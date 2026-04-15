@@ -29,10 +29,6 @@ interface AccessRequest {
 	signature: Hex      // personal_sign over packed message hash
 }
 
-// ------------------------------------------------------------
-// ABI
-// ------------------------------------------------------------
-
 const SETTLEMENT_REGISTRY_ABI = [
 	{
 		"inputs": [
@@ -59,10 +55,6 @@ const SETTLEMENT_REGISTRY_ABI = [
 		"type": "function"
 	}
 ] as const
-
-// ------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------
 
 /**
  * Build the message hash the client must have signed.
@@ -96,10 +88,12 @@ function jsonError(message: string, status: number): Response {
 	})
 }
 
-// ------------------------------------------------------------
-// Verification
-// ------------------------------------------------------------
-
+/**
+ * 
+ * @param req 
+ * @param env 
+ * @returns 
+ */
 async function verify(
 	req: AccessRequest,
 	env: Env
@@ -152,10 +146,12 @@ async function verify(
 	return { ok: true, address: stealthAddress }
 }
 
-// ------------------------------------------------------------
-// Handlers
-// ------------------------------------------------------------
-
+/**
+ * 
+ * @param request 
+ * @param env 
+ * @returns 
+ */
 async function handleAccess(request: Request, env: Env): Promise<Response> {
 
 	if (!env.BUCKET) {
@@ -182,8 +178,6 @@ async function handleAccess(request: Request, env: Env): Promise<Response> {
 		)
 	}
 
-	console.log('******************************** got the req body ' + JSON.stringify(body))
-
 	const result = await verify(body, env)
 	if (!result.ok) {
 		return jsonError(result.reason, 401)
@@ -207,10 +201,7 @@ async function handleAccess(request: Request, env: Env): Promise<Response> {
 	})
 }
 
-// ------------------------------------------------------------
-// Router
-// ------------------------------------------------------------
-
+// handle CORS
 const CORS_HEADERS = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'POST, OPTIONS',
