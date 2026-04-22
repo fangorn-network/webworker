@@ -128,12 +128,17 @@ async function verify(
 
 	let settled: boolean
 	try {
+		// easiest option: upload the code (this code) to IPFS
+		// execute similar to a Lit action, but in a webworker instead of a tee
 		settled = await client.readContract({
 			address: env.SETTLEMENT_REGISTRY_ADDRESS as Address,
 			abi: SETTLEMENT_REGISTRY_ABI,
 			functionName: 'isSettled',
 			args: [stealthAddress, req.resourceId as Hex],
 		})
+
+		// TODO: Submit attestation on-chain?
+
 	} catch (e) {
 		console.error('RPC error:', e)
 		return { ok: false, reason: 'settlement check failed' }
