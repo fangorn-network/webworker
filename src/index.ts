@@ -1,13 +1,14 @@
 import {
 	createPublicClient,
 	http,
-	recoverAddress,
 	keccak256,
 	encodePacked,
+	parseAbiItem,
 	type Hex,
 	type Address,
 	recoverMessageAddress,
 } from 'viem'
+
 import { arbitrumSepolia } from 'viem/chains'
 
 // ------------------------------------------------------------
@@ -32,25 +33,20 @@ interface AccessRequest {
 const SETTLEMENT_REGISTRY_ABI = [
 	{
 		"inputs": [
-			{
-				"internalType": "address",
-				"name": "stealth_address",
-				"type": "address"
-			},
-			{
-				"internalType": "bytes32",
-				"name": "resource_id",
-				"type": "bytes32"
-			}
+			{ "internalType": "address", "name": "stealth_address", "type": "address" },
+			{ "internalType": "bytes32", "name": "resource_id", "type": "bytes32" }
 		],
 		"name": "isSettled",
-		"outputs": [
-			{
-				"internalType": "bool",
-				"name": "",
-				"type": "bool"
-			}
+		"outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+		"stateMutability": "view",
+		"type": "function"
+	},
+	{
+		"inputs": [
+			{ "internalType": "bytes32", "name": "resource_id", "type": "bytes32" }
 		],
+		"name": "getPrice",
+		"outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
 		"stateMutability": "view",
 		"type": "function"
 	}
@@ -99,7 +95,7 @@ async function verify(
 	env: Env
 ): Promise<{ ok: true; address: Address } | { ok: false; reason: string }> {
 
-	// 1. Timestamp freshness
+	// 1. Check timestamp freshness
 	const now = Math.floor(Date.now() / 1000)
 	const window = parseInt(env.TIMESTAMP_WINDOW, 10)
 	if (Math.abs(now - req.timestamp) > window) {
@@ -115,16 +111,34 @@ async function verify(
 			signature: req.signature
 		})
 
-		console.log('we got the address ' + stealthAddress)
 	} catch {
 		return { ok: false, reason: 'invalid signature' }
 	}
+
 
 	// 3. Verify settlement on-chain
 	const client = createPublicClient({
 		chain: arbitrumSepolia,
 		transport: http(env.ARBITRUM_SEPOLIA_RPC),
 	})
+
+	let price: bigint
+	try {
+		price = await client.readContract({
+			address: env.SETTLEMENT_REGISTRY_ADDRESS as Address,
+			abi: SETTLEMENT_REGISTRY_ABI,
+			functionName: 'getPrice',
+			args: [req.resourceId as Hex],
+		})
+	} catch (e) {
+		console.error('price lookup failed:', e)
+		return { ok: false, reason: 'price lookup failed' }
+	}
+
+	// just return resources if they are priced at 0
+	if (price === 0n) {
+		return { ok: true, address: stealthAddress }
+	}
 
 	let settled: boolean
 	try {

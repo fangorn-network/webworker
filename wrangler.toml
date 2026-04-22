@@ -7,7 +7,7 @@ binding = "BUCKET"
 bucket_name = "my-first-bucket"
 
 [vars]
-SETTLEMENT_REGISTRY_ADDRESS = "0x0309df3ccb232023934b68c9ed068dec74be42cc"
+SETTLEMENT_REGISTRY_ADDRESS = "0x1d21545f536a2f026348477960ca59f9f1d7fabd"
 ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
 
