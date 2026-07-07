@@ -1,6 +1,6 @@
 # examples
 
-A simulated caller that proves address ownership to the `onchain-gate` worker.
+A simulated caller that proves address ownership to the `pinata-url-provider` worker.
 
 ## `simulated-caller.mjs`
 
@@ -15,19 +15,19 @@ Runs the full ownership handshake against a running worker:
 
 Signing uses [`viem`](https://viem.sh) (`privateKeyToAccount(...).signMessage`),
 the same library the worker uses to recover the signer. Install deps first with
-`npm install` (from the `onchain-gate` directory).
+`pnpm install` (from the repo root).
 
 ### Run
 
 ```bash
 # terminal 1 — start the worker (add RPC_URL + PINATA_JWT to .dev.vars first
 # if you want the resend to reach a real on-chain check / Pinata)
-npm run dev
+pnpm dev
 
 # terminal 2 — run the caller
 node examples/simulated-caller.mjs
 # or point it elsewhere:
-node examples/simulated-caller.mjs https://<your-worker>.workers.dev
+node examples/simulated-caller.mjs https://pinata-url-provider.fangorn-0be.workers.dev
 ```
 
 ### Options

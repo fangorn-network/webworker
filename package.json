@@ -4,10 +4,10 @@
   "private": true,
   "packageManager": "pnpm@10.27.0",
   "scripts": {
-    "dev:r2": "pnpm --filter ./fangorn-access-worker dev",
-    "dev:gate": "pnpm --filter ./pinata-url-provider dev",
-    "deploy:r2": "pnpm --filter ./fangorn-access-worker deploy",
-    "deploy:gate": "pnpm --filter ./pinata-url-provider deploy",
+    "dev:r2": "pnpm --filter ./fangorn-access-worker run dev",
+    "dev:gate": "pnpm --filter ./pinata-url-provider run dev",
+    "deploy:r2": "pnpm --filter ./fangorn-access-worker run deploy",
+    "deploy:gate": "pnpm --filter ./pinata-url-provider run deploy",
     "typecheck": "pnpm -r typecheck"
   },
   "pnpm": {

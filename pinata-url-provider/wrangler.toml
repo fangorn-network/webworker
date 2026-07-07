@@ -2,6 +2,13 @@ name = "pinata-url-provider"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
+# ── Deployment routing ───────────────────────────────────────────────────────
+# Set explicitly so `wrangler deploy` doesn't fall back to defaults (and warn).
+# Keep the worker's *.workers.dev URL, but disable per-version Preview URLs.
+# Using a custom domain/route instead? Set workers_dev = false.
+workers_dev = true
+preview_urls = false
+
 # ── Public (non-secret) configuration ────────────────────────────────────────
 # Edit these to describe your condition. Secrets (RPC_URL, PINATA_JWT) are NOT
 # set here — add them with `wrangler secret put NAME` (or .dev.vars locally).

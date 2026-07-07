@@ -69,6 +69,7 @@ async function main() {
   console.log('\nResult:');
   if (second.status === 200) {
     console.log('  ✔ Ownership proven AND on-chain condition met — got an upload URL.');
+    console.log(`uploadUrl: ${JSON.stringify(second.json.uploadUrl)}`)
   } else if (second.status === 403) {
     console.log('  ✔ Ownership proven (signature accepted). ✘ On-chain condition not met for this address.');
   } else if (second.status === 401) {
