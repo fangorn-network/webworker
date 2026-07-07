@@ -8,7 +8,7 @@ importers:
 
   .: {}
 
-  fangorn-r2:
+  fangorn-access-worker:
     dependencies:
       viem:
         specifier: ^2.0.0
@@ -30,7 +30,7 @@ importers:
         specifier: ^4.82.2
         version: 4.107.1(@cloudflare/workers-types@4.20260702.1)
 
-  onchain-gate:
+  pinata-url-provider:
     dependencies:
       viem:
         specifier: ^2.54.6

@@ -1,3 +1,3 @@
 packages:
-  - "fangorn-r2"
-  - "onchain-gate"
+  - "fangorn-access-worker"
+  - "pinata-url-provider"

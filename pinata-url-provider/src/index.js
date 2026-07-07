@@ -27,7 +27,7 @@ import { recoverMessageAddress } from 'viem';
 
 export default {
   async fetch(request, env) {
-    const cors = corsHeaders(env);
+    const cors = corsHeaders(env, request);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: cors });
@@ -312,13 +312,42 @@ function firstWord(result) {
   return BigInt('0x' + hex);
 }
 
-function corsHeaders(env) {
-  return {
-    'access-control-allow-origin': env.ALLOWED_ORIGIN || '*',
+/**
+ * Build CORS response headers.
+ *
+ * CORS is a *browser* mechanism: it only governs whether page JavaScript from a
+ * given origin may read this response. It is NOT an access-control boundary and
+ * it does not gate non-browser callers — curl, CLIs, servers and other scripts
+ * neither send an enforceable `Origin` nor honour these headers, so they are
+ * unaffected by ALLOWED_ORIGIN. The real gate is the signed-challenge ownership
+ * proof (see verifyCallerOwnsAddress), which every caller goes through equally.
+ *
+ * ALLOWED_ORIGIN modes:
+ *   "*" (default) — allow any browser origin.
+ *   a comma-separated allowlist (e.g. "https://fangorn.network,https://app.x") —
+ *     reflect the caller's Origin when it matches; add `Vary: Origin` so caches
+ *     don't serve the wrong header. Browser requests from other origins are
+ *     blocked by the browser; CLI callers still work regardless.
+ */
+function corsHeaders(env, request) {
+  const base = {
     'access-control-allow-methods': 'GET, POST, OPTIONS',
     'access-control-allow-headers': 'content-type, authorization',
     'access-control-max-age': '86400',
   };
+
+  const allowed = (env.ALLOWED_ORIGIN || '*').trim();
+  if (allowed === '*') {
+    return { ...base, 'access-control-allow-origin': '*' };
+  }
+
+  const allowlist = allowed.split(',').map((s) => s.trim()).filter(Boolean);
+  const requestOrigin = request.headers.get('Origin');
+  const headers = { ...base, vary: 'Origin' };
+  if (requestOrigin && allowlist.includes(requestOrigin)) {
+    headers['access-control-allow-origin'] = requestOrigin;
+  }
+  return headers;
 }
 
 function json(status, obj, extraHeaders) {

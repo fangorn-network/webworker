@@ -36,10 +36,15 @@ SIGNATURE_MAX_AGE = "300"       # max age in seconds of the signed challenge's I
 # ── Pinata presigned upload URL settings ─────────────────────────────────────
 PINATA_NETWORK = "public"        # "public" or "private"
 PINATA_URL_EXPIRES = "300"       # seconds the upload URL stays valid
-# PINATA_MAX_FILE_SIZE = "10485760"          # optional, bytes
-# PINATA_ALLOW_MIME_TYPES = "image/png,application/json"  # optional CSV
+PINATA_MAX_FILE_SIZE = "10485760"          # optional, bytes
+PINATA_ALLOW_MIME_TYPES = "application/json"  # optional CSV
 
-# CORS: lock this to your site in production, e.g. "https://fangorn.network".
+# CORS — browsers only. This restricts which *web pages* may read the response
+# from their JavaScript; it is NOT an access-control gate and does NOT affect
+# CLI/curl/server callers (they ignore CORS). Access is gated by the signed
+# ownership proof regardless. Use "*" to allow any browser origin, or a
+# comma-separated allowlist to lock it to your site(s), e.g.
+#   ALLOWED_ORIGIN = "https://fangorn.network,https://app.fangorn.network"
 ALLOWED_ORIGIN = "*"
 
 # Secrets to set (do NOT put these in [vars]):
