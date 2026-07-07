@@ -1,0 +1,3 @@
+# Copy to `.dev.vars` for local `wrangler dev`. Never commit the real file.
+RPC_URL="https://your-evm-rpc.example/v2/YOUR_KEY"
+PINATA_JWT="your-pinata-jwt"

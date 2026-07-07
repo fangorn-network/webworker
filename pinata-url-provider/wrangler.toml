@@ -1,0 +1,47 @@
+name = "pinata-url-provider"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# ── Public (non-secret) configuration ────────────────────────────────────────
+# Edit these to describe your condition. Secrets (RPC_URL, PINATA_JWT) are NOT
+# set here — add them with `wrangler secret put NAME` (or .dev.vars locally).
+[vars]
+# Which chain (informational only; the actual endpoint is RPC_URL).
+CHAIN_ID = "8453"
+
+# Contract + view function to evaluate.
+CONTRACT_ADDRESS = "0x0000000000000000000000000000000000000000"
+# 4-byte selector. Get it with: cast sig "balanceOf(address)"  ->  0x70a08231
+VIEW_SELECTOR = "0x70a08231"
+# "true" appends the requestor address as the function's single argument.
+PASS_ADDRESS_ARG = "true"
+
+# How to compare the returned uint256/bool:
+#   gte | gt | lte | lt | eq | nonzero | zero | bool
+COMPARE_OP = "gte"
+# Compared as a bigint (ignored for nonzero/zero/bool). For ERC-20 remember decimals.
+COMPARE_VALUE = "1"
+
+# "true" skips the on-chain check entirely: a valid ownership signature alone
+# yields a presigned URL. Handy for local dev/testing without an RPC endpoint.
+# Leave "false" (or unset) in production.
+STUB_CONTRACT_CALL = "true"
+
+# ── Address-ownership proof ──────────────────────────────────────────────────
+# Callers must sign a challenge message with the address's key and send
+# { message, signature } so the worker can prove they control the address (not
+# just that some qualifying address exists). Always enforced. See examples/.
+SIGNATURE_MAX_AGE = "300"       # max age in seconds of the signed challenge's Issued-At
+
+# ── Pinata presigned upload URL settings ─────────────────────────────────────
+PINATA_NETWORK = "public"        # "public" or "private"
+PINATA_URL_EXPIRES = "300"       # seconds the upload URL stays valid
+# PINATA_MAX_FILE_SIZE = "10485760"          # optional, bytes
+# PINATA_ALLOW_MIME_TYPES = "image/png,application/json"  # optional CSV
+
+# CORS: lock this to your site in production, e.g. "https://fangorn.network".
+ALLOWED_ORIGIN = "*"
+
+# Secrets to set (do NOT put these in [vars]):
+#   wrangler secret put RPC_URL
+#   wrangler secret put PINATA_JWT
