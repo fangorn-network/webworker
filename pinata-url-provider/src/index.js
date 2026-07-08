@@ -1,29 +1,24 @@
 /**
- * onchain-gate — a self-contained Cloudflare Worker.
+ * pinata-url-provider — a self-contained Cloudflare Worker.
  *
  * Flow:
- *   1. Caller hits the worker with ?address=0x...
- *   2. The worker makes a read-only `eth_call` to a configured contract view
- *      function on a configured EVM chain.
- *   3. It compares the returned value against a configured condition. (This step
- *      can be stubbed with STUB_CONTRACT_CALL="true" so ownership alone gates.)
- *   4. If the condition passes, it mints a short-lived Pinata *presigned upload
- *      URL* and returns it, so the caller can pin one file to IPFS without ever
- *      seeing your Pinata JWT.
+ *   1. The caller proves control of an address by signing a one-time challenge
+ *      (EIP-191 `personal_sign`). If the signature doesn't verify, the request is
+ *      rejected with "Verification failed…" — see `verifyCallerOwnsAddress()`.
+ *   2. The worker calls `isRegistered(address)` on the Fangorn registry contract
+ *      (a Stylus contract on Arbitrum Sepolia; address + RPC are configurable) to
+ *      check whether that public key is registered. If not, the caller is told to
+ *      register at fangorn.network. This can be stubbed for local dev with
+ *      STUB_REGISTRATION_CHECK="true".
+ *   3. If registered, the worker mints a short-lived Pinata *presigned upload URL*
+ *      and returns it, so the caller can pin one file to IPFS without ever seeing
+ *      your Pinata JWT.
  *
- * The only dependency is `viem` (used for signature recovery). All behaviour is
- * driven by environment variables (see wrangler.toml / README).
- *
- * ── Ownership gating ─────────────────────────────────────────────────────────
- * On its own, the on-chain check only proves that *an address* satisfies the
- * condition — not that the caller controls it. So every request must carry a
- * short challenge message signed by that address (EIP-191 `personal_sign`); the
- * worker recovers the signer with viem and requires it to equal the requested
- * address — see `verifyCallerOwnsAddress()`. This is always enforced. A runnable
- * caller lives in `examples/`.
+ * The only dependency is `viem` (signature recovery + selector encoding). All
+ * behaviour is driven by environment variables (see wrangler.toml / README).
  */
 
-import { recoverMessageAddress } from 'viem';
+import { recoverMessageAddress, toFunctionSelector } from 'viem';
 
 export default {
   async fetch(request, env) {
@@ -56,23 +51,28 @@ export default {
       }, cors);
     }
 
-    // 1) Evaluate the on-chain condition — unless STUB_CONTRACT_CALL is set, in
+    // 1) Check on-chain registration — unless STUB_REGISTRATION_CHECK is set, in
     // which case a valid signature alone is enough (useful for local dev/testing
     // without an RPC endpoint).
-    const stubbed = (env.STUB_CONTRACT_CALL ?? 'false') === 'true';
+    const stubbed = (env.STUB_REGISTRATION_CHECK ?? 'false') === 'true';
     if (!stubbed) {
-      let passed;
+      let registered;
       try {
-        passed = await checkCondition(env, address);
+        registered = await isRegistered(env, address);
       } catch (err) {
-        return json(502, { error: 'On-chain check failed.', detail: String(err?.message || err) }, cors);
+        return json(502, { error: 'On-chain registration check failed.', detail: String(err?.message || err) }, cors);
       }
-      if (!passed) {
-        return json(403, { ok: false, address, error: 'On-chain condition not met.' }, cors);
+      if (!registered) {
+        const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
+        return json(403, {
+          ok: false,
+          address,
+          error: `This public key is not registered. Please login on ${registerUrl} to register.`,
+        }, cors);
       }
     }
 
-    // 2) Condition met (or stubbed) — issue a Pinata presigned upload URL.
+    // 2) Registered (or stubbed) — issue a Pinata presigned upload URL.
     try {
       const uploadUrl = await createPinataUploadUrl(env);
       return json(200, {
@@ -89,38 +89,44 @@ export default {
   },
 };
 
-/* ───────────────────────────── on-chain check ──────────────────────────── */
+/* ─────────────────────────── registration check ────────────────────────── */
+
+// Default registry target: the Fangorn registry (a Stylus contract) on Arbitrum
+// Sepolia, reachable over the public RPC (fine for a read-only eth_call).
+const DEFAULT_REGISTRY_ADDRESS = '0x0d3f3b1bb7cb809e35f5e50c5c51f013b418ab64';
+const DEFAULT_RPC_URL = 'https://sepolia-rollup.arbitrum.io/rpc';
+
+// The registry's ABI function. NOTE: the Stylus (Rust) contract's `is_registered`
+// method is exposed in the ABI as camelCase `isRegistered(address)` — calling the
+// snake_case selector reverts. Verified on-chain against the default contract.
+const DEFAULT_REGISTRY_FUNCTION = 'isRegistered(address)';
 
 /**
- * Calls a single view function and compares its first returned 32-byte word
- * (interpreted as a uint256 / bool) against the configured condition.
+ * Returns whether `address` is registered, by calling the registry's
+ * `isRegistered(address)` view (returns `bool`).
  *
- * Env:
- *   RPC_URL           EVM JSON-RPC endpoint (secret).
- *   CONTRACT_ADDRESS  Contract to call.
- *   VIEW_SELECTOR     4-byte function selector, e.g. 0x70a08231 (balanceOf).
- *   PASS_ADDRESS_ARG  "true" to append the requestor address as the sole arg.
- *   COMPARE_OP        gte | gt | lte | lt | eq | nonzero | zero | bool.
- *   COMPARE_VALUE     Decimal string compared as a bigint (for the numeric ops).
+ * Env (all optional; sensible Arbitrum Sepolia defaults):
+ *   RPC_URL                    EVM JSON-RPC endpoint.
+ *   REGISTRY_CONTRACT_ADDRESS  Registry contract to call.
+ *   REGISTRY_FUNCTION          ABI signature of the check (default
+ *                              "isRegistered(address)").
  */
-async function checkCondition(env, address) {
-  if (!env.RPC_URL) throw new Error('RPC_URL is not set.');
-  if (!isAddress(env.CONTRACT_ADDRESS || '')) throw new Error('CONTRACT_ADDRESS is missing or invalid.');
-  if (!/^0x[0-9a-fA-F]{8}$/.test(env.VIEW_SELECTOR || '')) {
-    throw new Error('VIEW_SELECTOR must be a 4-byte selector like 0x70a08231.');
-  }
+async function isRegistered(env, address) {
+  const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
+  const contract = env.REGISTRY_CONTRACT_ADDRESS || DEFAULT_REGISTRY_ADDRESS;
+  if (!isAddress(contract)) throw new Error('REGISTRY_CONTRACT_ADDRESS is missing or invalid.');
 
-  const passArg = (env.PASS_ADDRESS_ARG ?? 'true') !== 'false';
-  const data = env.VIEW_SELECTOR + (passArg ? encodeAddress(address) : '');
+  const selector = toFunctionSelector(env.REGISTRY_FUNCTION || DEFAULT_REGISTRY_FUNCTION);
+  const data = selector + encodeAddress(address);
 
-  const res = await fetch(env.RPC_URL, {
+  const res = await fetch(rpcUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
       method: 'eth_call',
-      params: [{ to: env.CONTRACT_ADDRESS, data }, 'latest'],
+      params: [{ to: contract, data }, 'latest'],
     }),
   });
   if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
@@ -128,24 +134,8 @@ async function checkCondition(env, address) {
   const body = await res.json();
   if (body.error) throw new Error(`RPC error: ${body.error.message || JSON.stringify(body.error)}`);
 
-  const word = firstWord(body.result);
-  return compare(word, env);
-}
-
-function compare(word, env) {
-  const op = (env.COMPARE_OP || 'nonzero').toLowerCase();
-  const value = env.COMPARE_VALUE != null && env.COMPARE_VALUE !== '' ? BigInt(env.COMPARE_VALUE) : 0n;
-  switch (op) {
-    case 'nonzero': return word !== 0n;
-    case 'zero': return word === 0n;
-    case 'bool': return word === 1n;
-    case 'gte': return word >= value;
-    case 'gt': return word > value;
-    case 'lte': return word <= value;
-    case 'lt': return word < value;
-    case 'eq': return word === value;
-    default: throw new Error(`Unknown COMPARE_OP: ${op}`);
-  }
+  // `isRegistered` returns a bool — the ABI word is 1 (true) or 0 (false).
+  return firstWord(body.result) !== 0n;
 }
 
 /* ───────────────────────────── pinata ──────────────────────────────────── */
@@ -202,11 +192,16 @@ async function createPinataUploadUrl(env) {
  *   3. require Issued-At to be fresh (within SIGNATURE_MAX_AGE) to bound replay,
  *   4. recover the signer from the signature and require it to equal `address`.
  *
- * Returns { ok: true } or { ok: false, error, challenge } — `challenge` is a
- * freshly-minted message the caller can sign and retry with.
+ * Returns one of:
+ *   { ok: true }
+ *   { ok: false, needsSignature: true, error, challenge } — no proof supplied
+ *     yet; `error`/`challenge` prompt the caller to sign and resend.
+ *   { ok: false, error, challenge } — a signature was supplied but did not
+ *     verify (wrong key, tampering, or a stale challenge).
  *
- * This is always enforced: the whole point is to bind the on-chain check to a
- * caller who provably controls the address, so there is no unauthenticated mode.
+ * This is always enforced: the whole point is to bind the registration check to
+ * a caller who provably controls the address, so there is no unauthenticated
+ * mode.
  *
  * Env:
  *   SIGNATURE_MAX_AGE   How many seconds old an Issued-At may be (default 300).
@@ -214,41 +209,49 @@ async function createPinataUploadUrl(env) {
 async function verifyCallerOwnsAddress(input, address, env) {
   const now = Math.floor(Date.now() / 1000);
   const challenge = buildChallengeMessage(address, now);
-  const fail = (error) => ({ ok: false, error, challenge });
 
   const { message, signature } = input;
+  // Handshake step 1 — nothing signed yet. Hand back the challenge to sign;
+  // this is a prompt, not a failure.
   if (!message || !signature) {
-    return fail('Signature required. Sign the `challenge` message with the address\'s key and resend it as { message, signature }.');
+    return {
+      ok: false,
+      needsSignature: true,
+      error: 'Sign the `challenge` message below with your private key and resend it as { address, message, signature }.',
+      challenge,
+    };
   }
+
+  // A signature was supplied but does not check out. Every failure path below
+  // means the caller could not prove control of `address` — almost always
+  // because they signed with the wrong key — so they all report the same thing.
+  const fail = () => ({
+    ok: false,
+    error: 'Verification failed. Please be sure you have the correct private key.',
+    challenge,
+  });
 
   const parsed = parseChallengeMessage(message);
-  if (!parsed) return fail('Malformed challenge message.');
-  if (parsed.address.toLowerCase() !== address) {
-    return fail('The signed message is for a different address.');
-  }
+  if (!parsed) return fail();
+  if (parsed.address.toLowerCase() !== address) return fail();
 
   // Reject anything that is not the canonical template verbatim.
-  if (message !== buildChallengeMessage(parsed.address, parsed.issuedAt)) {
-    return fail('Challenge message does not match the expected format.');
-  }
+  if (message !== buildChallengeMessage(parsed.address, parsed.issuedAt)) return fail();
 
   // Freshness: bound replay without server-side state. Allow small clock skew.
   const maxAge = Number(env.SIGNATURE_MAX_AGE || 300);
   const skew = 60;
-  if (!(parsed.issuedAt <= now + skew && parsed.issuedAt >= now - maxAge)) {
-    return fail('Challenge expired or not yet valid. Sign the fresh `challenge`.');
-  }
+  if (!(parsed.issuedAt <= now + skew && parsed.issuedAt >= now - maxAge)) return fail();
 
   // Recover the signer (EIP-191 personal_sign) and require it to equal `address`.
   let recovered;
   try {
     recovered = await recoverMessageAddress({ message, signature });
   } catch {
-    return fail('Malformed signature.');
+    return fail();
   }
-  if (recovered.toLowerCase() !== address) {
-    return fail('Signature does not match the address.');
-  }
+  if (recovered.toLowerCase() !== address) return fail();
+
   return { ok: true };
 }
 

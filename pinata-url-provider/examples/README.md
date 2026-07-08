@@ -10,8 +10,8 @@ Runs the full ownership handshake against a running worker:
 2. The caller signs the challenge with the address's private key
    (EIP-191 `personal_sign`).
 3. `POST { address, message, signature }` → the worker recovers the signer,
-   confirms it matches `address`, then evaluates the on-chain condition and (if
-   met) returns a Pinata upload URL.
+   confirms it matches `address`, then checks on-chain registration and (if
+   registered) returns a Pinata upload URL.
 
 Signing uses [`viem`](https://viem.sh) (`privateKeyToAccount(...).signMessage`),
 the same library the worker uses to recover the signer. Install deps first with
@@ -20,8 +20,9 @@ the same library the worker uses to recover the signer. Install deps first with
 ### Run
 
 ```bash
-# terminal 1 — start the worker (add RPC_URL + PINATA_JWT to .dev.vars first
-# if you want the resend to reach a real on-chain check / Pinata)
+# terminal 1 — start the worker (add PINATA_JWT to .dev.vars first if you want
+# the resend to actually mint a Pinata URL; the registry check uses the public
+# Arbitrum Sepolia RPC by default)
 pnpm dev
 
 # terminal 2 — run the caller
@@ -42,9 +43,12 @@ node examples/simulated-caller.mjs https://pinata-url-provider.fangorn-0be.worke
 
 ### Interpreting the result
 
-- **`200`** — ownership proven **and** the on-chain condition passed; you got an
+- **`200`** — ownership proven **and** the address is registered; you got an
   upload URL.
-- **`403` "On-chain condition not met."** — the **signature was accepted**
-  (ownership proven); the address just doesn't satisfy the configured condition.
-- **`401`** — the ownership check rejected the request (missing/expired/invalid
-  signature); the error explains why and includes a fresh `challenge`.
+- **`403` "This public key is not registered…"** — the **signature was accepted**
+  (ownership proven); the address just isn't registered. The demo key won't be —
+  register a real address at fangorn.network, or set `STUB_REGISTRATION_CHECK=true`
+  locally to bypass the check.
+- **`401`** — the ownership check rejected the request (no signature yet, or
+  "Verification failed…" for a wrong key); the error explains which and includes a
+  fresh `challenge`.

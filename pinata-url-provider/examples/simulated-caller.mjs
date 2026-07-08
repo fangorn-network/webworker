@@ -1,12 +1,12 @@
 /**
- * Simulated caller for onchain-gate's address-ownership check.
+ * Simulated caller for pinata-url-provider's address-ownership check.
  *
  * Demonstrates the full ownership handshake against a running worker:
  *
  *   1. POST { address }                          → 401 + a `challenge` to sign
  *   2. sign the challenge with the address's key (EIP-191 personal_sign, via viem)
  *   3. POST { address, message, signature }      → ownership accepted; the worker
- *      then evaluates the on-chain condition and (if met) returns an upload URL.
+ *      then checks on-chain registration and (if registered) returns an upload URL.
  *
  * Usage:
  *   node examples/simulated-caller.mjs [workerUrl]
@@ -68,10 +68,10 @@ async function main() {
 
   console.log('\nResult:');
   if (second.status === 200) {
-    console.log('  ✔ Ownership proven AND on-chain condition met — got an upload URL.');
+    console.log('  ✔ Ownership proven AND address registered — got an upload URL.');
     console.log(`uploadUrl: ${JSON.stringify(second.json.uploadUrl)}`)
   } else if (second.status === 403) {
-    console.log('  ✔ Ownership proven (signature accepted). ✘ On-chain condition not met for this address.');
+    console.log('  ✔ Ownership proven (signature accepted). ✘ This address is not registered.');
   } else if (second.status === 401) {
     console.log('  ✘ Ownership check rejected the signature. See the error above.');
   } else {
@@ -81,6 +81,6 @@ async function main() {
 
 main().catch((err) => {
   console.error('\nError:', err.message);
-  console.error(`\nIs the worker running? Start it with:  cd onchain-gate && npm run dev`);
+  console.error(`\nIs the worker running? Start it with:  cd pinata-url-provider && pnpm dev`);
   process.exit(1);
 });

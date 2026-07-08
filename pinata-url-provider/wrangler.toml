@@ -10,34 +10,35 @@ workers_dev = true
 preview_urls = false
 
 # ── Public (non-secret) configuration ────────────────────────────────────────
-# Edit these to describe your condition. Secrets (RPC_URL, PINATA_JWT) are NOT
-# set here — add them with `wrangler secret put NAME` (or .dev.vars locally).
+# Edit these to point at your registry. The only secret is PINATA_JWT — set it
+# with `wrangler secret put PINATA_JWT` (or .dev.vars locally).
 [vars]
-# Which chain (informational only; the actual endpoint is RPC_URL).
-CHAIN_ID = "8453"
-
-# Contract + view function to evaluate.
-CONTRACT_ADDRESS = "0x0000000000000000000000000000000000000000"
-# 4-byte selector. Get it with: cast sig "balanceOf(address)"  ->  0x70a08231
-VIEW_SELECTOR = "0x70a08231"
-# "true" appends the requestor address as the function's single argument.
-PASS_ADDRESS_ARG = "true"
-
-# How to compare the returned uint256/bool:
-#   gte | gt | lte | lt | eq | nonzero | zero | bool
-COMPARE_OP = "gte"
-# Compared as a bigint (ignored for nonzero/zero/bool). For ERC-20 remember decimals.
-COMPARE_VALUE = "1"
+# ── Registration check ───────────────────────────────────────────────────────
+# The worker calls isRegistered(address) on this contract and gates on the bool.
+# Defaults target the Fangorn registry (a Stylus contract) on Arbitrum Sepolia.
+REGISTRY_CONTRACT_ADDRESS = "0x0d3f3b1bb7cb809e35f5e50c5c51f013b418ab64"
+# EVM JSON-RPC endpoint. The public Arbitrum Sepolia RPC is fine for this
+# read-only call; swap in your own (e.g. Alchemy) for higher rate limits.
+RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
+# Which chain the RPC points at (informational only). 421614 = Arbitrum Sepolia.
+CHAIN_ID = "421614"
+# Advanced: the ABI signature of the check. The Stylus contract exposes its Rust
+# `is_registered` as camelCase `isRegistered(address)`; override only if yours
+# differs.
+# REGISTRY_FUNCTION = "isRegistered(address)"
 
 # "true" skips the on-chain check entirely: a valid ownership signature alone
 # yields a presigned URL. Handy for local dev/testing without an RPC endpoint.
 # Leave "false" (or unset) in production.
-STUB_CONTRACT_CALL = "true"
+STUB_REGISTRATION_CHECK = "false"
+
+# Shown in the "not registered" error so callers know where to register.
+REGISTER_URL = "https://fangorn.network"
 
 # ── Address-ownership proof ──────────────────────────────────────────────────
 # Callers must sign a challenge message with the address's key and send
 # { message, signature } so the worker can prove they control the address (not
-# just that some qualifying address exists). Always enforced. See examples/.
+# just that some registered address exists). Always enforced. See examples/.
 SIGNATURE_MAX_AGE = "300"       # max age in seconds of the signed challenge's Issued-At
 
 # ── Pinata presigned upload URL settings ─────────────────────────────────────
@@ -54,6 +55,5 @@ PINATA_ALLOW_MIME_TYPES = "application/json"  # optional CSV
 #   ALLOWED_ORIGIN = "https://fangorn.network,https://app.fangorn.network"
 ALLOWED_ORIGIN = "*"
 
-# Secrets to set (do NOT put these in [vars]):
-#   wrangler secret put RPC_URL
-#   wrangler secret put PINATA_JWT
+# Secret to set (do NOT put this in [vars]):
+#   wrangler secret put PINATA_JWT   # Pinata key with the Files:Write scope

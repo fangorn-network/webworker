@@ -1,17 +1,19 @@
 # pinata-url-provider
 
 A tiny, self-contained Cloudflare Worker that gates a **Pinata presigned upload
-URL** behind an **on-chain condition**.
+URL** behind **on-chain registration**.
 
-1. Caller → `GET https://<worker>/?address=0x…`
-2. Worker makes a read-only `eth_call` to a configured contract view function on
-   a configured EVM chain and compares the result to a configured condition.
-3. If it passes, the worker mints a short-lived Pinata presigned upload URL and
+1. The caller proves control of an address by signing a one-time challenge. If the
+   signature doesn't verify, the request is rejected ("Verification failed…").
+2. The worker calls `isRegistered(address)` on the Fangorn registry contract (a
+   Stylus contract on Arbitrum Sepolia). If the address isn't registered, it tells
+   the caller to register at fangorn.network.
+3. If registered, the worker mints a short-lived Pinata presigned upload URL and
    returns it. The caller uploads one file to IPFS without ever seeing your JWT.
 
-The only runtime dependency is [`viem`](https://viem.sh) (for signature
-recovery); everything else rides on the Workers `fetch` runtime. All behaviour is
-configured through environment variables.
+The only runtime dependency is [`viem`](https://viem.sh) (signature recovery +
+selector encoding); everything else rides on the Workers `fetch` runtime. All
+behaviour is configured through environment variables.
 
 ## Setup
 
@@ -22,10 +24,10 @@ then work inside this package:
 pnpm install                       # from the repo root — installs viem + wrangler
 
 cd pinata-url-provider
-cp .dev.vars.example .dev.vars     # add RPC_URL and PINATA_JWT for local dev
+cp .dev.vars.example .dev.vars     # add your PINATA_JWT for local dev
 ```
 
-Edit `wrangler.toml` `[vars]` to describe your gate, then run locally:
+Edit `wrangler.toml` `[vars]` to point at your registry, then run locally:
 
 ```bash
 pnpm dev
@@ -50,19 +52,26 @@ That is all the worker needs: it only calls `POST /v3/files/sign` to mint upload
 URLs. Leave Groups, Gateways, and Analytics off. End users never receive this
 JWT; they upload with the short-lived presigned URL it produces.
 
-**3. Set the secrets** (never put these in `wrangler.toml`):
+**3. Set the secret** (never put it in `wrangler.toml`):
 
 ```bash
 pnpm exec wrangler secret put PINATA_JWT    # the Files:Write JWT from step 2
-pnpm exec wrangler secret put RPC_URL       # EVM JSON-RPC endpoint (skip if stubbing)
 ```
 
-**4. Configure the gate** in `wrangler.toml` `[vars]`:
+`RPC_URL` defaults to the public Arbitrum Sepolia endpoint in `wrangler.toml`, so
+no RPC secret is required — override that var if you want a private endpoint.
 
-- Set `STUB_CONTRACT_CALL = "false"` so the on-chain check actually runs. Leaving
-  it `"true"` hands a URL to anyone with a valid ownership signature — dev only.
-- Fill in `CONTRACT_ADDRESS`, `VIEW_SELECTOR`, `PASS_ADDRESS_ARG`, `COMPARE_OP`,
-  and `COMPARE_VALUE` for your condition (see [Configuration](#configuration)).
+**4. Configure the registry check** in `wrangler.toml` `[vars]`:
+
+- `REGISTRY_CONTRACT_ADDRESS` — the contract the worker calls
+  `isRegistered(address)` on (defaults to the Fangorn registry `0x0d3f…ab64` on
+  Arbitrum Sepolia).
+- `RPC_URL` — defaults to the public Arbitrum Sepolia RPC; swap in your own for
+  higher rate limits.
+- Keep `STUB_REGISTRATION_CHECK = "false"` in production. Setting it `"true"`
+  skips the on-chain check — a valid signature alone yields a URL (dev only).
+- `REGISTER_URL` — shown in the "not registered" error (default
+  `https://fangorn.network`).
 - Lock `ALLOWED_ORIGIN` to your site(s) if a browser calls the worker; leave it
   `"*"` if only CLIs/servers do (CORS does not apply to them).
 - Tune `PINATA_NETWORK`, `PINATA_URL_EXPIRES`, and the optional
@@ -92,14 +101,12 @@ curl "https://<worker>/?address=0xYourAddress"
 
 | Var | Where | Meaning |
 | --- | --- | --- |
-| `RPC_URL` | secret | EVM JSON-RPC endpoint (any EVM chain). |
-| `CONTRACT_ADDRESS` | var | Contract whose view function is called. |
-| `VIEW_SELECTOR` | var | 4-byte selector, e.g. `cast sig "balanceOf(address)"` → `0x70a08231`. |
-| `PASS_ADDRESS_ARG` | var | `"true"` appends the requestor address as the function's single arg. |
-| `COMPARE_OP` | var | `gte` \| `gt` \| `lte` \| `lt` \| `eq` \| `nonzero` \| `zero` \| `bool`. |
-| `COMPARE_VALUE` | var | Threshold compared as a bigint (ignored for `nonzero`/`zero`/`bool`). |
-| `STUB_CONTRACT_CALL` | var | `"true"` skips the on-chain check — a valid signature alone yields a URL (dev/testing). |
-| `CHAIN_ID` | var | Informational only. |
+| `REGISTRY_CONTRACT_ADDRESS` | var | Registry contract; the worker calls `isRegistered(address)` on it. Default: the Fangorn registry on Arbitrum Sepolia. |
+| `RPC_URL` | var | EVM JSON-RPC endpoint. Default: public Arbitrum Sepolia. |
+| `REGISTRY_FUNCTION` | var | Optional. ABI signature of the check (default `isRegistered(address)`). |
+| `STUB_REGISTRATION_CHECK` | var | `"true"` skips the on-chain check — a valid signature alone yields a URL (dev/testing). |
+| `REGISTER_URL` | var | URL shown in the "not registered" error (default `https://fangorn.network`). |
+| `CHAIN_ID` | var | Informational only (`421614` = Arbitrum Sepolia). |
 | `PINATA_JWT` | secret | Pinata JWT used to sign upload URLs. Needs the **Files: Write** scope only. |
 | `PINATA_NETWORK` | var | `public` or `private`. |
 | `PINATA_URL_EXPIRES` | var | Seconds the upload URL stays valid. |
@@ -107,32 +114,24 @@ curl "https://<worker>/?address=0xYourAddress"
 | `PINATA_ALLOW_MIME_TYPES` | var | Optional CSV of allowed MIME types. |
 | `ALLOWED_ORIGIN` | var | Browser CORS: `*` or a comma-separated allowlist. Does not affect CLI/server callers. |
 
-The condition is: `f(<returned uint256/bool>) COMPARE_OP COMPARE_VALUE`.
-Only the **first 32-byte return word** is read, so the view function should
-return a single `uint256` or `bool`.
+The worker calls `isRegistered(address)` (a `view` returning `bool`) on
+`REGISTRY_CONTRACT_ADDRESS` and gates on the result. Note the Fangorn registry is
+a **Stylus** (Rust) contract whose `is_registered` method is exposed in the ABI as
+camelCase **`isRegistered(address)`** — that is the default; override
+`REGISTRY_FUNCTION` only if your registry differs.
 
-Set `STUB_CONTRACT_CALL="true"` to skip this step entirely: the worker verifies
-the ownership signature and then returns a presigned URL without any `eth_call`
-(so `RPC_URL` isn't needed). The `200` response carries `stubbed: true`. Use it
-for local dev or to exercise the signature flow; keep it off in production.
-
-### Examples
-
-- **Holds ≥ 1 NFT** (`balanceOf(address)`): `VIEW_SELECTOR=0x70a08231`,
-  `PASS_ADDRESS_ARG=true`, `COMPARE_OP=gte`, `COMPARE_VALUE=1`.
-- **Holds ≥ 10 USDC** (6 decimals): same selector, `COMPARE_VALUE=10000000`.
-- **Custom `hasAccess(address) → bool`**: `VIEW_SELECTOR=`(that selector),
-  `PASS_ADDRESS_ARG=true`, `COMPARE_OP=bool`.
-- **Global flag `isOpen() → bool`, no arg**: `PASS_ADDRESS_ARG=false`,
-  `COMPARE_OP=bool`.
+Set `STUB_REGISTRATION_CHECK="true"` to skip this step entirely: the worker
+verifies the ownership signature and then returns a presigned URL without any
+`eth_call` (so no RPC is needed). The `200` response carries `stubbed: true`. Use
+it for local dev or to exercise the signature flow; keep it off in production.
 
 ## Responses
 
 | Status | Body |
 | --- | --- |
 | `200` | `{ ok: true, address, uploadUrl, network, expiresIn }` |
-| `401` | `{ ok: false, address, error, challenge }` — missing/invalid ownership signature; sign `challenge` and retry |
-| `403` | `{ ok: false, address, error: "On-chain condition not met." }` |
+| `401` | `{ ok: false, address, error, challenge }` — no signature yet, or verification failed ("…correct private key"); sign `challenge` and retry |
+| `403` | `{ ok: false, address, error: "This public key is not registered…" }` — ownership proven, but the address isn't registered |
 | `400` | invalid/missing address |
 | `502` | RPC or Pinata call failed (see `detail`) |
 
@@ -152,11 +151,13 @@ const pin = await fetch(uploadUrl, { method: 'POST', body: fd }).then((r) => r.j
 
 ## Proving address ownership
 
-The on-chain check alone only proves that **an address** meets the condition —
-not that the caller controls it. To close that gap the worker **always** requires
-the caller to **sign a challenge** with the address's private key and verifies
-the signature (EIP-191 `personal_sign`) in `verifyCallerOwnsAddress()`
-(`src/index.js`), recovering the signer with viem's `recoverMessageAddress`.
+The registration check alone only proves that **an address** is registered — not
+that the caller controls it. To close that gap the worker **always** requires the
+caller to **sign a challenge** with the address's private key and verifies the
+signature (EIP-191 `personal_sign`) in `verifyCallerOwnsAddress()`
+(`src/index.js`), recovering the signer with viem's `recoverMessageAddress`. A
+signature that doesn't recover to the claimed address fails with **"Verification
+failed. Please be sure you have the correct private key."**
 
 ### The handshake
 
@@ -164,14 +165,14 @@ the signature (EIP-191 `personal_sign`) in `verifyCallerOwnsAddress()`
 
    ```
    POST / { "address": "0x…" }
-   → 401 { ok:false, error:"Signature required…", challenge:"Fangorn onchain-gate…\nIssued-At: <unix>" }
+   → 401 { ok:false, error:"Sign the `challenge`…", challenge:"Fangorn onchain-gate…\nIssued-At: <unix>" }
    ```
 
 2. Caller signs `challenge` with the address's key and resends:
 
    ```
    POST / { "address":"0x…", "message":"<challenge verbatim>", "signature":"0x…65 bytes" }
-   → 200 { ok:true, uploadUrl, … }
+   → 200 { ok:true, uploadUrl, … }   (or 403 if that address isn't registered)
    ```
 
 The worker requires the signed `message` to be the canonical challenge verbatim,

@@ -1,3 +1,8 @@
 # Copy to `.dev.vars` for local `wrangler dev`. Never commit the real file.
-RPC_URL="https://your-evm-rpc.example/v2/YOUR_KEY"
+
+# Required: a Pinata API key with the Files:Write scope.
 PINATA_JWT="your-pinata-jwt"
+
+# Optional: override the public Arbitrum Sepolia RPC from wrangler.toml with your
+# own endpoint (e.g. Alchemy) for higher rate limits.
+# RPC_URL="https://your-evm-rpc.example/v2/YOUR_KEY"
