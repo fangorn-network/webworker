@@ -45,7 +45,10 @@ SIGNATURE_MAX_AGE = "300"       # max age in seconds of the signed challenge's I
 PINATA_NETWORK = "public"        # "public" or "private"
 PINATA_URL_EXPIRES = "300"       # seconds the upload URL stays valid
 PINATA_MAX_FILE_SIZE = "10485760"          # optional, bytes
-PINATA_ALLOW_MIME_TYPES = "application/json"  # optional CSV
+# Fangorn uploads opaque binary (CAR packfiles + raw commit blocks) as
+# octet-stream, and serialized payloads as text/plain — so allow exactly those.
+# Widen or unset to permit more MIME types.
+PINATA_ALLOW_MIME_TYPES = "application/octet-stream,text/plain"  # optional CSV
 
 # CORS — browsers only. This restricts which *web pages* may read the response
 # from their JavaScript; it is NOT an access-control gate and does NOT affect
