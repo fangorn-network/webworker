@@ -72,14 +72,68 @@ export default {
       }
     }
 
-    // 2) Registered (or stubbed) — issue a Pinata presigned upload URL.
+    // Resolve the upload size the caller declared (the SDK sends its exact byte
+    // length). Absent → a back-compat default. Bounded per-request so nobody can
+    // mint a URL for an absurd file.
+    const maxUpload = Number(env.MAX_UPLOAD_SIZE || DEFAULT_MAX_UPLOAD);
+    let size;
+    if (input.size == null || input.size === '') {
+      size = Number(env.DEFAULT_UPLOAD_SIZE || DEFAULT_UPLOAD_SIZE);
+    } else {
+      size = Number(input.size);
+      if (!Number.isInteger(size) || size <= 0) {
+        return json(400, { error: 'size must be a positive integer number of bytes.' }, cors);
+      }
+    }
+    if (size > maxUpload) {
+      return json(413, {
+        ok: false,
+        address,
+        error: `Requested upload size ${size} exceeds the per-upload maximum of ${maxUpload} bytes.`,
+      }, cors);
+    }
+
+    // Per-wallet daily *byte budget* — bounds the Pinata bill now that callers
+    // declare their size. Checked after auth so an over-budget wallet never
+    // mints; usage is recorded only on a successful grant (a failed mint costs
+    // no quota). Debits the declared size, which the SDK sets to the exact bytes.
+    //
+    // Retries reuse the caller's uploadId: a transient upload failure re-mints a
+    // fresh (single-use) URL, but must NOT re-charge. A size already paid under
+    // this uploadId skips both the budget check and the debit.
+    const cap = byteCapConfig(env);
+    let used = 0;
+    let charge = cap.active;
+    if (cap.active && input.uploadId) {
+      const paid = await paidSize(env, address, input.uploadId);
+      if (paid !== null && size <= paid) charge = false; // already paid on a prior attempt
+    }
+    if (charge) {
+      used = await currentUsage(env, address);
+      if (used + size > cap.limit) {
+        return json(429, {
+          ok: false,
+          address,
+          error: `Daily storage budget reached (${cap.limit} bytes/wallet, ${used} used). Resets at 00:00 UTC.`,
+        }, cors);
+      }
+    }
+
+    // 2) Registered (or stubbed) — issue a Pinata presigned upload URL scoped to
+    // the requested size (plus a little multipart/form-data headroom).
     try {
-      const uploadUrl = await createPinataUploadUrl(env);
+      const maxFileSize = size + UPLOAD_HEADROOM;
+      const uploadUrl = await createPinataUploadUrl(env, maxFileSize);
+      if (charge) {
+        await recordUsage(env, address, used, size);
+        if (input.uploadId) await markPaid(env, address, input.uploadId, size);
+      }
       return json(200, {
         ok: true,
         address,
         uploadUrl,
         network: env.PINATA_NETWORK || 'public',
+        maxFileSize,
         expiresIn: Number(env.PINATA_URL_EXPIRES || 300),
         ...(stubbed ? { stubbed: true } : {}),
       }, cors);
@@ -91,9 +145,10 @@ export default {
 
 /* ─────────────────────────── registration check ────────────────────────── */
 
-// Default registry target: the Fangorn registry (a Stylus contract) on Arbitrum
-// Sepolia, reachable over the public RPC (fine for a read-only eth_call).
-const DEFAULT_REGISTRY_ADDRESS = '0x0d3f3b1bb7cb809e35f5e50c5c51f013b418ab64';
+// Default RPC endpoint (the public Arbitrum Sepolia RPC is fine for a read-only
+// eth_call). The registry *contract* deliberately has NO default: gating on the
+// wrong contract silently is worse than failing, so it must be set explicitly in
+// wrangler.toml (a `[build]` guard there also blocks deploy if it's absent).
 const DEFAULT_RPC_URL = 'https://sepolia-rollup.arbitrum.io/rpc';
 
 // The registry's ABI function. NOTE: the Stylus (Rust) contract's `is_registered`
@@ -105,16 +160,17 @@ const DEFAULT_REGISTRY_FUNCTION = 'isRegistered(address)';
  * Returns whether `address` is registered, by calling the registry's
  * `isRegistered(address)` view (returns `bool`).
  *
- * Env (all optional; sensible Arbitrum Sepolia defaults):
- *   RPC_URL                    EVM JSON-RPC endpoint.
- *   REGISTRY_CONTRACT_ADDRESS  Registry contract to call.
- *   REGISTRY_FUNCTION          ABI signature of the check (default
+ * Env:
+ *   RPC_URL                    EVM JSON-RPC endpoint (optional; defaults to the
+ *                              public Arbitrum Sepolia RPC).
+ *   REGISTRY_CONTRACT_ADDRESS  Registry contract to call — REQUIRED, no default.
+ *   REGISTRY_FUNCTION          ABI signature of the check (optional; default
  *                              "isRegistered(address)").
  */
 async function isRegistered(env, address) {
   const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
-  const contract = env.REGISTRY_CONTRACT_ADDRESS || DEFAULT_REGISTRY_ADDRESS;
-  if (!isAddress(contract)) throw new Error('REGISTRY_CONTRACT_ADDRESS is missing or invalid.');
+  const contract = env.REGISTRY_CONTRACT_ADDRESS;
+  if (!isAddress(contract)) throw new Error('REGISTRY_CONTRACT_ADDRESS is not set (or not a valid address) in wrangler.toml.');
 
   const selector = toFunctionSelector(env.REGISTRY_FUNCTION || DEFAULT_REGISTRY_FUNCTION);
   const data = selector + encodeAddress(address);
@@ -138,6 +194,61 @@ async function isRegistered(env, address) {
   return firstWord(body.result) !== 0n;
 }
 
+/* ─────────────────────────── per-wallet rate cap ───────────────────────── */
+
+// Upload sizing defaults (all overridable via env; bytes).
+const DEFAULT_UPLOAD_SIZE = 10 * 1024 * 1024;   // used when a caller omits `size` (older SDKs)
+const DEFAULT_MAX_UPLOAD = 500 * 1024 * 1024;   // per-request ceiling when MAX_UPLOAD_SIZE unset
+const UPLOAD_HEADROOM = 4096;                    // multipart/form-data overhead slack on max_file_size
+
+// Per-wallet daily *byte budget*, backed by Workers KV. The SDK declares each
+// upload's size, so we meter the bytes we grant per wallet per UTC day — a
+// direct bound on the Pinata bill. Inactive unless DAILY_BYTE_LIMIT > 0 and the
+// RATE_KV namespace is bound, so existing deployments/tests are unaffected until
+// opted in.
+// ponytail: KV is eventually consistent, so a concurrent burst across edge
+// locations can overshoot the budget by a little. Fine for a cost guard; swap to
+// a Durable Object if you ever need exact enforcement.
+function byteCapConfig(env) {
+  const limit = Number(env.DAILY_BYTE_LIMIT || 0);
+  return { active: limit > 0 && !!env.RATE_KV, limit };
+}
+
+// One byte counter per wallet per UTC day.
+function usageKey(address) {
+  return `bytes:${address}:${new Date().toISOString().slice(0, 10)}`;
+}
+
+async function currentUsage(env, address) {
+  return Number(await env.RATE_KV.get(usageKey(address))) || 0;
+}
+
+async function recordUsage(env, address, used, size) {
+  // TTL only needs to outlive the UTC day the key belongs to; 2 days is plenty.
+  await env.RATE_KV.put(usageKey(address), String(used + size), { expirationTtl: 172800 });
+}
+
+// Idempotency marker so retries of one logical upload (same uploadId) are
+// charged once. Stores the paid size; a re-mint at the same-or-smaller size is
+// free (the legit retry case), a larger size is charged normally.
+// ponytail: a modified client could reuse an uploadId for other same-size files
+// within the TTL to under-pay — acceptable for a soft budget already bypassable
+// via multiple wallets. Make uploadId a content hash to close it (that also
+// dedupes identical content, which Pinata pins once anyway).
+function paidKey(address, uploadId) {
+  return `paid:${address}:${uploadId}`;
+}
+
+async function paidSize(env, address, uploadId) {
+  const raw = await env.RATE_KV.get(paidKey(address, uploadId));
+  return raw === null ? null : Number(raw) || 0;
+}
+
+async function markPaid(env, address, uploadId, size) {
+  // Only needs to outlive the retry window (~2 min at 6 attempts); keep it short.
+  await env.RATE_KV.put(paidKey(address, uploadId), String(size), { expirationTtl: 3600 });
+}
+
 /* ───────────────────────────── pinata ──────────────────────────────────── */
 
 /**
@@ -149,15 +260,15 @@ async function isRegistered(env, address) {
  *
  * Docs: https://docs.pinata.cloud/files/presigned-urls
  */
-async function createPinataUploadUrl(env) {
+async function createPinataUploadUrl(env, maxFileSize) {
   if (!env.PINATA_JWT) throw new Error('PINATA_JWT is not set.');
 
   const payload = {
     network: env.PINATA_NETWORK || 'public',
     expires: Number(env.PINATA_URL_EXPIRES || 300),
     date: Math.floor(Date.now() / 1000),
+    max_file_size: maxFileSize,
   };
-  if (env.PINATA_MAX_FILE_SIZE) payload.max_file_size = Number(env.PINATA_MAX_FILE_SIZE);
   if (env.PINATA_ALLOW_MIME_TYPES) {
     payload.allow_mime_types = env.PINATA_ALLOW_MIME_TYPES.split(',').map((s) => s.trim()).filter(Boolean);
   }
@@ -287,6 +398,8 @@ async function readInput(request) {
     address: q.get('address')?.trim() || '',
     message: q.get('message') ?? undefined,          // signed verbatim — never trim
     signature: q.get('signature')?.trim() || undefined,
+    size: q.get('size')?.trim() || undefined,        // declared upload size, bytes
+    uploadId: q.get('uploadId')?.trim() || undefined, // idempotency key across retries
   };
   if (request.method === 'POST') {
     const body = await request.json().catch(() => null);
@@ -294,6 +407,10 @@ async function readInput(request) {
       if (!out.address && typeof body.address === 'string') out.address = body.address.trim();
       if (out.message == null && typeof body.message === 'string') out.message = body.message;
       if (!out.signature && typeof body.signature === 'string') out.signature = body.signature.trim();
+      if (out.size == null && (typeof body.size === 'number' || typeof body.size === 'string')) {
+        out.size = String(body.size);
+      }
+      if (!out.uploadId && typeof body.uploadId === 'string') out.uploadId = body.uploadId.trim();
     }
   }
   return out;

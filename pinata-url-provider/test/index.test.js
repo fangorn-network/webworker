@@ -54,7 +54,12 @@ const ACCOUNT = privateKeyToAccount('0x' + '11'.repeat(32));
 const OTHER = privateKeyToAccount('0x' + '22'.repeat(32));
 
 function baseEnv(overrides = {}) {
-  return { PINATA_JWT: 'test-jwt', STUB_REGISTRATION_CHECK: 'false', ...overrides };
+  return {
+    PINATA_JWT: 'test-jwt',
+    STUB_REGISTRATION_CHECK: 'false',
+    REGISTRY_CONTRACT_ADDRESS: '0x9a3811b365a4aeea1626eaad185b273424ae5e48',
+    ...overrides,
+  };
 }
 
 // Mirror of the worker's canonical challenge template (see buildChallengeMessage).
@@ -91,6 +96,19 @@ async function call(env, { method = 'POST', body, query, headers } = {}) {
   try { json = JSON.parse(text); } catch { json = text; }
   return { status: res.status, json, headers: res.headers };
 }
+
+// In-memory Workers KV stub: just enough of get/put for the rate-cap tests.
+function mockKV(initial = {}) {
+  const store = new Map(Object.entries(initial).map(([k, v]) => [k, String(v)]));
+  return {
+    get: async (k) => (store.has(k) ? store.get(k) : null),
+    put: async (k, v) => void store.set(k, String(v)),
+    _store: store,
+  };
+}
+
+const utcDay = () => new Date().toISOString().slice(0, 10);
+const usageKey = (account) => `bytes:${account.address.toLowerCase()}:${utcDay()}`;
 
 /* ── success modes ───────────────────────────────────────────────────────── */
 
@@ -131,6 +149,13 @@ test('GET with proof in query params → 200', async () => {
 test('unsupported method → 405', async () => {
   const res = await call(baseEnv(), { method: 'PUT' });
   assert.equal(res.status, 405);
+});
+
+test('non-stubbed + missing REGISTRY_CONTRACT_ADDRESS → 502 (no silent fallback)', async () => {
+  const env = baseEnv();
+  delete env.REGISTRY_CONTRACT_ADDRESS;
+  const res = await call(env, { body: await proof() }); // throws before any RPC fetch
+  assert.equal(res.status, 502);
 });
 
 test('invalid address → 400', async () => {
@@ -203,4 +228,70 @@ test('missing PINATA_JWT → 502', async () => {
   const res = await call(env, { body: await proof() });
   assert.equal(res.status, 502);
   assert.match(res.json.error, /Failed to create Pinata upload URL/);
+});
+
+/* ── per-wallet byte budget ──────────────────────────────────────────────── */
+
+test('declared size under budget → 200, URL scoped to size, debits bytes', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [usageKey(ACCOUNT)]: 1000 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 4000 } });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.ok, true);
+  assert.equal(res.json.maxFileSize, 4000 + 4096);              // requested + headroom
+  assert.equal(kv._store.get(usageKey(ACCOUNT)), '5000');       // 1000 + declared 4000
+});
+
+test('requested size over the per-upload ceiling → 413 (no mint)', async () => {
+  rpcResponse = registeredRpc; // pinataResponse null: a mint would throw
+  const env = baseEnv({ MAX_UPLOAD_SIZE: '5000' });
+  const res = await call(env, { body: { ...(await proof()), size: 6000 } });
+  assert.equal(res.status, 413);
+  assert.match(res.json.error, /per-upload maximum/i);
+});
+
+test('declared size over remaining budget → 429 and never mints', async () => {
+  rpcResponse = registeredRpc; // pinataResponse null: a mint would throw
+  const kv = mockKV({ [usageKey(ACCOUNT)]: 9000 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
+  assert.equal(res.status, 429);
+  assert.match(res.json.error, /budget reached/i);
+  assert.equal(kv._store.get(usageKey(ACCOUNT)), '9000'); // unchanged — no grant
+});
+
+test('failed mint does not consume budget', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = () => jsonResponse(500, { error: 'nope' });
+  const kv = mockKV({ [usageKey(ACCOUNT)]: 100 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
+  assert.equal(res.status, 502);
+  assert.equal(kv._store.get(usageKey(ACCOUNT)), '100'); // no grant, no charge
+});
+
+test('retry with same uploadId re-mints but is charged once', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [usageKey(ACCOUNT)]: 1000 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const body = { ...(await proof()), size: 3000, uploadId: 'up-1' };
+  const first = await call(env, { body });
+  const second = await call(env, { body }); // same uploadId = a retry
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);       // re-mints a fresh URL
+  assert.equal(kv._store.get(usageKey(ACCOUNT)), '4000'); // 1000 + 3000 once, not twice
+});
+
+test('reusing an uploadId for a larger size is charged the larger size', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [usageKey(ACCOUNT)]: 0 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const p = await proof();
+  await call(env, { body: { ...p, size: 2000, uploadId: 'up-2' } }); // pays 2000
+  await call(env, { body: { ...p, size: 5000, uploadId: 'up-2' } }); // larger → charged
+  assert.equal(kv._store.get(usageKey(ACCOUNT)), '7000'); // 2000 + 5000
 });
