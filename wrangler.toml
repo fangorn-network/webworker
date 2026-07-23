@@ -4,10 +4,11 @@ compatibility_date = "2025-07-18"
 
 [[r2_buckets]]
 binding = "BUCKET"
-bucket_name = "my-first-bucket"
+bucket_name = "fttf"
 
 [vars]
-SETTLEMENT_REGISTRY_ADDRESS = "0x282915f5c6f6c9b15c131fa379916da47754fbef"
+# WORKER_X25519_SECRET is a secret, set via `wrangler secret put WORKER_X25519_SECRET`
+SETTLEMENT_REGISTRY_ADDRESS = "0xec43a354e1b375585e58ae1e6b02954f84139feb"
 ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
 

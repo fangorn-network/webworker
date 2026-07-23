@@ -40,3 +40,17 @@ While the infrastructure is hardened, developers must secure the logic and data 
     Authentication & Access: You can implement Cloudflare Access with a single click to protect Worker routes or use the Web Crypto API for custom JWT validation.
     Data Protection: Data stored in Workers KV is encrypted at rest using AES-256 and encrypted in transit via TLS.
     Security Headers: Workers are frequently used to inject security headers (e.g., CSP, HSTS, X-Frame-Options) into responses to protect against XSS and clickjacking. 
+
+---
+
+### Gen keys
+
+openssl rand -hex 32 | npx wrangler secret put WORKER_X25519_SECRET
+
+
+# deploy work
+cd ~/fangorn/webworker && npx wrangler deploy      # ships the new /upload + DEK-from-R2 /access
+
+# run the example
+cd ~/fangorn/x402f && npm run client:node          # runs the loop (costs Sepolia gas for createResource)
+
