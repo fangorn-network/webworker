@@ -3,9 +3,9 @@
  *
  * The worker is a plain `(request, env) => Response` over standard Web APIs, so
  * we call it directly (no miniflare) and stub the two outbound `fetch`es it
- * makes: the registry `eth_call` (RPC) and the Pinata `sign` endpoint. Ownership
- * signatures are real EIP-191 personal_signs via viem, the same lib the worker
- * uses to recover them.
+ * makes: the SubscriptionRegistry `access()` eth_call (RPC) and the Pinata `sign`
+ * endpoint. Ownership signatures are real EIP-191 personal_signs via viem, the
+ * same lib the worker uses to recover them.
  *
  * Run:  node --test   (from pinata-url-provider/)
  */
@@ -22,28 +22,35 @@ import worker from '../src/index.js';
 const realFetch = globalThis.fetch;
 let rpcResponse = null;
 let pinataResponse = null;
+let lastPinataInit = null; // request init captured from the Pinata sign call
 
 before(() => {
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, init) => {
     const u = String(url);
     if (u.includes('uploads.pinata.cloud')) {
       if (!pinataResponse) throw new Error('unexpected Pinata fetch');
+      lastPinataInit = init;
       return pinataResponse();
     }
     if (!rpcResponse) throw new Error('unexpected RPC fetch');
-    return rpcResponse();
+    return rpcResponse(u, init);
   };
 });
 after(() => { globalThis.fetch = realFetch; });
-beforeEach(() => { rpcResponse = null; pinataResponse = null; });
+beforeEach(() => { rpcResponse = null; pinataResponse = null; lastPinataInit = null; });
 
 const jsonResponse = (status, obj) =>
   new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
 
-const abiWord = (n) => '0x' + String(n).padStart(64, '0');
-const registeredRpc = () => jsonResponse(200, { result: abiWord(1) });
-const notRegisteredRpc = () => jsonResponse(200, { result: abiWord(0) });
+const wordHex = (n) => BigInt(n).toString(16).padStart(64, '0');
 const pinataOk = () => jsonResponse(200, { data: 'https://uploads.pinata.cloud/signed/xyz' });
+
+// The SubscriptionRegistry `access(address)` view returns two 32-byte words:
+// [0] bool registered, [1] uint64 paidAt (Unix seconds). One eth_call per request.
+const accessRpc = ({ registered = true, paidAt = 0 } = {}) =>
+  () => jsonResponse(200, { result: '0x' + wordHex(registered ? 1 : 0) + wordHex(paidAt) });
+const registeredRpc = accessRpc({ registered: true });
+const notRegisteredRpc = accessRpc({ registered: false });
 
 /* ── request/proof helpers ───────────────────────────────────────────────── */
 const BASE_URL = 'https://worker.test/';
@@ -57,7 +64,7 @@ function baseEnv(overrides = {}) {
   return {
     PINATA_JWT: 'test-jwt',
     STUB_REGISTRATION_CHECK: 'false',
-    REGISTRY_CONTRACT_ADDRESS: '0x9a3811b365a4aeea1626eaad185b273424ae5e48',
+    SUBSCRIPTION_CONTRACT_ADDRESS: '0x9a3811b365a4aeea1626eaad185b273424ae5e48',
     ...overrides,
   };
 }
@@ -109,6 +116,7 @@ function mockKV(initial = {}) {
 
 const utcDay = () => new Date().toISOString().slice(0, 10);
 const usageKey = (account) => `bytes:${account.address.toLowerCase()}:${utcDay()}`;
+const totalKey = (account) => `total:${account.address.toLowerCase()}`;
 
 /* ── success modes ───────────────────────────────────────────────────────── */
 
@@ -137,6 +145,17 @@ test('registered on-chain + valid signature → 200 with uploadUrl', async () =>
   assert.equal(res.json.stubbed, undefined);
 });
 
+test('PINATA_ALLOW_MIME_TYPES → forwarded to Pinata as a trimmed allow_mime_types', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  // Spaces after the comma also exercise the worker's per-entry .trim().
+  const env = baseEnv({ PINATA_ALLOW_MIME_TYPES: 'application/octet-stream, text/plain' });
+  const res = await call(env, { body: await proof() });
+  assert.equal(res.status, 200);
+  const payload = JSON.parse(lastPinataInit.body);
+  assert.deepEqual(payload.allow_mime_types, ['application/octet-stream', 'text/plain']);
+});
+
 test('GET with proof in query params → 200', async () => {
   pinataResponse = pinataOk;
   const res = await call(baseEnv({ STUB_REGISTRATION_CHECK: 'true' }), { method: 'GET', query: await proof() });
@@ -151,9 +170,9 @@ test('unsupported method → 405', async () => {
   assert.equal(res.status, 405);
 });
 
-test('non-stubbed + missing REGISTRY_CONTRACT_ADDRESS → 502 (no silent fallback)', async () => {
+test('non-stubbed + missing SUBSCRIPTION_CONTRACT_ADDRESS → 502 (no silent fallback)', async () => {
   const env = baseEnv();
-  delete env.REGISTRY_CONTRACT_ADDRESS;
+  delete env.SUBSCRIPTION_CONTRACT_ADDRESS;
   const res = await call(env, { body: await proof() }); // throws before any RPC fetch
   assert.equal(res.status, 502);
 });
@@ -210,7 +229,7 @@ test('RPC failure → 502', async () => {
   rpcResponse = () => jsonResponse(500, { error: 'rpc down' });
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 502);
-  assert.match(res.json.error, /registration check failed/i);
+  assert.match(res.json.error, /access check failed/i);
 });
 
 test('Pinata sign failure → 502', async () => {
@@ -294,4 +313,89 @@ test('reusing an uploadId for a larger size is charged the larger size', async (
   await call(env, { body: { ...p, size: 2000, uploadId: 'up-2' } }); // pays 2000
   await call(env, { body: { ...p, size: 5000, uploadId: 'up-2' } }); // larger → charged
   assert.equal(kv._store.get(usageKey(ACCOUNT)), '7000'); // 2000 + 5000
+});
+
+/* ── free tier + on-chain subscription ───────────────────────────────────── */
+
+test('under the free tier → 200, debits the lifetime counter, no window check', async () => {
+  // access() returns registered=true, paidAt=0. Under the free tier the window
+  // check is skipped, so paidAt=0 doesn't matter and the upload mints.
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const kv = mockKV();
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 4000 } });
+  assert.equal(res.status, 200);
+  assert.equal(kv._store.get(totalKey(ACCOUNT)), '4000');
+});
+
+test('past the free tier with an active subscription → 200', async () => {
+  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() });
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
+  assert.equal(res.status, 200);
+  assert.equal(kv._store.get(totalKey(ACCOUNT)), '11000'); // keeps climbing past the limit
+});
+
+test('past the free tier with no subscription → 402 (never mints)', async () => {
+  rpcResponse = accessRpc({ registered: true, paidAt: 0 }); // never subscribed
+  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
+  assert.equal(res.status, 402);
+  assert.match(res.json.error, /sign up for a subscription/i);
+  assert.match(res.json.error, /fangorn\.network\/subscribe/); // default SUBSCRIBE_URL
+  assert.equal(kv._store.get(totalKey(ACCOUNT)), '9000'); // unchanged — no grant
+});
+
+test('past the free tier with a stale (>30d) subscription → 402', async () => {
+  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() - 40 * 86400 });
+  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
+  assert.equal(res.status, 402);
+});
+
+test('a subscriber past the free tier is still bound by the daily cap → 429', async () => {
+  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() }); // active sub
+  const kv = mockKV({ [totalKey(ACCOUNT)]: 20000, [usageKey(ACCOUNT)]: 4000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', DAILY_BYTE_LIMIT: '5000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
+  assert.equal(res.status, 429);
+  assert.match(res.json.error, /budget reached/i);
+});
+
+test('retry past the free tier (same uploadId) is charged once', async () => {
+  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() });
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const body = { ...(await proof()), size: 2000, uploadId: 'sub-1' };
+  const first = await call(env, { body });
+  const second = await call(env, { body }); // same uploadId = a retry
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(kv._store.get(totalKey(ACCOUNT)), '11000'); // 9000 + 2000 once, not twice
+});
+
+/* ── usage endpoint ──────────────────────────────────────────────────────── */
+
+test('GET /usage → byte counters + limits (no proof, no RPC)', async () => {
+  // rpcResponse/pinataResponse stay null: /usage must hit neither.
+  const kv = mockKV({ [totalKey(ACCOUNT)]: 500, [usageKey(ACCOUNT)]: 200 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', DAILY_BYTE_LIMIT: '5000', RATE_KV: kv });
+  const res = await worker.fetch(new Request(`https://worker.test/usage?address=${ACCOUNT.address}`), env);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.total, 500);
+  assert.equal(body.freeLimit, 10000);
+  assert.equal(body.daily, 200);
+  assert.equal(body.dailyLimit, 5000);
+});
+
+test('GET /usage with a bad address → 400', async () => {
+  const res = await worker.fetch(new Request('https://worker.test/usage?address=nope'), baseEnv());
+  assert.equal(res.status, 400);
 });

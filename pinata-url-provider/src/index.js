@@ -31,6 +31,31 @@ export default {
       return json(405, { error: 'Method not allowed. Use GET or POST.' }, cors);
     }
 
+    // GET /usage?address=0x… — a wallet's byte counters (lifetime total + today's
+    // daily) and the configured limits, so the dashboard can show usage. Read-only
+    // and unauthenticated: byte counts aren't sensitive (and are roughly inferable
+    // on-chain), while the sensitive action — minting an upload URL — still requires
+    // the signed ownership proof below.
+    const url = new URL(request.url);
+    if (url.pathname === '/usage') {
+      const address = (url.searchParams.get('address') || '').toLowerCase();
+      if (!isAddress(address)) {
+        return json(400, { error: 'Provide a valid EVM address via ?address=0x….' }, cors);
+      }
+      const kvOn = !!env.RATE_KV;
+      const free = freeTierConfig(env);
+      const cap = byteCapConfig(env);
+      return json(200, {
+        ok: true,
+        address,
+        total: kvOn ? await currentTotal(env, address) : 0,
+        freeLimit: free.active ? free.limit : 0,
+        daily: kvOn ? await currentUsage(env, address) : 0,
+        dailyLimit: cap.active ? cap.limit : 0,
+        day: new Date().toISOString().slice(0, 10),
+      }, cors);
+    }
+
     // Read the request once (the POST body can only be consumed a single time):
     // address plus the optional ownership proof (message + signature).
     const input = await readInput(request);
@@ -51,18 +76,19 @@ export default {
       }, cors);
     }
 
-    // 1) Check on-chain registration — unless STUB_REGISTRATION_CHECK is set, in
-    // which case a valid signature alone is enough (useful for local dev/testing
-    // without an RPC endpoint).
+    // 1) On-chain access gate — ONE call to the SubscriptionRegistry's access()
+    // view returns both registration status (it cross-calls DataRegistry internally)
+    // and the subscription timestamp. STUB_REGISTRATION_CHECK skips the chain
+    // entirely (a valid signature alone suffices — dev/testing without an RPC).
     const stubbed = (env.STUB_REGISTRATION_CHECK ?? 'false') === 'true';
+    let access = null;
     if (!stubbed) {
-      let registered;
       try {
-        registered = await isRegistered(env, address);
+        access = await readAccess(env, address);
       } catch (err) {
-        return json(502, { error: 'On-chain registration check failed.', detail: String(err?.message || err) }, cors);
+        return json(502, { error: 'On-chain access check failed.', detail: String(err?.message || err) }, cors);
       }
-      if (!registered) {
+      if (!access.registered) {
         const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
         return json(403, {
           ok: false,
@@ -102,20 +128,45 @@ export default {
     // fresh (single-use) URL, but must NOT re-charge. A size already paid under
     // this uploadId skips both the budget check and the debit.
     const cap = byteCapConfig(env);
+    const free = freeTierConfig(env);
     let used = 0;
-    let charge = cap.active;
-    if (cap.active && input.uploadId) {
+    let total = 0;
+    let charge = cap.active || free.active;
+    if (charge && input.uploadId) {
       const paid = await paidSize(env, address, input.uploadId);
-      if (paid !== null && size <= paid) charge = false; // already paid on a prior attempt
+      if (paid !== null && size <= paid) charge = false; // already granted on a prior attempt
     }
     if (charge) {
-      used = await currentUsage(env, address);
-      if (used + size > cap.limit) {
-        return json(429, {
-          ok: false,
-          address,
-          error: `Daily storage budget reached (${cap.limit} bytes/wallet, ${used} used). Resets at 00:00 UTC.`,
-        }, cors);
+      // Free tier: the first FREE_BYTE_LIMIT lifetime bytes are free. Beyond that,
+      // the wallet must have an active on-chain subscription (fee paid within the
+      // window). The upload that first crosses the limit already needs one.
+      if (free.active) {
+        total = await currentTotal(env, address);
+        if (total + size > free.limit) {
+          // Past the free tier: require an active subscription (fee paid within the
+          // window). We already have paidAt from the access() read above. Stub mode
+          // has no chain data → treat as active for dev.
+          const active = stubbed || isWithinWindow(env, access.paidAt);
+          if (!active) {
+            const subscribeUrl = env.SUBSCRIBE_URL || 'https://fangorn.network/subscribe';
+            return json(402, {
+              ok: false,
+              address,
+              error: `To continue using Fangorn's storage, please sign up for a subscription at ${subscribeUrl}`,
+            }, cors);
+          }
+        }
+      }
+      // Daily ceiling still applies to everyone (free and subscribed) as an abuse guard.
+      if (cap.active) {
+        used = await currentUsage(env, address);
+        if (used + size > cap.limit) {
+          return json(429, {
+            ok: false,
+            address,
+            error: `Daily storage budget reached (${cap.limit} bytes/wallet, ${used} used). Resets at 00:00 UTC.`,
+          }, cors);
+        }
       }
     }
 
@@ -125,7 +176,10 @@ export default {
       const maxFileSize = size + UPLOAD_HEADROOM;
       const uploadUrl = await createPinataUploadUrl(env, maxFileSize);
       if (charge) {
-        await recordUsage(env, address, used, size);
+        // Keep the lifetime counter climbing (even past the free limit) so a
+        // wallet can't dip back under it after crossing and get free uploads again.
+        if (free.active) await recordTotal(env, address, total, size);
+        if (cap.active) await recordUsage(env, address, used, size);
         if (input.uploadId) await markPaid(env, address, input.uploadId, size);
       }
       return json(200, {
@@ -143,37 +197,39 @@ export default {
   },
 };
 
-/* ─────────────────────────── registration check ────────────────────────── */
+/* ───────────────────────── on-chain access gate ────────────────────────── */
 
 // Default RPC endpoint (the public Arbitrum Sepolia RPC is fine for a read-only
-// eth_call). The registry *contract* deliberately has NO default: gating on the
+// eth_call). The subscription *contract* deliberately has NO default: gating on the
 // wrong contract silently is worse than failing, so it must be set explicitly in
 // wrangler.toml (a `[build]` guard there also blocks deploy if it's absent).
 const DEFAULT_RPC_URL = 'https://sepolia-rollup.arbitrum.io/rpc';
 
-// The registry's ABI function. NOTE: the Stylus (Rust) contract's `is_registered`
-// method is exposed in the ABI as camelCase `isRegistered(address)` — calling the
-// snake_case selector reverts. Verified on-chain against the default contract.
-const DEFAULT_REGISTRY_FUNCTION = 'isRegistered(address)';
+// The SubscriptionRegistry view `access(address) -> (bool registered, uint64 paidAt)`.
+// It cross-calls DataRegistry.isRegistered internally, so this single read gives the
+// worker both the registration gate and the subscription timestamp. Stylus exposes
+// the Rust method as camelCase.
+const DEFAULT_ACCESS_FUNCTION = 'access(address)';
 
 /**
- * Returns whether `address` is registered, by calling the registry's
- * `isRegistered(address)` view (returns `bool`).
+ * One `eth_call` to the SubscriptionRegistry's `access(address)` view, returning
+ * `{ registered, paidAt }`. `registered` is the contract's cross-call to
+ * DataRegistry.isRegistered; `paidAt` is the wallet's last subscription timestamp
+ * (Unix seconds bigint, 0 if never). The worker applies the free-tier + active-
+ * window policy itself.
  *
  * Env:
- *   RPC_URL                    EVM JSON-RPC endpoint (optional; defaults to the
- *                              public Arbitrum Sepolia RPC).
- *   REGISTRY_CONTRACT_ADDRESS  Registry contract to call — REQUIRED, no default.
- *   REGISTRY_FUNCTION          ABI signature of the check (optional; default
- *                              "isRegistered(address)").
+ *   RPC_URL                        EVM JSON-RPC endpoint (optional; defaults to the
+ *                                  public Arbitrum Sepolia RPC).
+ *   SUBSCRIPTION_CONTRACT_ADDRESS  SubscriptionRegistry to call — REQUIRED, no default.
+ *   ACCESS_FUNCTION                ABI signature (optional; default "access(address)").
  */
-async function isRegistered(env, address) {
+async function readAccess(env, address) {
   const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
-  const contract = env.REGISTRY_CONTRACT_ADDRESS;
-  if (!isAddress(contract)) throw new Error('REGISTRY_CONTRACT_ADDRESS is not set (or not a valid address) in wrangler.toml.');
+  const contract = env.SUBSCRIPTION_CONTRACT_ADDRESS;
+  if (!isAddress(contract)) throw new Error('SUBSCRIPTION_CONTRACT_ADDRESS is not set (or not a valid address) in wrangler.toml.');
 
-  const selector = toFunctionSelector(env.REGISTRY_FUNCTION || DEFAULT_REGISTRY_FUNCTION);
-  const data = selector + encodeAddress(address);
+  const data = toFunctionSelector(env.ACCESS_FUNCTION || DEFAULT_ACCESS_FUNCTION) + encodeAddress(address);
 
   const res = await fetch(rpcUrl, {
     method: 'POST',
@@ -190,8 +246,19 @@ async function isRegistered(env, address) {
   const body = await res.json();
   if (body.error) throw new Error(`RPC error: ${body.error.message || JSON.stringify(body.error)}`);
 
-  // `isRegistered` returns a bool — the ABI word is 1 (true) or 0 (false).
-  return firstWord(body.result) !== 0n;
+  // access() returns two 32-byte words: [0] bool registered, [1] uint64 paidAt.
+  return { registered: wordAt(body.result, 0) !== 0n, paidAt: wordAt(body.result, 1) };
+}
+
+/**
+ * Whether a subscription paid at `paidAt` (Unix seconds bigint, 0 = never) is still
+ * active — within SUBSCRIPTION_WINDOW_DAYS (default 30) of now. The window lives
+ * here, not on-chain, so it's tunable without a contract redeploy.
+ */
+function isWithinWindow(env, paidAt) {
+  if (paidAt === 0n) return false;
+  const windowSecs = BigInt(Number(env.SUBSCRIPTION_WINDOW_DAYS || 30) * 86400);
+  return BigInt(Math.floor(Date.now() / 1000)) < paidAt + windowSecs;
 }
 
 /* ─────────────────────────── per-wallet rate cap ───────────────────────── */
@@ -212,6 +279,27 @@ const UPLOAD_HEADROOM = 4096;                    // multipart/form-data overhead
 function byteCapConfig(env) {
   const limit = Number(env.DAILY_BYTE_LIMIT || 0);
   return { active: limit > 0 && !!env.RATE_KV, limit };
+}
+
+// Lifetime free tier: a cumulative per-wallet byte allowance. Beyond it, each
+// upload requires an active on-chain subscription. Opt-in like the daily cap:
+// inactive unless FREE_BYTE_LIMIT > 0 and RATE_KV is bound.
+function freeTierConfig(env) {
+  const limit = Number(env.FREE_BYTE_LIMIT || 0);
+  return { active: limit > 0 && !!env.RATE_KV, limit };
+}
+
+// One lifetime byte counter per wallet (no date segment, never expires).
+function totalKey(address) {
+  return `total:${address}`;
+}
+
+async function currentTotal(env, address) {
+  return Number(await env.RATE_KV.get(totalKey(address))) || 0;
+}
+
+async function recordTotal(env, address, total, size) {
+  await env.RATE_KV.put(totalKey(address), String(total + size));
 }
 
 // One byte counter per wallet per UTC day.
@@ -425,11 +513,12 @@ function encodeAddress(address) {
   return address.replace(/^0x/, '').toLowerCase().padStart(64, '0');
 }
 
-/** Reads the first 32-byte word of an eth_call result as a bigint. */
-function firstWord(result) {
+/** Reads the i-th 32-byte word (0-indexed) of an eth_call result as a bigint. */
+function wordAt(result, i) {
   if (!result || result === '0x') return 0n;
-  const hex = result.slice(2, 66).padStart(64, '0');
-  return BigInt('0x' + hex);
+  const hex = result.slice(2 + i * 64, 2 + (i + 1) * 64);
+  if (!hex) return 0n;
+  return BigInt('0x' + hex.padStart(64, '0'));
 }
 
 /**

@@ -11,28 +11,36 @@ preview_urls = false
 
 # ── Config guard ─────────────────────────────────────────────────────────────
 # Runs before every `wrangler deploy`/`dev`; a non-zero exit aborts. Refuses to
-# ship unless a well-formed REGISTRY_CONTRACT_ADDRESS is set below — the worker
-# must never silently gate registration on a fallback/wrong contract.
+# ship unless a well-formed SUBSCRIPTION_CONTRACT_ADDRESS is set below — the worker
+# must never silently gate access on a fallback/wrong contract.
 [build]
-command = "grep -qE '^[[:space:]]*REGISTRY_CONTRACT_ADDRESS[[:space:]]*=[[:space:]]*\"0x[0-9a-fA-F]{40}\"' wrangler.toml || { echo 'ERROR: REGISTRY_CONTRACT_ADDRESS missing or invalid in wrangler.toml' >&2; exit 1; }"
+command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:space:]]*\"0x[0-9a-fA-F]{40}\"' wrangler.toml || { echo 'ERROR: SUBSCRIPTION_CONTRACT_ADDRESS missing or invalid in wrangler.toml' >&2; exit 1; }"
 
 # ── Public (non-secret) configuration ────────────────────────────────────────
 # Edit these to point at your registry. The only secret is PINATA_JWT — set it
 # with `wrangler secret put PINATA_JWT` (or .dev.vars locally).
 [vars]
-# ── Registration check ───────────────────────────────────────────────────────
-# The worker calls isRegistered(address) on this contract and gates on the bool.
-# Defaults target the Fangorn registry (a Stylus contract) on Arbitrum Sepolia.
-REGISTRY_CONTRACT_ADDRESS = "0x9a3811b365a4aeea1626eaad185b273424ae5e48"
+# ── Access check ─────────────────────────────────────────────────────────────
+# The worker calls access(address) on the SubscriptionRegistry, which returns
+# (registered, paidAt): `registered` is a cross-contract call to the DataRegistry's
+# isRegistered, and `paidAt` is the wallet's last subscription timestamp. So one
+# read gives both the registration gate and the subscription window check. Point
+# this at the deployed SubscriptionRegistry (Stylus contract) on Arbitrum Sepolia.
+SUBSCRIPTION_CONTRACT_ADDRESS = "0xae8d9ff615d5bc9e31597b6332a8cb6fe110adb2"
 # EVM JSON-RPC endpoint. The public Arbitrum Sepolia RPC is fine for this
 # read-only call; swap in your own (e.g. Alchemy) for higher rate limits.
 RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
 # Which chain the RPC points at (informational only). 421614 = Arbitrum Sepolia.
 CHAIN_ID = "421614"
-# Advanced: the ABI signature of the check. The Stylus contract exposes its Rust
-# `is_registered` as camelCase `isRegistered(address)`; override only if yours
-# differs.
-REGISTRY_FUNCTION = "isRegistered(address)"
+# Advanced: the ABI signature of the access view. Stylus exposes the Rust `access`
+# method as camelCase `access(address)`; override only if yours differs.
+ACCESS_FUNCTION = "access(address)"
+
+# Once a wallet exhausts its free tier (FREE_BYTE_LIMIT below), each upload must
+# have an active subscription: the wallet paid the subscription fee within
+# SUBSCRIPTION_WINDOW_DAYS. The worker gets paidAt from access() above and does the
+# window math here, so the window is tunable without a contract redeploy.
+SUBSCRIPTION_WINDOW_DAYS = "30"
 
 # "true" skips the on-chain check entirely: a valid ownership signature alone
 # yields a presigned URL. Handy for local dev/testing without an RPC endpoint.
@@ -41,6 +49,9 @@ STUB_REGISTRATION_CHECK = "false"
 
 # Shown in the "not registered" error so callers know where to register.
 REGISTER_URL = "https://fangorn.network"
+
+# Shown in the over-free-tier (402) error so callers know where to subscribe.
+SUBSCRIBE_URL = "https://fangorn.network"
 
 # ── Address-ownership proof ──────────────────────────────────────────────────
 # Callers must sign a challenge message with the address's key and send
@@ -73,6 +84,11 @@ ALLOWED_ORIGIN = "*"
 # budget*: the sum of granted upload sizes per wallet per UTC day. Set "0" (or
 # unset) to disable. Requires the RATE_KV namespace binding below.
 DAILY_BYTE_LIMIT = "5368709120"   # 5 GiB / wallet / day
+
+# Lifetime free tier (bytes): the cumulative total a wallet may upload for free
+# before an active subscription is required. Set "0" (or unset) to disable the
+# free-tier/subscription gate entirely. Requires the RATE_KV binding below.
+FREE_BYTE_LIMIT = "1073741824"    # 1 GiB / wallet, lifetime
 
 # Secret to set (do NOT put this in [vars]):
 #   wrangler secret put PINATA_JWT   # Pinata key with the Files:Write scope
