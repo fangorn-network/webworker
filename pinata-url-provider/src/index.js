@@ -174,7 +174,7 @@ export default {
     // the requested size (plus a little multipart/form-data headroom).
     try {
       const maxFileSize = size + UPLOAD_HEADROOM;
-      const uploadUrl = await createPinataUploadUrl(env, maxFileSize);
+      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address);
       if (charge) {
         // Keep the lifetime counter climbing (even past the free limit) so a
         // wallet can't dip back under it after crossing and get free uploads again.
@@ -339,6 +339,68 @@ async function markPaid(env, address, uploadId, size) {
 
 /* ───────────────────────────── pinata ──────────────────────────────────── */
 
+const PINATA_API = 'https://api.pinata.cloud/v3';
+
+/**
+ * The Pinata group every one of `address`'s uploads is filed under, created on
+ * first use. Groups are how a whole deployment's pins stay sweepable: a cleanup
+ * job lists groups by name prefix and unpins their files, without needing any
+ * record of what was uploaded.
+ *
+ * Name is `${PINATA_GROUP_PREFIX}:${address}` — per wallet, namespaced by
+ * deployment. The prefix is REQUIRED: a pin filed under no group (or under an
+ * unlabelled one) is a pin no cleanup job can find, which defeats the point, so
+ * an unset prefix fails the request rather than minting.
+ *
+ * Resolution order: KV cache → look up by name → create. The by-name lookup is
+ * what stops a lost KV entry from forking one wallet's pins across two groups.
+ *
+ * ponytail: two concurrent first-uploads from one wallet can both miss and
+ * create a duplicate same-named group. Harmless — the sweep matches on name, so
+ * both get caught — and self-heals once one wins the cache. A Durable Object
+ * would serialize it, same trade-off as the KV byte counters above.
+ */
+async function walletGroupId(env, address) {
+  const prefix = (env.PINATA_GROUP_PREFIX || '').trim();
+  if (!prefix) throw new Error('PINATA_GROUP_PREFIX is not set (every upload must be filed under a group).');
+  const name = `${prefix}:${address}`;
+  const key = `group:${name}`;
+
+  // Lifetime cache (no TTL) — a wallet's group never changes.
+  if (env.RATE_KV) {
+    const cached = await env.RATE_KV.get(key);
+    if (cached) return cached;
+  }
+
+  const auth = { authorization: `Bearer ${env.PINATA_JWT}` };
+  // Groups are per-network, same as the files they hold.
+  const groups = `${PINATA_API}/groups/${env.PINATA_NETWORK || 'public'}`;
+  // `name` filters by substring, so match exactly rather than taking groups[0].
+  const found = await pinataJson(`${groups}?name=${encodeURIComponent(name)}`, { headers: auth });
+  let id = found?.groups?.find((g) => g.name === name)?.id;
+
+  if (!id) {
+    const created = await pinataJson(groups, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    id = created?.data?.id;
+    if (!id) throw new Error(`Pinata returned no group id: ${JSON.stringify(created)}`);
+  }
+
+  if (env.RATE_KV) await env.RATE_KV.put(key, id);
+  return id;
+}
+
+/** fetch + JSON against the Pinata API, throwing with the body on a non-2xx. */
+async function pinataJson(url, init) {
+  const res = await fetch(url, init);
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`Pinata HTTP ${res.status}: ${data ? JSON.stringify(data) : '(no body)'}`);
+  return data;
+}
+
 /**
  * Mints a Pinata presigned upload URL. The caller can then upload one file with:
  *   const fd = new FormData();
@@ -346,9 +408,12 @@ async function markPaid(env, address, uploadId, size) {
  *   fd.append('network', '<network>');
  *   await fetch(uploadUrl, { method: 'POST', body: fd });
  *
+ * `group_id` is signed into the URL, so the uploader cannot file the pin
+ * somewhere else (or nowhere).
+ *
  * Docs: https://docs.pinata.cloud/files/presigned-urls
  */
-async function createPinataUploadUrl(env, maxFileSize) {
+async function createPinataUploadUrl(env, maxFileSize, address) {
   if (!env.PINATA_JWT) throw new Error('PINATA_JWT is not set.');
 
   const payload = {
@@ -356,12 +421,13 @@ async function createPinataUploadUrl(env, maxFileSize) {
     expires: Number(env.PINATA_URL_EXPIRES || 300),
     date: Math.floor(Date.now() / 1000),
     max_file_size: maxFileSize,
+    group_id: await walletGroupId(env, address),
   };
   if (env.PINATA_ALLOW_MIME_TYPES) {
     payload.allow_mime_types = env.PINATA_ALLOW_MIME_TYPES.split(',').map((s) => s.trim()).filter(Boolean);
   }
 
-  const res = await fetch('https://uploads.pinata.cloud/v3/files/sign', {
+  const data = await pinataJson('https://uploads.pinata.cloud/v3/files/sign', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -369,9 +435,6 @@ async function createPinataUploadUrl(env, maxFileSize) {
     },
     body: JSON.stringify(payload),
   });
-
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`Pinata HTTP ${res.status}: ${data ? JSON.stringify(data) : '(no body)'}`);
 
   const url = data?.data || data?.url;
   if (!url) throw new Error(`Pinata returned no signed URL: ${JSON.stringify(data)}`);

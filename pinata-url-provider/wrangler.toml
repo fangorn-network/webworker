@@ -70,6 +70,13 @@ MAX_UPLOAD_SIZE = "524288000"    # 500 MiB
 # octet-stream, and serialized payloads as text/plain — so allow exactly those.
 # Widen or unset to permit more MIME types.
 PINATA_ALLOW_MIME_TYPES = "application/octet-stream,text/plain"  # optional CSV
+# Every presigned URL is scoped to a Pinata group named "<prefix>:<wallet>" — one
+# group per wallet, namespaced by deployment — so a whole deployment's pins can be
+# swept later (list groups by this prefix, unpin their files). REQUIRED: a mint
+# that can't resolve its group fails rather than pinning where no cleanup job can
+# find it. This deployment is testnet; production is a separate worker deploy with
+# its own prefix.
+PINATA_GROUP_PREFIX = "testnet"
 
 # CORS — browsers only. This restricts which *web pages* may read the response
 # from their JavaScript; it is NOT an access-control gate and does NOT affect
@@ -91,7 +98,7 @@ DAILY_BYTE_LIMIT = "5368709120"   # 5 GiB / wallet / day
 FREE_BYTE_LIMIT = "1073741824"    # 1 GiB / wallet, lifetime
 
 # Secret to set (do NOT put this in [vars]):
-#   wrangler secret put PINATA_JWT   # Pinata key with the Files:Write scope
+#   wrangler secret put PINATA_JWT   # Pinata key with Files:Write AND Groups:Write
 
 # KV namespace backing the per-wallet cap. Create it once, then paste the id:
 #   wrangler kv namespace create RATE_KV

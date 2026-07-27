@@ -2,10 +2,10 @@
  * Tests for the pinata-url-provider worker — one case per success/failure mode.
  *
  * The worker is a plain `(request, env) => Response` over standard Web APIs, so
- * we call it directly (no miniflare) and stub the two outbound `fetch`es it
- * makes: the SubscriptionRegistry `access()` eth_call (RPC) and the Pinata `sign`
- * endpoint. Ownership signatures are real EIP-191 personal_signs via viem, the
- * same lib the worker uses to recover them.
+ * we call it directly (no miniflare) and stub the three outbound `fetch`es it
+ * makes: the SubscriptionRegistry `access()` eth_call (RPC), the Pinata groups
+ * API, and the Pinata `sign` endpoint. Ownership signatures are real EIP-191
+ * personal_signs via viem, the same lib the worker uses to recover them.
  *
  * Run:  node --test   (from pinata-url-provider/)
  */
@@ -17,12 +17,16 @@ import { privateKeyToAccount } from 'viem/accounts';
 import worker from '../src/index.js';
 
 /* ── outbound fetch stub ─────────────────────────────────────────────────── */
-// Routes by URL: anything hitting Pinata → `pinataResponse`, else the RPC.
-// A route left null that gets called throws, so tests catch stray calls.
+// Routes by URL: the Pinata sign endpoint → `pinataResponse`, the Pinata groups
+// API → `groupsResponse`, else the RPC. A route left null that gets called
+// throws, so tests catch stray calls. Groups are defaulted in `beforeEach`
+// (every mint resolves one), and their calls recorded for assertions.
 const realFetch = globalThis.fetch;
 let rpcResponse = null;
 let pinataResponse = null;
+let groupsResponse = null;
 let lastPinataInit = null; // request init captured from the Pinata sign call
+let groupCalls = [];       // { url, init } per Pinata groups API call
 
 before(() => {
   globalThis.fetch = async (url, init) => {
@@ -32,18 +36,34 @@ before(() => {
       lastPinataInit = init;
       return pinataResponse();
     }
+    if (u.includes('api.pinata.cloud')) {
+      if (!groupsResponse) throw new Error('unexpected Pinata groups fetch');
+      groupCalls.push({ url: u, init });
+      return groupsResponse(u, init);
+    }
     if (!rpcResponse) throw new Error('unexpected RPC fetch');
     return rpcResponse(u, init);
   };
 });
 after(() => { globalThis.fetch = realFetch; });
-beforeEach(() => { rpcResponse = null; pinataResponse = null; lastPinataInit = null; });
+beforeEach(() => {
+  rpcResponse = null;
+  pinataResponse = null;
+  lastPinataInit = null;
+  groupCalls = [];
+  // Default: no existing group → the worker creates one.
+  groupsResponse = (u, init) =>
+    init?.method === 'POST'
+      ? jsonResponse(200, { data: { id: GROUP_ID } })
+      : jsonResponse(200, { groups: [] });
+});
 
 const jsonResponse = (status, obj) =>
   new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
 
 const wordHex = (n) => BigInt(n).toString(16).padStart(64, '0');
 const pinataOk = () => jsonResponse(200, { data: 'https://uploads.pinata.cloud/signed/xyz' });
+const GROUP_ID = 'ad4bc3bf-8794-49e7-94ff-fea1ce745779';
 
 // The SubscriptionRegistry `access(address)` view returns two 32-byte words:
 // [0] bool registered, [1] uint64 paidAt (Unix seconds). One eth_call per request.
@@ -63,6 +83,7 @@ const OTHER = privateKeyToAccount('0x' + '22'.repeat(32));
 function baseEnv(overrides = {}) {
   return {
     PINATA_JWT: 'test-jwt',
+    PINATA_GROUP_PREFIX: 'testnet',
     STUB_REGISTRATION_CHECK: 'false',
     SUBSCRIPTION_CONTRACT_ADDRESS: '0x9a3811b365a4aeea1626eaad185b273424ae5e48',
     ...overrides,
@@ -154,6 +175,54 @@ test('PINATA_ALLOW_MIME_TYPES → forwarded to Pinata as a trimmed allow_mime_ty
   assert.equal(res.status, 200);
   const payload = JSON.parse(lastPinataInit.body);
   assert.deepEqual(payload.allow_mime_types, ['application/octet-stream', 'text/plain']);
+});
+
+/* ── per-wallet Pinata group ─────────────────────────────────────────────── */
+
+test('mint files the upload under a per-wallet group named <prefix>:<wallet>', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 200);
+  // Signed into the upload URL, so the uploader can't file the pin elsewhere.
+  assert.equal(JSON.parse(lastPinataInit.body).group_id, GROUP_ID);
+  const name = `testnet:${ACCOUNT.address.toLowerCase()}`;
+  assert.equal(JSON.parse(groupCalls.at(-1).init.body).name, name);
+  assert.match(groupCalls[0].url, new RegExp(`name=${encodeURIComponent(name)}`));
+});
+
+test('an existing group is adopted by name, not duplicated', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const name = `testnet:${ACCOUNT.address.toLowerCase()}`;
+  // Substring match — the worker must pick the exact name, not groups[0].
+  groupsResponse = () => jsonResponse(200, { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] });
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(lastPinataInit.body).group_id, GROUP_ID);
+  assert.equal(groupCalls.length, 1); // looked up, never created
+});
+
+test('the wallet→group id is cached in KV across mints', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const kv = mockKV();
+  const env = baseEnv({ RATE_KV: kv });
+  const p = await proof();
+  await call(env, { body: p });
+  const afterFirst = groupCalls.length;
+  await call(env, { body: p });
+  assert.equal(kv._store.get(`group:testnet:${ACCOUNT.address.toLowerCase()}`), GROUP_ID);
+  assert.equal(groupCalls.length, afterFirst); // second mint hit the cache
+});
+
+test('missing PINATA_GROUP_PREFIX → 502 and never mints', async () => {
+  rpcResponse = registeredRpc; // pinataResponse null: a mint would throw
+  const env = baseEnv();
+  delete env.PINATA_GROUP_PREFIX;
+  const res = await call(env, { body: await proof() });
+  assert.equal(res.status, 502);
+  assert.equal(groupCalls.length, 0);
 });
 
 test('GET with proof in query params → 200', async () => {
