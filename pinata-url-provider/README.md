@@ -230,7 +230,7 @@ dashboard can show usage:
 ```json
 { "ok": true, "address": "0x…",
   "total": 12345, "freeLimit": 1073741824,
-  "daily": 2048,  "dailyLimit": 5368709120,
+  "daily": 2048,  "dailyLimit": 1073741824,
   "day": "2026-07-27" }
 ```
 
