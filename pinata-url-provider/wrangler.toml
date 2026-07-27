@@ -90,7 +90,7 @@ ALLOWED_ORIGIN = "*"
 # The SDK declares each upload's size, so the cap is a per-wallet daily *byte
 # budget*: the sum of granted upload sizes per wallet per UTC day. Set "0" (or
 # unset) to disable. Requires the RATE_KV namespace binding below.
-DAILY_BYTE_LIMIT = "5368709120"   # 5 GiB / wallet / day
+DAILY_BYTE_LIMIT = "1073741824"   # 1 GiB / wallet / day
 
 # Lifetime free tier (bytes): the cumulative total a wallet may upload for free
 # before an active subscription is required. Set "0" (or unset) to disable the
