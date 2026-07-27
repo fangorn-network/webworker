@@ -1,18 +1,19 @@
 {
-  "name": "fangorn-access-worker",
-  "version": "1.0.1",
+  "name": "fangorn-webworker",
+  "version": "1.0.0",
   "private": true,
+  "packageManager": "pnpm@10.27.0",
   "scripts": {
-    "dev": "wrangler dev --local",
-    "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "dev:r2": "pnpm --filter ./fangorn-access-worker run dev",
+    "dev:gate": "pnpm --filter ./pinata-url-provider run dev",
+    "deploy:r2": "pnpm --filter ./fangorn-access-worker run deploy",
+    "deploy:gate": "pnpm --filter ./pinata-url-provider run deploy",
+    "typecheck": "pnpm -r typecheck"
   },
-  "dependencies": {
-    "viem": "^2.0.0"
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "^4.0.0",
-    "typescript": "^5.0.0",
-    "wrangler": "^4.82.2"
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
   }
 }
