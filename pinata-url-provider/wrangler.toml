@@ -26,7 +26,7 @@ command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:s
 # isRegistered, and `paidAt` is the wallet's last subscription timestamp. So one
 # read gives both the registration gate and the subscription window check. Point
 # this at the deployed SubscriptionRegistry (Stylus contract) on Arbitrum Sepolia.
-SUBSCRIPTION_CONTRACT_ADDRESS = "0xae8d9ff615d5bc9e31597b6332a8cb6fe110adb2"
+SUBSCRIPTION_CONTRACT_ADDRESS = "0xa554a1817a4ec6f2808e55ded21abc707d86b1b9"
 # EVM JSON-RPC endpoint. The public Arbitrum Sepolia RPC is fine for this
 # read-only call; swap in your own (e.g. Alchemy) for higher rate limits.
 RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
