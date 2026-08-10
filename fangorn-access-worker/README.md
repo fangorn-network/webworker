@@ -25,9 +25,11 @@ configuring configure themselves:
 - **The X25519 identity** is minted into your bucket on first request. It is the
   key every DEK in your bucket is sealed to, it never leaves your Cloudflare
   account, and it is generated once and kept.
-- **The upload gate** claims itself. The first upload (or `POST /claim`) presents
-  a token; its hash is stored, and every later upload must match. SOND3R mints
-  that token and claims your worker the moment you connect it.
+- **The upload gate** claims itself. `POST /claim` stores the hash of an upload
+  token plus the address of the wallet that signed for it, and every later upload
+  must present that token. SOND3R does this the moment you connect the worker,
+  and can rotate the token later against the same wallet — so losing the token
+  never strands the bucket.
 
 Prefer the CLI:
 
@@ -54,7 +56,7 @@ buyer's machine.
 | `GET /ct/:id` | no | streams ciphertext, with HTTP Range support |
 | `POST /access` | **yes** | checks settlement, unseals the DEK, returns 32 bytes |
 | `POST /upload/:id` | **yes** | stores ciphertext + sealed DEK |
-| `POST /claim` | **yes** | claims a fresh bucket to an upload token |
+| `POST /claim` | **yes** | claims (or rotates) the bucket's upload token |
 
 `/ct/` is deliberately open: ciphertext is safe to hand to anyone, and leaving it
 ungated is what lets a video stream with ordinary Range requests. Only keys are
@@ -68,25 +70,25 @@ Object keys must be bytes32 — `resourceId` for chunk 0,
 `keccak256(resourceId ++ uint32 i)` for the rest. Anything else 404s, which is
 what keeps `/ct/` from serving the bucket's own `.dek` blobs and worker secret.
 
-## Resetting a claimed bucket
+## Taking back a claimed bucket
 
-`already has an upload token, and it isn't this one` means the bucket was claimed
-by a token the caller no longer has. Usually that is **your own** bucket claimed
-from a relay whose staging directory has since gone — the worker cannot tell an
-owner from a stranger over HTTP, so the reset deliberately goes through something
-only the Cloudflare account holder can do:
+`POST /claim` with a token the bucket doesn't hold answers 401 and a `reason`:
 
-```sh
-npx wrangler r2 object delete <your-bucket>/.upload-token --remote
-```
+| `reason` | means | fix |
+|---|---|---|
+| `needs-signature` | claimed by another token | sign the claim message with the owning wallet — retry Connect in the publisher portal, which prompts for it |
+| `not-owner` | claimed, and owned by a different address | connect with the wallet named in the error |
+| `pinned` | the worker has an `UPLOAD_TOKEN` secret, which overrides everything | paste that value into the portal's *Upload token* field, or `npx wrangler secret delete UPLOAD_TOKEN` |
 
-Then reconnect in the publisher portal. The next claim wins.
+The claim message is `sond3r storage claim\ntoken: <sha256 of token>\ntime:
+<unix>`, valid for 10 minutes. The first claim records the signer as the bucket's
+owner; only that address can point the bucket at a different token afterwards.
+Nothing else in the bucket is touched — ciphertext, sealed DEKs and the X25519
+identity all survive, so already-published files keep working.
 
-Nothing else in the bucket is touched — ciphertext, sealed DEKs and the worker's
-X25519 identity all survive, so already-published files keep working.
-
-Pinning `UPLOAD_TOKEN` as a secret sidesteps the claim mechanism entirely and is
-the better choice for a long-lived shared worker.
+A bucket claimed before this shipped has no recorded owner, so the first valid
+signature adopts it. That is the migration path for buckets stranded by the old
+token-only gate.
 
 ## Optional env
 

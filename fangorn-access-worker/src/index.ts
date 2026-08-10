@@ -95,8 +95,10 @@ function withCors(response: Response): Response {
 	return response
 }
 
-function jsonError(message: string, status: number): Response {
-	return new Response(JSON.stringify({ error: message }), {
+/** `reason` is a machine-readable code for the caller to branch on — sond3r's
+ *  relay turns it into the right instruction instead of listing every cause. */
+function jsonError(message: string, status: number, reason?: string): Response {
+	return new Response(JSON.stringify({ error: message, ...(reason ? { reason } : {}) }), {
 		status,
 		headers: { 'Content-Type': 'application/json' },
 	})
@@ -339,6 +341,83 @@ async function authorizeUpload(request: Request, env: Env): Promise<boolean> {
 	return theirs ? (await theirs.text()) === digest : false
 }
 
+/** R2 key holding the ETH address allowed to rotate the upload token. See `handleClaim`. */
+const OWNER_KEY = '.upload-owner'
+
+/** The exact string a publisher's wallet signs to claim this bucket. sond3r's
+ *  relay builds the identical string (server/index.js, `claimMessage`) — they
+ *  must agree byte-for-byte or every claim recovers a different address. */
+const claimMessage = (digest: string, timestamp: number): string =>
+	`sond3r storage claim\ntoken: ${digest}\ntime: ${timestamp}`
+
+/** Wider than TIMESTAMP_WINDOW: a claim waits on a wallet popup, /access doesn't. */
+const CLAIM_WINDOW = 600
+
+/**
+ * POST /claim — install or ROTATE this bucket's upload token, with no wrangler.
+ *
+ * The token alone can't authorize rotating itself (a publisher who lost it is
+ * exactly who needs to rotate), so the authority is the publisher's wallet: the
+ * first claim records the signing address in `.upload-owner`, and afterwards
+ * only that address can point the bucket at a different token. Rotating
+ * ETH_PRIVATE_KEY on the relay — which changes the derived token and used to
+ * strand the bucket behind `wrangler r2 object delete` — is now a re-Connect.
+ *
+ * Presenting the token that already won needs no signature, so this stays
+ * idempotent for the ordinary connect-again case.
+ *
+ * ponytail: a bucket claimed BEFORE this shipped has no `.upload-owner`, so the
+ * first valid signature adopts it. That reopens the same land-grab window a
+ * fresh bucket already has, once, for legacy buckets only — the alternative is
+ * leaving them permanently stranded, which is the bug being fixed.
+ */
+async function handleClaim(request: Request, env: Env): Promise<Response> {
+	const presented = (request.headers.get('Authorization') ?? '').replace(/^Bearer /i, '').trim()
+	if (!presented) return jsonError('missing upload token', 401, 'missing-token')
+
+	const pinned = (env.UPLOAD_TOKEN ?? '').trim()
+	if (pinned) {
+		// A pinned worker accepts nothing else, and no signature can override it —
+		// the secret is Cloudflare-account state, not bucket state.
+		return presented === pinned
+			? new Response(JSON.stringify({ claimed: true }), { headers: { 'Content-Type': 'application/json' } })
+			: jsonError('this worker pins an UPLOAD_TOKEN secret, and this is not it', 401, 'pinned')
+	}
+
+	const digest = await sha256Hex(presented)
+	const claimed = await env.BUCKET.get(TOKEN_KEY)
+	if (claimed && (await claimed.text()) === digest) {
+		return new Response(JSON.stringify({ claimed: true }), { headers: { 'Content-Type': 'application/json' } })
+	}
+
+	const body = (await request.json().catch(() => ({}))) as { timestamp?: number; signature?: Hex }
+	const timestamp = Number(body.timestamp)
+	if (!body.signature || !Number.isFinite(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - timestamp) > CLAIM_WINDOW) {
+		return jsonError('this bucket is claimed by a different token — sign to take it over', 401, 'needs-signature')
+	}
+
+	let signer: Address
+	try {
+		signer = await recoverMessageAddress({ message: claimMessage(digest, timestamp), signature: body.signature })
+	} catch {
+		return jsonError('invalid claim signature', 401, 'needs-signature')
+	}
+
+	let owner = await env.BUCKET.get(OWNER_KEY).then((o) => o?.text())
+	if (!owner) {
+		// `etagDoesNotMatch: '*'` makes first-owner atomic, so two racers cannot
+		// both believe they won.
+		const won = await env.BUCKET.put(OWNER_KEY, signer, { onlyIf: { etagDoesNotMatch: '*' } })
+		owner = won ? signer : await env.BUCKET.get(OWNER_KEY).then((o) => o?.text())
+	}
+	if (owner?.toLowerCase() !== signer.toLowerCase()) {
+		return jsonError(`this bucket belongs to ${owner} — connect with that wallet`, 401, 'not-owner')
+	}
+
+	await env.BUCKET.put(TOKEN_KEY, digest)
+	return new Response(JSON.stringify({ claimed: true, owner }), { headers: { 'Content-Type': 'application/json' } })
+}
+
 async function handleUpload(request: Request, env: Env, resourceId: string): Promise<Response> {
 	if (!isObjectKey(resourceId)) return jsonError('resourceId must be 32 bytes of hex', 400)
 	if (!(await authorizeUpload(request, env))) {
@@ -439,14 +518,7 @@ export default {
 			// Claim the bucket without uploading, so a publisher connecting a fresh
 			// worker closes the unclaimed window at connect time rather than at
 			// first publish. Idempotent: re-presenting the winning token succeeds.
-			if (pathname === '/claim') {
-				const ok = await authorizeUpload(request, env)
-				return withCors(
-					ok
-						? new Response(JSON.stringify({ claimed: true }), { headers: { 'Content-Type': 'application/json' } })
-						: jsonError('already claimed by a different token', 401)
-				)
-			}
+			if (pathname === '/claim') return withCors(await handleClaim(request, env))
 			if (pathname.startsWith('/upload/')) {
 				return withCors(await handleUpload(request, env, decodeURIComponent(pathname.slice(8))))
 			}
