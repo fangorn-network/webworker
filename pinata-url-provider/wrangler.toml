@@ -1,0 +1,107 @@
+name = "pinata-url-provider"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# ── Deployment routing ───────────────────────────────────────────────────────
+# Set explicitly so `wrangler deploy` doesn't fall back to defaults (and warn).
+# Keep the worker's *.workers.dev URL, but disable per-version Preview URLs.
+# Using a custom domain/route instead? Set workers_dev = false.
+workers_dev = true
+preview_urls = false
+
+# ── Config guard ─────────────────────────────────────────────────────────────
+# Runs before every `wrangler deploy`/`dev`; a non-zero exit aborts. Refuses to
+# ship unless a well-formed SUBSCRIPTION_CONTRACT_ADDRESS is set below — the worker
+# must never silently gate access on a fallback/wrong contract.
+[build]
+command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:space:]]*\"0x[0-9a-fA-F]{40}\"' wrangler.toml || { echo 'ERROR: SUBSCRIPTION_CONTRACT_ADDRESS missing or invalid in wrangler.toml' >&2; exit 1; }"
+
+# ── Public (non-secret) configuration ────────────────────────────────────────
+# Edit these to point at your registry. The only secret is PINATA_JWT — set it
+# with `wrangler secret put PINATA_JWT` (or .dev.vars locally).
+[vars]
+# ── Access check ─────────────────────────────────────────────────────────────
+# The worker calls access(address) on the SubscriptionRegistry, which returns
+# (registered, paidAt): `registered` is a cross-contract call to the DataRegistry's
+# isRegistered, and `paidAt` is the wallet's last subscription timestamp. So one
+# read gives both the registration gate and the subscription window check. Point
+# this at the deployed SubscriptionRegistry (Stylus contract) on Arbitrum Sepolia.
+SUBSCRIPTION_CONTRACT_ADDRESS = "0xa554a1817a4ec6f2808e55ded21abc707d86b1b9"
+# EVM JSON-RPC endpoint. The public Arbitrum Sepolia RPC is fine for this
+# read-only call; swap in your own (e.g. Alchemy) for higher rate limits.
+RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
+# Which chain the RPC points at (informational only). 421614 = Arbitrum Sepolia.
+CHAIN_ID = "421614"
+# Advanced: the ABI signature of the access view. Stylus exposes the Rust `access`
+# method as camelCase `access(address)`; override only if yours differs.
+ACCESS_FUNCTION = "access(address)"
+
+# Once a wallet exhausts its free tier (FREE_BYTE_LIMIT below), each upload must
+# have an active subscription: the wallet paid the subscription fee within
+# SUBSCRIPTION_WINDOW_DAYS. The worker gets paidAt from access() above and does the
+# window math here, so the window is tunable without a contract redeploy.
+SUBSCRIPTION_WINDOW_DAYS = "30"
+
+# "true" skips the on-chain check entirely: a valid ownership signature alone
+# yields a presigned URL. Handy for local dev/testing without an RPC endpoint.
+# Leave "false" (or unset) in production.
+STUB_REGISTRATION_CHECK = "false"
+
+# Shown in the "not registered" error so callers know where to register.
+REGISTER_URL = "https://fangorn.network"
+
+# Shown in the over-free-tier (402) error so callers know where to subscribe.
+SUBSCRIBE_URL = "https://fangorn.network"
+
+# ── Address-ownership proof ──────────────────────────────────────────────────
+# Callers must sign a challenge message with the address's key and send
+# { message, signature } so the worker can prove they control the address (not
+# just that some registered address exists). Always enforced. See examples/.
+SIGNATURE_MAX_AGE = "300"       # max age in seconds of the signed challenge's Issued-At
+
+# ── Pinata presigned upload URL settings ─────────────────────────────────────
+PINATA_NETWORK = "public"        # "public" or "private"
+PINATA_URL_EXPIRES = "300"       # seconds the upload URL stays valid
+# Per-upload ceiling (bytes). The SDK declares the exact size it needs and the
+# worker mints a URL scoped to it; this only caps how large any single request
+# may be, so nobody can mint a URL for an absurd file. Unset → 500 MiB default.
+MAX_UPLOAD_SIZE = "524288000"    # 500 MiB
+# Fangorn uploads opaque binary (CAR packfiles + raw commit blocks) as
+# octet-stream, and serialized payloads as text/plain — so allow exactly those.
+# Widen or unset to permit more MIME types.
+PINATA_ALLOW_MIME_TYPES = "application/octet-stream,text/plain"  # optional CSV
+# Every presigned URL is scoped to a Pinata group named "<prefix>:<wallet>" — one
+# group per wallet, namespaced by deployment — so a whole deployment's pins can be
+# swept later (list groups by this prefix, unpin their files). REQUIRED: a mint
+# that can't resolve its group fails rather than pinning where no cleanup job can
+# find it. This deployment is testnet; production is a separate worker deploy with
+# its own prefix.
+PINATA_GROUP_PREFIX = "testnet"
+
+# CORS — browsers only. This restricts which *web pages* may read the response
+# from their JavaScript; it is NOT an access-control gate and does NOT affect
+# CLI/curl/server callers (they ignore CORS). Access is gated by the signed
+# ownership proof regardless. Use "*" to allow any browser origin, or a
+# comma-separated allowlist to lock it to your site(s), e.g.
+#   ALLOWED_ORIGIN = "https://fangorn.network,https://app.fangorn.network"
+ALLOWED_ORIGIN = "*"
+
+# ── Per-wallet abuse cap (Workers KV) ────────────────────────────────────────
+# The SDK declares each upload's size, so the cap is a per-wallet daily *byte
+# budget*: the sum of granted upload sizes per wallet per UTC day. Set "0" (or
+# unset) to disable. Requires the RATE_KV namespace binding below.
+DAILY_BYTE_LIMIT = "1073741824"   # 1 GiB / wallet / day
+
+# Lifetime free tier (bytes): the cumulative total a wallet may upload for free
+# before an active subscription is required. Set "0" (or unset) to disable the
+# free-tier/subscription gate entirely. Requires the RATE_KV binding below.
+FREE_BYTE_LIMIT = "1073741824"    # 1 GiB / wallet, lifetime
+
+# Secret to set (do NOT put this in [vars]):
+#   wrangler secret put PINATA_JWT   # Pinata key with Files:Write AND Groups:Write
+
+# KV namespace backing the per-wallet cap. Create it once, then paste the id:
+#   wrangler kv namespace create RATE_KV
+[[kv_namespaces]]
+binding = "RATE_KV"
+id = "524161f052814fe3a809d8d0f0a14c6a"  # arb_sep_kv

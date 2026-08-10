@@ -1,37 +1,29 @@
 # Fangorn Webworker
 
-A pnpm workspace containing the Cloudflare Workers behind Fangorn's content gating.
+The Fangorn webworker is a Cloudflare Worker that gates R2 content behind on-chain settlement verification. Publishers deploy their own worker, with one worker per R2 bucket.
 
-## Packages
+Example deployed at `https://fangorn-access-worker.quickbeam.workers.dev`
 
-| Package | Path | Description |
-|---------|------|-------------|
-| [`fangorn-access-worker`](./fangorn-access-worker) | `fangorn-access-worker/` | Gates R2 content behind on-chain settlement verification. One worker per R2 bucket. |
-| [`pinata-url-provider`](./pinata-url-provider) | `pinata-url-provider/` | Generic on-chain condition gate that mints Pinata presigned upload URLs for callers who prove address ownership and pass a configurable contract check. |
+### How it works
 
-See each package's own `README.md` for details.
+1. Consumer signs `{ nullifier, resourceId, objectKey, timestamp }` with their stealth address private key
+2. Worker recovers the stealth address from the signature
+3. Worker calls `is_settled(stealthAddress, resourceId)` on the Settlement Registry
+4. If settled → bytes proxied directly from R2
+5. If not → 401
 
-## Getting started
+The worker is stateless, open-source, and has no logging. Its only capability is verifying settlement and proxying bytes. The content URL is never exposed to the consumer.
 
-This repo uses [pnpm](https://pnpm.io) workspaces.
 
-```sh
-pnpm install
-```
+## Run locally
 
-## Common tasks
+npx wrangler dev --local
 
-Run from the repo root:
+## Deploy
 
-```sh
-pnpm dev:r2        # wrangler dev for fangorn-access-worker
-pnpm dev:gate      # wrangler dev for pinata-url-provider
-pnpm deploy:r2     # deploy fangorn-access-worker
-pnpm deploy:gate   # deploy pinata-url-provider
-pnpm typecheck     # typecheck every package that defines a typecheck script
-```
+npx wrangler login
 
-Or work inside a package directly, e.g.:
+npx wrangler deploy
 
 ## Security
 
@@ -48,17 +40,3 @@ While the infrastructure is hardened, developers must secure the logic and data 
     Authentication & Access: You can implement Cloudflare Access with a single click to protect Worker routes or use the Web Crypto API for custom JWT validation.
     Data Protection: Data stored in Workers KV is encrypted at rest using AES-256 and encrypted in transit via TLS.
     Security Headers: Workers are frequently used to inject security headers (e.g., CSP, HSTS, X-Frame-Options) into responses to protect against XSS and clickjacking. 
-
----
-
-### Gen keys
-
-openssl rand -hex 32 | npx wrangler secret put WORKER_X25519_SECRET
-
-
-# deploy work
-cd ~/fangorn/webworker && npx wrangler deploy      # ships the new /upload + DEK-from-R2 /access
-
-# run the example
-cd ~/fangorn/x402f && npm run client:node          # runs the loop (costs Sepolia gas for createResource)
-
