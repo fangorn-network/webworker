@@ -1,42 +1,100 @@
-# Fangorn Webworker
+# Fangorn access worker
 
-The Fangorn webworker is a Cloudflare Worker that gates R2 content behind on-chain settlement verification. Publishers deploy their own worker, with one worker per R2 bucket.
+A Cloudflare Worker that releases decryption keys against on-chain settlement.
+**Publishers deploy their own** — one worker per R2 bucket — so the content sits
+in their Cloudflare account, on their bill, under their own terms with
+Cloudflare. Nobody else can read it, and nobody else is responsible for it.
 
-Example deployed at `https://fangorn-access-worker.quickbeam.workers.dev`
+Reference deployment: `https://fangorn-access-worker.quickbeam.workers.dev`
 
-### How it works
+## Deploy your own
 
-1. Consumer signs `{ nullifier, resourceId, objectKey, timestamp }` with their stealth address private key
-2. Worker recovers the stealth address from the signature
-3. Worker calls `is_settled(stealthAddress, resourceId)` on the Settlement Registry
-4. If settled → bytes proxied directly from R2
-5. If not → 401
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/fangorn-network/webworker/tree/main/fangorn-access-worker)
 
-The worker is stateless, open-source, and has no logging. Its only capability is verifying settlement and proxying bytes. The content URL is never exposed to the consumer.
+That is the whole setup. Cloudflare reads `wrangler.toml`, creates the R2 bucket
+and the Worker in **your** account, and hands you a `*.workers.dev` URL. Paste
+that URL into SOND3R's publisher portal ("connect your storage") and publish.
 
+The `/tree/main/fangorn-access-worker` suffix is required — this repo is a pnpm
+workspace, and a button pointed at the root fails with *"application detection
+logic has been run in the root of a workspace"*.
 
-## Run locally
+There is nothing to configure, because the two things that would normally need
+configuring configure themselves:
 
-npx wrangler dev --local
+- **The X25519 identity** is minted into your bucket on first request. It is the
+  key every DEK in your bucket is sealed to, it never leaves your Cloudflare
+  account, and it is generated once and kept.
+- **The upload gate** claims itself. The first upload (or `POST /claim`) presents
+  a token; its hash is stored, and every later upload must match. SOND3R mints
+  that token and claims your worker the moment you connect it.
 
-## Deploy
+Prefer the CLI:
 
+```sh
 npx wrangler login
-
 npx wrangler deploy
+```
 
-## Security
+Both paths create a bucket named `fttf` (the `[[r2_buckets]]` binding in
+`wrangler.toml`) — rename it there before your first deploy if you care what it
+is called. Renaming it *after* publishing points the worker at an empty bucket.
 
-Cloudflare Webworkers are designed with a high-security isolation model. Instead of VMs or containers, they use V8 isolated, providing a lightweight and secure environment. However, they fundamentally require *trust in Cloudflare*. 
+## What it does
 
-- V8 Isolates: Unlike containers that share an OS kernel, [V8 Isolates](https://blog.cloudflare.com/introducing-cloudflare-workers/) separate code at the memory level. This allows thousands of Workers to run on a single thread while remaining isolated.
-- Spectre Mitigation: Cloudflare uses a unique approach to prevent [Spectre-style side-channel attacks](https://blog.cloudflare.com/mitigating-spectre-and-other-security-threats-the-cloudflare-workers-security-model/) by removing high-precision timers and implementing memory protection keys that trap unauthorized memory access attempts.
-- Automatic Patches: Since Cloudflare manages the runtime, security updates for the V8 engine and the Workers runtime are applied automatically without developer intervention. 
+Files are AES-256-GCM encrypted by the publisher under a random per-file key
+(the DEK). The ciphertext goes to R2; the DEK is sealed to this worker's X25519
+public key and stored beside it. **The worker never sees plaintext** — it hands
+back a 32-byte key to callers who have paid, and the decryption happens on the
+buyer's machine.
 
-### Application-Level Security (Developer’s Responsibility)
-While the infrastructure is hardened, developers must secure the logic and data flow within their scripts. 
+| route | gated? | does |
+|---|---|---|
+| `GET /pubkey` | no | the X25519 key publishers seal DEKs to |
+| `GET /ct/:id` | no | streams ciphertext, with HTTP Range support |
+| `POST /access` | **yes** | checks settlement, unseals the DEK, returns 32 bytes |
+| `POST /upload/:id` | **yes** | stores ciphertext + sealed DEK |
+| `POST /claim` | **yes** | claims a fresh bucket to an upload token |
 
-    Secret Management: Never hardcode sensitive data like API keys. Use Wrangler Secrets to encrypt and store credentials securely.
-    Authentication & Access: You can implement Cloudflare Access with a single click to protect Worker routes or use the Web Crypto API for custom JWT validation.
-    Data Protection: Data stored in Workers KV is encrypted at rest using AES-256 and encrypted in transit via TLS.
-    Security Headers: Workers are frequently used to inject security headers (e.g., CSP, HSTS, X-Frame-Options) into responses to protect against XSS and clickjacking. 
+`/ct/` is deliberately open: ciphertext is safe to hand to anyone, and leaving it
+ungated is what lets a video stream with ordinary Range requests. Only keys are
+gated.
+
+`/access` releases a DEK when the request is signed by a stealth address for
+which `SettlementRegistry.isSettled(stealthAddress, resourceId)` is true, within
+`TIMESTAMP_WINDOW` seconds. Resources priced at 0 release to any valid signer.
+
+Object keys must be bytes32 — `resourceId` for chunk 0,
+`keccak256(resourceId ++ uint32 i)` for the rest. Anything else 404s, which is
+what keeps `/ct/` from serving the bucket's own `.dek` blobs and worker secret.
+
+## Optional env
+
+Both are for the shared deployment and neither is needed for your own:
+
+| var | effect |
+|---|---|
+| `WORKER_X25519_SECRET` | pins the identity instead of minting one. **Required** on a worker that already has DEKs sealed to a key — minting a new one strands every published file. `openssl rand -hex 32 \| npx wrangler secret put WORKER_X25519_SECRET` |
+| `UPLOAD_TOKEN` | pins the upload token instead of claiming on first use |
+
+## Develop
+
+```sh
+npx wrangler dev --local     # http://localhost:8787 — SOND3R accepts loopback http
+npm test                     # vitest against a simulated R2
+npm run typecheck
+```
+
+## Trust
+
+Within the trust model this worker still sits inside it: it holds the key that
+unseals your DEKs, so whoever runs the worker can read the content. Deploying
+your own is what makes that "you" instead of someone else. Removing the boundary
+entirely — moving the DEK into an FHE coprocessor so no operator holds it — is
+Phase 1, and the handle format is already shaped for it.
+
+Cloudflare itself remains trusted. Workers isolate at the V8 level rather than in
+containers ([isolates](https://blog.cloudflare.com/introducing-cloudflare-workers/),
+[Spectre mitigation](https://blog.cloudflare.com/mitigating-spectre-and-other-security-threats-the-cloudflare-workers-security-model/)),
+and the runtime is patched for you — but the operator can see what the isolate
+sees.

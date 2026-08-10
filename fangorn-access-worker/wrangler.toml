@@ -2,15 +2,31 @@ name = "fangorn-access-worker"
 main = "src/index.ts"
 compatibility_date = "2025-07-18"
 
+# This file is also a TEMPLATE: publishers deploy it into their own Cloudflare
+# account via the Deploy to Cloudflare button, which reads the binding below and
+# creates the bucket for them. Nothing else needs configuring — the worker mints
+# its own X25519 key and claims its own upload token on first request.
+#
+# `fttf` is deliberately not renamed to something prettier: this same file deploys
+# the shared worker at fangorn-access-worker.quickbeam.workers.dev, which is bound
+# to that bucket and holds live content. Changing it here would repoint that worker
+# at an empty bucket on the next `pnpm deploy:r2`.
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "fttf"
 
 [vars]
-# WORKER_X25519_SECRET is a secret, set via `wrangler secret put WORKER_X25519_SECRET`
+# The live SettlementRegistry on Arbitrum Sepolia. /access authorizes against this
+# contract, so a worker pointed at the wrong one releases nothing.
 SETTLEMENT_REGISTRY_ADDRESS = "0xec43a354e1b375585e58ae1e6b02954f84139feb"
 ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
+
+# Optional, and unset on a publisher-owned worker:
+#   WORKER_X25519_SECRET  pins the identity instead of minting one. REQUIRED on a
+#                         worker that already has DEKs sealed to a key.
+#   UPLOAD_TOKEN          pins the upload token instead of claiming on first use
+# Both are secrets: `wrangler secret put <NAME>`.
 
 [observability]
 enabled = true

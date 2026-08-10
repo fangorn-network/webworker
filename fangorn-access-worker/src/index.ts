@@ -32,8 +32,10 @@ interface Env {
 	SETTLEMENT_REGISTRY_ADDRESS: string
 	ARBITRUM_SEPOLIA_RPC: string
 	TIMESTAMP_WINDOW: string
-	/** 32-byte X25519 secret (hex). `wrangler secret put WORKER_X25519_SECRET`. */
-	WORKER_X25519_SECRET: string
+	/** 32-byte X25519 secret (hex). Optional — minted into the bucket if unset. */
+	WORKER_X25519_SECRET?: string
+	/** Pins the upload token. Optional — the bucket is claimed on first upload if unset. */
+	UPLOAD_TOKEN?: string
 }
 
 interface AccessRequest {
@@ -45,6 +47,22 @@ interface AccessRequest {
 
 /** R2 key holding the sealed DEK for a resource. Ciphertext lives at `resourceId`. */
 const dekKey = (resourceId: string): string => `${resourceId}.dek`
+
+/** R2 key holding this worker's minted X25519 secret. See `workerSecret`. */
+const SECRET_KEY = '.worker-x25519-secret'
+
+/**
+ * Every legitimate object key is a bytes32: `resourceId` for chunk 0,
+ * `keccak256(resourceId ++ uint32 i)` for the rest (see `chunkKey` in
+ * sond3r's src/buy.js and server/settle.js, which must agree).
+ *
+ * This is a security boundary, not tidiness. `/ct/` is ungated because
+ * ciphertext is safe to hand out — but the bucket also holds `<id>.dek` and
+ * `.worker-x25519-secret`, and without this an unauthenticated
+ * `GET /ct/.worker-x25519-secret` would serve the private key that opens every
+ * DEK in the bucket.
+ */
+const isObjectKey = (key: string): boolean => /^0x[0-9a-f]{64}$/.test(key)
 
 const SETTLEMENT_REGISTRY_ABI = [
 	{
@@ -102,18 +120,47 @@ function sealInfo(resourceId: Hex): Uint8Array {
 }
 
 /**
- * Decode the worker's X25519 secret from env, accepting hex with or without a
- * `0x` prefix. viem's hexToBytes unconditionally slices off the first two
- * characters, so an unprefixed 64-char key silently becomes 31 bytes — validate
- * rather than let a malformed key reach key derivation.
+ * This worker's X25519 identity — the key every DEK in this bucket is sealed to.
+ *
+ * `WORKER_X25519_SECRET` wins when set. The shared deployment already has DEKs
+ * sealed to a secret installed with `wrangler secret put`, and minting a new one
+ * would strand every resource already published to it.
+ *
+ * With no secret set, mint one into the bucket. A publisher deploying their own
+ * worker from the Deploy to Cloudflare button gets a working worker with no
+ * setup step — the button can prompt for secrets, but "paste 32 bytes of hex" is
+ * exactly the friction that stops a publisher who does not know what R2 is.
+ * The key never leaves their own Cloudflare account either way.
+ *
+ * Any 32 random bytes is a valid X25519 scalar; clamping happens in the curve.
  */
-function workerSecret(env: Env): Uint8Array {
+async function workerSecret(env: Env): Promise<Uint8Array> {
 	const raw = (env.WORKER_X25519_SECRET ?? '').trim()
-	const hex = raw.startsWith('0x') || raw.startsWith('0X') ? raw.slice(2) : raw
-	if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
-		throw new Error('WORKER_X25519_SECRET must be 32 bytes of hex (64 hex chars; 0x optional)')
+	if (raw) {
+		// viem's hexToBytes unconditionally slices off the first two characters, so
+		// an unprefixed 64-char key silently becomes 31 bytes — validate rather than
+		// let a malformed key reach key derivation.
+		const hex = raw.startsWith('0x') || raw.startsWith('0X') ? raw.slice(2) : raw
+		if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+			throw new Error('WORKER_X25519_SECRET must be 32 bytes of hex (64 hex chars; 0x optional)')
+		}
+		return hexToBytes(`0x${hex}`)
 	}
-	return hexToBytes(`0x${hex}`)
+
+	const existing = await env.BUCKET.get(SECRET_KEY)
+	if (existing) return new Uint8Array(await existing.arrayBuffer())
+
+	// `etagDoesNotMatch: '*'` means "only if absent". Two cold requests racing
+	// would otherwise each mint a key and overwrite the other — and every DEK
+	// sealed to the loser becomes permanently unopenable. On a lost race, put()
+	// returns null and we read the winner's key instead of our own.
+	const minted = crypto.getRandomValues(new Uint8Array(32))
+	const won = await env.BUCKET.put(SECRET_KEY, minted, { onlyIf: { etagDoesNotMatch: '*' } })
+	if (won) return minted
+
+	const theirs = await env.BUCKET.get(SECRET_KEY)
+	if (!theirs) throw new Error('could not mint or read the worker secret')
+	return new Uint8Array(await theirs.arrayBuffer())
 }
 
 /** Recover the DEK sealed to this worker's key, bound to resourceId. Throws if the GCM tag fails. */
@@ -228,7 +275,7 @@ async function handleAccess(request: Request, env: Env): Promise<Response> {
 
 	let secret: Uint8Array
 	try {
-		secret = workerSecret(env)
+		secret = await workerSecret(env)
 	} catch (e) {
 		console.error('bad worker secret:', e)
 		return jsonError('worker misconfigured', 500)
@@ -251,10 +298,52 @@ async function handleAccess(request: Request, env: Env): Promise<Response> {
 
 // ------------------------------------------------------------
 // Route: POST /upload/:resourceId — store ciphertext + sealed DEK
-// ponytail: permissionless for testing; gate with an auth token before real use.
 // ------------------------------------------------------------
 
+/** R2 key holding the SHA-256 of the token allowed to upload. See `authorizeUpload`. */
+const TOKEN_KEY = '.upload-token'
+
+const sha256Hex = async (s: string): Promise<string> =>
+	bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))))
+
+/**
+ * Uploads are gated, and the gate installs itself on first use.
+ *
+ * `UPLOAD_TOKEN` wins when set — that is how the shared deployment is pinned.
+ * Otherwise the FIRST upload to a fresh bucket claims it: whatever token it
+ * presents is hashed and stored, and every later upload must match. A publisher
+ * deploying their own worker never sets anything; sond3r mints a token and
+ * claims the worker the moment they connect it (see POST /api/worker there).
+ *
+ * The exposure is the gap between `wrangler deploy` and that first claim, which
+ * is seconds and ends the first time the real publisher uploads. Being
+ * permissionless — the previous behaviour — meant anyone who learned the URL
+ * could overwrite a publisher's ciphertext forever.
+ */
+async function authorizeUpload(request: Request, env: Env): Promise<boolean> {
+	const presented = (request.headers.get('Authorization') ?? '').replace(/^Bearer /i, '').trim()
+	if (!presented) return false
+
+	const pinned = (env.UPLOAD_TOKEN ?? '').trim()
+	if (pinned) return presented === pinned
+
+	const digest = await sha256Hex(presented)
+	const claimed = await env.BUCKET.get(TOKEN_KEY)
+	if (claimed) return (await claimed.text()) === digest
+
+	// Unclaimed bucket: this token becomes the owner. `etagDoesNotMatch: '*'`
+	// makes the claim atomic, so two racers cannot both believe they won.
+	const won = await env.BUCKET.put(TOKEN_KEY, digest, { onlyIf: { etagDoesNotMatch: '*' } })
+	if (won) return true
+	const theirs = await env.BUCKET.get(TOKEN_KEY)
+	return theirs ? (await theirs.text()) === digest : false
+}
+
 async function handleUpload(request: Request, env: Env, resourceId: string): Promise<Response> {
+	if (!isObjectKey(resourceId)) return jsonError('resourceId must be 32 bytes of hex', 400)
+	if (!(await authorizeUpload(request, env))) {
+		return jsonError('missing or incorrect upload token', 401)
+	}
 	if (!request.body) return jsonError('empty body (expected ciphertext stream)', 400)
 
 	const sealedHex = request.headers.get('X-Sealed-Dek')
@@ -285,6 +374,8 @@ async function handleUpload(request: Request, env: Env, resourceId: string): Pro
 // ------------------------------------------------------------
 
 async function handleCiphertext(request: Request, env: Env, resourceId: string): Promise<Response> {
+	if (!isObjectKey(resourceId)) return jsonError('not found', 404)
+
 	const rangeHeader = request.headers.get('Range')
 	let r2Range: R2Range | undefined
 	if (rangeHeader) {
@@ -327,7 +418,7 @@ export default {
 		if (method === 'GET') {
 			if (pathname === '/pubkey') {
 				try {
-					const pub = x25519.getPublicKey(workerSecret(env))
+					const pub = x25519.getPublicKey(await workerSecret(env))
 					return withCors(
 						new Response(JSON.stringify({ pubkey: bytesToHex(pub) }), {
 							headers: { 'Content-Type': 'application/json' },
@@ -345,6 +436,17 @@ export default {
 
 		if (method === 'POST') {
 			if (pathname === '/access') return withCors(await handleAccess(request, env))
+			// Claim the bucket without uploading, so a publisher connecting a fresh
+			// worker closes the unclaimed window at connect time rather than at
+			// first publish. Idempotent: re-presenting the winning token succeeds.
+			if (pathname === '/claim') {
+				const ok = await authorizeUpload(request, env)
+				return withCors(
+					ok
+						? new Response(JSON.stringify({ claimed: true }), { headers: { 'Content-Type': 'application/json' } })
+						: jsonError('already claimed by a different token', 401)
+				)
+			}
 			if (pathname.startsWith('/upload/')) {
 				return withCors(await handleUpload(request, env, decodeURIComponent(pathname.slice(8))))
 			}
