@@ -68,6 +68,26 @@ Object keys must be bytes32 — `resourceId` for chunk 0,
 `keccak256(resourceId ++ uint32 i)` for the rest. Anything else 404s, which is
 what keeps `/ct/` from serving the bucket's own `.dek` blobs and worker secret.
 
+## Resetting a claimed bucket
+
+`already has an upload token, and it isn't this one` means the bucket was claimed
+by a token the caller no longer has. Usually that is **your own** bucket claimed
+from a relay whose staging directory has since gone — the worker cannot tell an
+owner from a stranger over HTTP, so the reset deliberately goes through something
+only the Cloudflare account holder can do:
+
+```sh
+npx wrangler r2 object delete <your-bucket>/.upload-token --remote
+```
+
+Then reconnect in the publisher portal. The next claim wins.
+
+Nothing else in the bucket is touched — ciphertext, sealed DEKs and the worker's
+X25519 identity all survive, so already-published files keep working.
+
+Pinning `UPLOAD_TOKEN` as a secret sidesteps the claim mechanism entirely and is
+the better choice for a long-lived shared worker.
+
 ## Optional env
 
 Both are for the shared deployment and neither is needed for your own:
