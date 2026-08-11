@@ -1,3 +1,4 @@
 packages:
   - "fangorn-access-worker"
   - "pinata-url-provider"
+  - "quickbeam-registry"

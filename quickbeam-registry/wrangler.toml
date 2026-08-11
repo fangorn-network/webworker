@@ -1,0 +1,116 @@
+name = "quickbeam-registry"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+workers_dev = true
+preview_urls = false
+
+# ── Domains ──────────────────────────────────────────────────────────────────
+# The zone is already on Cloudflare, so a custom domain plus a WILDCARD gives every
+# view a branded HTTPS URL with no DNS call and no certificate per view — Cloudflare
+# holds both. `qb-147c24c5-music.qb.sond3r.com/search` is the same request as
+# `/q/qb_147c24c5_music/search`; the worker resolves the view from the Host header.
+#
+# Uncomment once the zone is attached to this account. A wildcard route needs a
+# proxied `*.qb` DNS record (or Cloudflare for SaaS) on the zone.
+# [[routes]]
+# pattern = "quickbeam.sond3r.com"
+# custom_domain = true
+#
+# [[routes]]
+# pattern = "*.qb.sond3r.com/*"
+# zone_name = "sond3r.com"
+
+# ── Config guard ─────────────────────────────────────────────────────────────
+# Runs before every `wrangler deploy`/`dev`; a non-zero exit aborts. The worker must
+# never gate on a fallback/wrong contract.
+[build]
+command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:space:]]*\"0x[0-9a-fA-F]{40}\"' wrangler.toml || { echo 'ERROR: SUBSCRIPTION_CONTRACT_ADDRESS missing or invalid in wrangler.toml' >&2; exit 1; }"
+
+[vars]
+# ── Entitlement ──────────────────────────────────────────────────────────────
+# access(address) on the SubscriptionRegistry returns (registered, paidAt) in one
+# call: `registered` is its cross-contract check against the DataRegistry, `paidAt`
+# the wallet's last subscription payment. An active subscription is the entitlement
+# for Quickbeam monitoring — there is no separate Quickbeam contract.
+#
+# ⚠️ This MUST be the SubscriptionRegistry whose dataRegistry() matches the registry
+# the SDK publishes to, or every wallet registered after a redeploy reads as
+# unregistered. Check with: cast call <addr> "dataRegistry()(address)"
+SUBSCRIPTION_CONTRACT_ADDRESS = "0xa554a1817a4ec6f2808e55ded21abc707d86b1b9"
+RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
+CHAIN_ID = "421614"
+ACCESS_FUNCTION = "access(address)"
+
+# The subscription is active for this many days after payment. Lives here, not
+# on-chain, so it is tunable without a contract redeploy. Keep in sync with the
+# storage worker and the website's display constant.
+SUBSCRIPTION_WINDOW_DAYS = "30"
+
+# "true" skips the on-chain check entirely — a valid signature alone is enough.
+# For local dev only.
+STUB_GATE = "false"
+
+# Shown in the 403 / 402 responses so callers know what to do next.
+REGISTER_URL = "https://fangorn.network"
+SUBSCRIBE_URL = "https://fangorn.network"
+
+# ── Teardown ─────────────────────────────────────────────────────────────────
+# Comma-separated wallets allowed to call /admin/remove and /admin/list. Nothing
+# expires on its own: a founder removes a source and the instance drops it within
+# one poll.
+ADMIN_WALLETS = "0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6"
+
+# Soft cap on views per wallet — an abuse guard, not an entitlement. A view is cheap
+# (embedding is deduplicated across views), so this can be generous. "0" disables it.
+MAX_VIEWS_PER_WALLET = "5"
+
+# Cosmetic: quoted back in the /views response so the user knows how long to wait.
+# Match the instance's --sources-refresh.
+POLL_HINT_SECONDS = "60"
+
+# ── Instance endpoints (the query proxy) ─────────────────────────────────────
+# The shared Quickbeam box. Plain HTTP is fine: browsers reach these through this
+# worker, which supplies TLS — that is why the box needs no DNS record or cert.
+#
+# There is no MCP_URL: a requester's MCP is their own local `quickbeam mcp` client
+# pointed at /q/{viewId}/cdn, whose catalog this worker filters to their namespaces.
+# Nothing MCP-shaped is provisioned per requester.
+SEARCH_URL = "http://CHANGE-ME:8080"
+CDN_URL = "http://CHANGE-ME:8090"
+
+# Per-view subdomains live under this suffix. Leave EMPTY to serve views only at
+# /q/{viewId}/… on the worker's own hostname; set it once the wildcard route above is
+# live and every view's advertised URL becomes its own subdomain.
+VIEW_DOMAIN_SUFFIX = ""
+
+# ── Hosted MCP (optional) ────────────────────────────────────────────────────
+# When a requester ticks "host an MCP for me", the worker runs one Cloud Run service
+# per view: the same quickbeam image, `mcp --cdn-url <that view's filtered catalog>`.
+# An MCP is stateless, holds no connections and needs no disk, so it scales to zero
+# and an idle user's MCP costs nothing — the opposite of the watcher, which is why
+# that one lives on a VM instead.
+#
+# Leave these unset to disable the feature: the checkbox then returns a clear
+# "not configured" error and the view still gets its search endpoint.
+#
+# The service account needs roles/run.admin and roles/iam.serviceAccountUser.
+# GCP_PROJECT = "your-project"
+# GCP_REGION = "us-central1"
+# GCP_SA_EMAIL = "quickbeam-registry@your-project.iam.gserviceaccount.com"
+# QUICKBEAM_IMAGE = "us-central1-docker.pkg.dev/your-project/quickbeam/quickbeam:latest"
+#
+# Secret (do NOT put in [vars]) — the `private_key` field of the service-account JSON:
+#   wrangler secret put GCP_SA_KEY
+
+# ── Address-ownership proof ──────────────────────────────────────────────────
+SIGNATURE_MAX_AGE = "300"
+
+# CORS — browsers only, not an access gate. The signed proof is.
+ALLOWED_ORIGIN = "*"
+
+# KV holding one row per watched source. Create it once, then paste the id:
+#   wrangler kv namespace create REGISTRY_KV
+[[kv_namespaces]]
+binding = "REGISTRY_KV"
+id = "CHANGE-ME"
