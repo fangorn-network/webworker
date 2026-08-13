@@ -87,12 +87,12 @@ async function mintToken(env) {
 }
 
 async function accessToken(env) {
-  const cached = env.REGISTRY_KV ? await env.REGISTRY_KV.get(TOKEN_KEY) : null;
+  const cached = env.QUICKBEAM_KV ? await env.QUICKBEAM_KV.get(TOKEN_KEY) : null;
   if (cached) return cached;
   const { access_token, expires_in } = await mintToken(env);
-  if (env.REGISTRY_KV) {
+  if (env.QUICKBEAM_KV) {
     // Expire early so a token is never used in its last minutes.
-    await env.REGISTRY_KV.put(TOKEN_KEY, access_token,
+    await env.QUICKBEAM_KV.put(TOKEN_KEY, access_token,
       { expirationTtl: Math.max(60, Number(expires_in || 3600) - 300) });
   }
   return access_token;

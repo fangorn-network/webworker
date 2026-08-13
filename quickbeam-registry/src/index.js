@@ -23,7 +23,7 @@
  * Only dependency is `viem` (signature recovery + selector encoding).
  */
 
-import { recoverMessageAddress, toFunctionSelector } from 'viem';
+import { keccak256, recoverMessageAddress, toFunctionSelector, toHex } from 'viem';
 import {
   gcpConfigured, serviceName, createMcpService, getMcpService, deleteMcpService,
 } from './gcp.js';
@@ -66,7 +66,12 @@ export default {
     if (url.pathname === '/watchlist') {
       const seen = new Map();
       for (const view of await listViews(env)) {
-        for (const s of view.sources) seen.set(`${s.owner}:${s.namespace}`, s);
+        // Dedupe on the whole triple: two apps can hold the same publisher:subspace,
+        // and collapsing those would leave one of them unwatched.
+        for (const s of view.sources) {
+          const src = withApp(s, env);
+          seen.set(`${src.app}:${src.owner}:${src.namespace}`, src);
+        }
       }
       return json(200, { sources: [...seen.values()] }, cors);
     }
@@ -84,6 +89,20 @@ export default {
       return json(200, {
         views: (requester ? views.filter((v) => v.requester === requester) : views)
           .map((v) => withUrls(v, url, env)),
+      }, cors);
+    }
+
+    // 404 before the wallet check, not after. Everything below is a write route, and
+    // falling through to "provide a valid EVM address" for a mistyped *path* sends the
+    // reader hunting for an auth problem that does not exist — which is exactly what a
+    // watcher pointed at the old `/sources` route used to see.
+    if (url.pathname !== '/views' && url.pathname !== '/admin/remove') {
+      return json(404, {
+        error: `Unknown route ${url.pathname}`,
+        routes: ['GET /watchlist', 'GET /views', 'GET /views/{id}', 'POST /views',
+                 'GET /q/{viewId}/search', 'GET /q/{viewId}/export',
+                 'GET /q/{viewId}/stream', 'GET /q/{viewId}/cdn/*',
+                 'POST /admin/remove'],
       }, cors);
     }
 
@@ -118,8 +137,8 @@ export default {
           mcpError = err.message;
         }
       }
-      await env.REGISTRY_KV.delete(viewKey(id));
-      await env.REGISTRY_KV.delete(dnsKey(dnsLabel(id)));
+      await env.QUICKBEAM_KV.delete(viewKey(id));
+      await env.QUICKBEAM_KV.delete(dnsKey(dnsLabel(id)));
       return json(mcpError ? 207 : 200, { ok: !mcpError, removed: id, ...(mcpError ? { mcpError } : {}) }, cors);
     }
 
@@ -132,14 +151,24 @@ export default {
         }, cors);
       }
 
-      const sources = normaliseSources(input.sources);
+      const sources = normaliseSources(input.sources, env.DEFAULT_APP);
       if (!sources.length) {
         return json(400, {
-          error: 'Provide at least one source as { "sources": [{ "owner": "0x…", "namespace": "…" }] }.',
+          error: 'Provide at least one source as { "sources": [{ "app": "…", "owner": "0x…", "namespace": "…" }] }. '
+               + 'Use "*" for owner and/or namespace to watch the whole app.',
         }, cors);
       }
-      if (sources.some((s) => !isAddress(s.owner) || !isSafeName(s.namespace))) {
-        return json(400, { error: 'Each source needs a valid owner address and namespace.' }, cors);
+      // `*` is the wildcard: an app-level source, every publisher and/or every subspace
+      // in that app. A concrete side still has to be a real address / safe name. `app`
+      // is already canonical here (normaliseSources hashed any name), so this only
+      // catches a source that named no app at all with no DEFAULT_APP to fall back on.
+      if (sources.some((s) => !APP_ID_RE.test(s.app)
+                           || !(s.owner === '*' || isAddress(s.owner))
+                           || !(s.namespace === '*' || isSafeName(s.namespace)))) {
+        return json(400, {
+          error: 'Each source needs an app (name or 0x… id), plus an owner address and '
+               + 'namespace (or "*" for either).',
+        }, cors);
       }
 
       const gate = await checkSubscription(env, address);
@@ -186,8 +215,8 @@ export default {
         view.hostedMcp = false;
       }
 
-      await env.REGISTRY_KV.put(viewKey(id), JSON.stringify(view));
-      await env.REGISTRY_KV.put(dnsKey(dnsLabel(id)), id);
+      await env.QUICKBEAM_KV.put(viewKey(id), JSON.stringify(view));
+      await env.QUICKBEAM_KV.put(dnsKey(dnsLabel(id)), id);
       return json(existing ? 200 : 202, {
         ok: true,
         ...withUrls(view, url, env),
@@ -196,6 +225,8 @@ export default {
       }, cors);
     }
 
+    // Unreachable: the route guard above admits only the two write paths, and both
+    // return. Kept so a future route added past that guard cannot fall off the end.
     return json(404, { error: `Unknown route ${url.pathname}` }, cors);
   },
 };
@@ -225,7 +256,7 @@ async function resolveHostView(env, url) {
   if (!suffix || !url.hostname.endsWith(`.${suffix}`)) return { matched: false, id: null };
   const label = url.hostname.slice(0, -(suffix.length + 1));
   if (!label || label.includes('.')) return { matched: false, id: null };
-  return { matched: true, id: await env.REGISTRY_KV.get(dnsKey(label)) };
+  return { matched: true, id: await env.QUICKBEAM_KV.get(dnsKey(label)) };
 }
 
 /**
@@ -237,15 +268,65 @@ function viewId(requester, name) {
   return `qb_${requester.slice(2, 10).toLowerCase()}_${slug(name)}`;
 }
 
+const APP_ID_RE = /^0x[0-9a-fA-F]{64}$/;
+
 /**
- * CDN domain for one source. MUST match `_domain_for` in quickbeam/watcher.py — the
- * watcher names the directory, this names it back to filter a view's catalog.
+ * The canonical form of an app: its 32-byte id. Mirrors `toAppId` in the SDK
+ * (`fangorn/src/config.ts`) — an id passes through, a name is `keccak256(toHex(name))`.
+ *
+ * The id is canonical rather than the name because it is the only form every caller can
+ * produce: the website reads apps out of `StateCommitted` topics, which carry the id and
+ * have no on-chain preimage, so an unknown app has no name to send. Storing both forms
+ * would also split one app across two CDN domains.
  */
-function domainFor(owner, namespace) {
-  return `${slug(owner.slice(2, 10))}-${slug(namespace)}`;
+function toAppId(nameOrId) {
+  const value = String(nameOrId || '').trim();
+  if (!value) return '';
+  return APP_ID_RE.test(value) ? value.toLowerCase() : keccak256(toHex(value));
 }
 
-const viewDomains = (view) => new Set(view.sources.map((s) => domainFor(s.owner, s.namespace)));
+/** A stored source with its app resolved — views predating the app dimension have none. */
+const withApp = (s, env) => ({ app: toAppId(s.app || env.DEFAULT_APP), owner: s.owner || '*',
+                               namespace: s.namespace || '*' });
+
+/**
+ * CDN domain for one source. MUST match `_domain_for` in quickbeam/watcher.py — the
+ * watcher names the directory, this names it back to filter a view's catalog. Byte
+ * drift between the two silently returns an empty catalog, so change them together.
+ */
+function domainFor(app, owner, namespace) {
+  return `${appSlug(app)}-${slug(owner.slice(2, 10))}-${slug(namespace)}`;
+}
+
+/**
+ * The app's fragment of a CDN domain name. An app id is sliced to its first 8 hex chars
+ * exactly as the owner address is — a full 66-char id would dominate the directory name
+ * for no extra safety. A plain name (only reachable from a hand-run static watcher, since
+ * the worker canonicalises everything it stores) is slugged whole.
+ */
+function appSlug(app) {
+  return APP_ID_RE.test(app) ? slug(app.slice(2, 10)) : slug(app);
+}
+
+/**
+ * Does a CDN domain name belong to this view? A concrete source names exactly one
+ * domain; a wildcard source cannot be enumerated (the watcher only learns its pairs as
+ * commits arrive), so it is matched on the parts that ARE pinned — always the app, plus
+ * whichever of owner/namespace is not `*`.
+ */
+function domainMatcher(view, env) {
+  const sources = view.sources.map((s) => withApp(s, env));
+  return (name) => sources.some((s) => {
+    if (s.owner !== '*' && s.namespace !== '*') {
+      return name === domainFor(s.app, s.owner, s.namespace);
+    }
+    if (!name.startsWith(`${appSlug(s.app)}-`)) return false;
+    const rest = name.slice(appSlug(s.app).length + 1);
+    if (s.owner !== '*') return rest.startsWith(`${slug(s.owner.slice(2, 10))}-`);
+    if (s.namespace !== '*') return rest.endsWith(`-${slug(s.namespace)}`);
+    return true;
+  });
+}
 
 function slug(text) {
   return (text || '').replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'x';
@@ -253,14 +334,24 @@ function slug(text) {
 
 const isSafeName = (s) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(s || '');
 
-function normaliseSources(raw) {
+/**
+ * A source is the whole app:publisher:subspace triple. `owner`/`namespace` may be `*`
+ * (or omitted, which means the same) to watch every publisher/subspace in that app —
+ * the app itself is never a wildcard, because `fangorn subscribe` filters on it at the
+ * topic level. `app` falls back to DEFAULT_APP so views written before the app dimension
+ * existed keep resolving.
+ */
+function normaliseSources(raw, defaultApp) {
   if (!Array.isArray(raw)) return [];
   const seen = new Map();
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue;
-    const owner = String(item.owner || '').trim().toLowerCase();
-    const namespace = String(item.namespace || '').trim();
-    if (owner && namespace) seen.set(`${owner}:${namespace}`, { owner, namespace });
+    // Canonicalise to the app id, so a caller sending the name and one sending the id
+    // land on the same source, the same watch-list row and the same CDN domain.
+    const app = toAppId(item.app || defaultApp);
+    const owner = String(item.owner || '*').trim().toLowerCase();
+    const namespace = String(item.namespace || '*').trim();
+    if (app) seen.set(`${app}:${owner}:${namespace}`, { app, owner, namespace });
   }
   return [...seen.values()];
 }
@@ -279,6 +370,11 @@ function withUrls(view, url, env) {
   return {
     ...view,
     searchUrl: `${base}/search`,
+    // The whole view as NDJSON, vectors included — handed over explicitly so callers
+    // never have to derive it by rewriting searchUrl.
+    exportUrl: `${base}/export`,
+    // SSE: told when to pull, rather than polling for it.
+    streamUrl: `${base}/stream`,
     cdnUrl: cdn,
     mcpCommand: `quickbeam mcp --cdn-url ${cdn}`,
   };
@@ -297,7 +393,7 @@ async function withMcpStatus(env, view) {
     if (live.url) {
       const updated = { ...view, mcp: { ...view.mcp, status: live.status, url: live.url } };
       const { searchUrl, cdnUrl, mcpCommand, ...row } = updated;
-      await env.REGISTRY_KV.put(viewKey(view.id), JSON.stringify(row));
+      await env.QUICKBEAM_KV.put(viewKey(view.id), JSON.stringify(row));
       return updated;
     }
   } catch {
@@ -320,7 +416,7 @@ async function ensureMcp(env, view, url) {
 
 async function readView(env, id) {
   if (!id) return null;
-  const raw = await env.REGISTRY_KV.get(viewKey(id));
+  const raw = await env.QUICKBEAM_KV.get(viewKey(id));
   return raw ? JSON.parse(raw) : null;
 }
 
@@ -332,9 +428,9 @@ async function listViews(env) {
   const out = [];
   let cursor;
   do {
-    const page = await env.REGISTRY_KV.list({ prefix: 'view:', cursor });
+    const page = await env.QUICKBEAM_KV.list({ prefix: 'view:', cursor });
     for (const key of page.keys) {
-      const raw = await env.REGISTRY_KV.get(key.name);
+      const raw = await env.QUICKBEAM_KV.get(key.name);
       if (raw) out.push(JSON.parse(raw));
     }
     cursor = page.list_complete ? undefined : page.cursor;
@@ -424,6 +520,10 @@ function isAdmin(env, address) {
 /**
  * Forward a query to the shared instance, scoped to one view.
  *
+ *   /q/{id}/export        → SEARCH_URL/bundle/export, same scope injection — the whole
+ *                           view as one NDJSON stream, for searching locally
+ *   /q/{id}/stream        → CDN_URL/events for this view's domains — SSE telling a
+ *                           client WHEN to pull, not resending the rows
  *   /q/{id}/search…       → SEARCH_URL/search… with the view's (owner,namespace)
  *                           pairs injected as `scope`, so the URL always means the
  *                           view's namespaces and a caller cannot widen it
@@ -451,21 +551,30 @@ async function proxy(request, env, url, cors, resolved = null) {
   if (!view) return json(404, { error: `No view ${id}` }, cors);
 
   let target;
+  let download = false;
   if (path === 'search' || path.startsWith('search/')) {
-    const params = new URLSearchParams(url.search);
-    // The view defines the scope; drop anything the caller supplied so the endpoint
-    // cannot be widened past what the view covers.
-    params.delete('scope');
-    params.delete('owner');
-    params.delete('namespace');
-    for (const s of view.sources) params.append('scope', `${s.owner}:${s.namespace}`);
-    target = `${trimSlash(env.SEARCH_URL)}/${path}?${params}`;
+    target = `${trimSlash(env.SEARCH_URL)}/${path}?${scopedParams(url, view, env)}`;
+  } else if (path === 'export') {
+    // The whole view as one NDJSON stream, for callers that want to search locally.
+    // Same scope injection as search, so a download URL can never reach past its view.
+    target = `${trimSlash(env.SEARCH_URL)}/bundle/export?${scopedParams(url, view, env)}`;
+    download = true;
+  } else if (path === 'stream') {
+    // Server-Sent Events: which of the view's domains changed, so a client can pull
+    // just that shard instead of polling. Filtered server-side by domain, so a caller
+    // never sees another view's traffic.
+    const params = new URLSearchParams();
+    for (const d of await resolveDomains(env, view)) params.append('domain', d);
+    target = `${trimSlash(env.CDN_URL)}/events?${params}`;
   } else if (path === 'cdn/catalog') {
     return filteredCatalog(env, view, cors);
   } else if (path.startsWith('cdn/')) {
     target = `${trimSlash(env.CDN_URL)}/${path.slice('cdn/'.length)}${url.search}`;
   } else {
-    return json(404, { error: 'Proxy routes: /q/{viewId}/search, /q/{viewId}/cdn/*' }, cors);
+    return json(404, {
+      error: 'Proxy routes: /q/{viewId}/search, /q/{viewId}/export, '
+        + '/q/{viewId}/stream, /q/{viewId}/cdn/*',
+    }, cors);
   }
 
   if (!/^https?:\/\//.test(target)) {
@@ -487,6 +596,12 @@ async function proxy(request, env, url, cors, resolved = null) {
 
   const out = new Headers(upstream.headers);
   for (const [k, v] of Object.entries(cors)) out.set(k, v);
+  if (download && upstream.ok) {
+    out.set('content-type', 'application/x-ndjson');
+    out.set('content-disposition', `attachment; filename="${view.id}.ndjson"`);
+  }
+  // `upstream.body` is passed through unbuffered, so a corpus of any size streams
+  // rather than landing in the Worker's memory.
   return new Response(upstream.body, { status: upstream.status, headers: out });
 }
 
@@ -504,14 +619,55 @@ async function filteredCatalog(env, view, cors) {
   } catch (err) {
     return json(502, { error: `Instance unreachable: ${err.message}` }, cors);
   }
-  const wanted = viewDomains(view);
+  const wanted = domainMatcher(view, env);
   return json(200, {
     ...catalog,
-    domains: (catalog.domains || []).filter((d) => wanted.has(d.name)),
+    domains: (catalog.domains || []).filter((d) => wanted(d.name)),
   }, cors);
 }
 
+/**
+ * The view's domains as concrete names. A wildcard source has no enumerable list — the
+ * watcher only names a domain once a commit for that pair arrives — so ask the instance
+ * what exists and keep the matches. Concrete-only views skip the fetch entirely.
+ */
+async function resolveDomains(env, view) {
+  const sources = view.sources.map((s) => withApp(s, env));
+  if (sources.every((s) => s.owner !== '*' && s.namespace !== '*')) {
+    return sources.map((s) => domainFor(s.app, s.owner, s.namespace));
+  }
+  const match = domainMatcher(view, env);
+  try {
+    const res = await fetch(`${trimSlash(env.CDN_URL)}/catalog`);
+    if (!res.ok) return [];
+    const catalog = await res.json();
+    return (catalog.domains || []).map((d) => d.name).filter(match);
+  } catch {
+    return [];
+  }
+}
+
 const trimSlash = (s) => (s || '').replace(/\/$/, '');
+
+/**
+ * The caller's query string with the view's scope forced in: any caller-supplied
+ * `scope`/`owner`/`namespace` is dropped first, so neither search nor export can be
+ * widened past what the view covers. Everything else (q, n_results, limit, offset)
+ * passes through untouched.
+ */
+function scopedParams(url, view, env) {
+  const params = new URLSearchParams(url.search);
+  params.delete('scope');
+  params.delete('owner');
+  params.delete('namespace');
+  // `app:owner:namespace` — the server leaves an empty part unconstrained, which is
+  // exactly what a `*` source means, so a wildcard needs no special case here.
+  for (const s of view.sources) {
+    const { app, owner, namespace } = withApp(s, env);
+    params.append('scope', `${app}:${owner === '*' ? '' : owner}:${namespace === '*' ? '' : namespace}`);
+  }
+  return params;
+}
 
 /* ────────────────────── address-ownership proof ─────────────────────────── */
 

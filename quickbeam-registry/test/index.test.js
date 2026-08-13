@@ -12,6 +12,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { privateKeyToAccount } from 'viem/accounts';
+import { keccak256, toHex } from 'viem';
 
 import worker from '../src/index.js';
 
@@ -99,16 +100,24 @@ const bob = privateKeyToAccount(B_KEY);
 
 const PUB = '0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6';
 const PUB2 = '0x9dFA1680e682e0Fc79c5904ab453c04c7252572c';
-const src = (owner, namespace) => ({ owner, namespace });
+// A source is the whole app:publisher:subspace triple; `*` on either of the last two
+// widens it to the app. Apps are canonicalised to their 32-byte id, which is the form
+// the website sends (it reads apps out of StateCommitted topics, which carry no name).
+const APP_NAME = 'sond3r.test.1';
+const APP = keccak256(toHex(APP_NAME));
+const APP2 = keccak256(toHex('other.app.1'));
+const appSlug = (id) => id.slice(2, 10);
+const src = (owner, namespace, app = APP) => ({ app, owner, namespace });
 
 let env;
 beforeEach(() => {
   env = {
-    REGISTRY_KV: kvStub(),
+    QUICKBEAM_KV: kvStub(),
     SUBSCRIPTION_CONTRACT_ADDRESS: '0xa554a1817a4ec6f2808e55ded21abc707d86b1b9',
     ADMIN_WALLETS: admin.address,
     SEARCH_URL: 'http://box:8080',
     CDN_URL: 'http://box:8090',
+    DEFAULT_APP: APP_NAME,   // a name here; the worker canonicalises it to the id
   };
   rpcResponse = () => accessResult(true, Math.floor(Date.now() / 1000)); // subscribed
   instanceResponse = null;
@@ -140,7 +149,7 @@ const createView = (account, name, sources) =>
   signedPost('/views', account, { name, sources });
 
 /** View rows only — each view also writes a dns: reverse-map key. */
-const viewCount = () => [...env.REGISTRY_KV.store.keys()].filter((k) => k.startsWith('view:')).length;
+const viewCount = () => [...env.QUICKBEAM_KV.store.keys()].filter((k) => k.startsWith('view:')).length;
 
 /* ── tests ───────────────────────────────────────────────────────────────── */
 
@@ -148,7 +157,7 @@ test('unsigned /views returns a challenge, not a view', async () => {
   const res = await post('/views', { address: alice.address, name: 'v', sources: [src(PUB, 'ns')] });
   assert.equal(res.status, 401);
   assert.match((await res.json()).challenge, /Quickbeam request/);
-  assert.equal(env.REGISTRY_KV.store.size, 0);
+  assert.equal(env.QUICKBEAM_KV.store.size, 0);
 });
 
 test('a signature from the wrong wallet is rejected', async () => {
@@ -159,7 +168,7 @@ test('a signature from the wrong wallet is rejected', async () => {
     address: alice.address, message: challenge, signature, name: 'v', sources: [src(PUB, 'ns')],
   });
   assert.equal(res.status, 401);
-  assert.equal(env.REGISTRY_KV.store.size, 0);
+  assert.equal(env.QUICKBEAM_KV.store.size, 0);
 });
 
 test('a stale Issued-At is rejected', async () => {
@@ -183,6 +192,7 @@ test('creating a view returns its search and MCP URLs', async () => {
   const body = await res.json();
   assert.match(body.id, /^qb_[0-9a-f]{8}_music$/);
   assert.match(body.searchUrl, /\/q\/qb_[0-9a-f]{8}_music\/search$/);
+  assert.match(body.exportUrl, /\/q\/qb_[0-9a-f]{8}_music\/export$/);
   assert.match(body.mcpCommand, /^quickbeam mcp --cdn-url https:\/\/reg\.test\/q\//);
 });
 
@@ -192,7 +202,63 @@ test('EMBED ONCE: two requesters, same namespace → one watchlist entry', async
 
   const { sources } = await (await get('/watchlist')).json();
   assert.equal(sources.length, 1, 'the namespace must be embedded once, not per requester');
-  assert.deepEqual(sources[0], { owner: PUB.toLowerCase(), namespace: 'shared' });
+  assert.deepEqual(sources[0], { app: APP, owner: PUB.toLowerCase(), namespace: 'shared' });
+});
+
+test('the same publisher:subspace in two apps is two watchlist entries', async () => {
+  await createView(alice, 'mine', [src(PUB, 'media')]);
+  await createView(bob, 'theirs', [src(PUB, 'media', APP2)]);
+
+  const { sources } = await (await get('/watchlist')).json();
+  assert.equal(sources.length, 2, 'apps must not collapse into one entry');
+  assert.deepEqual(sources.map((s) => s.app).sort(), [APP2, APP].sort());
+});
+
+test('a whole-app view is one wildcard watchlist entry', async () => {
+  await createView(alice, 'everything', [src('*', '*')]);
+
+  const { sources } = await (await get('/watchlist')).json();
+  assert.deepEqual(sources, [{ app: APP, owner: '*', namespace: '*' }]);
+});
+
+test('a source with no app falls back to DEFAULT_APP', async () => {
+  await createView(alice, 'legacy', [{ owner: PUB, namespace: 'shared' }]);
+
+  const { sources } = await (await get('/watchlist')).json();
+  assert.equal(sources[0].app, APP, 'views written before apps existed must keep working');
+});
+
+test('the website payload is accepted verbatim', async () => {
+  // Exactly what websites/fangorn Home.jsx sends: `app` is ALWAYS a 32-byte app id,
+  // because the site reads apps out of StateCommitted topics (`pickedApp`) or derives
+  // its own with toAppId(DEFAULT_APP) — it never has a bare name for an arbitrary app.
+  // A 66-char id fails isSafeName (48-char cap), which is what used to 400 here.
+  const res = await createView(alice, 'from-site', [{
+    app: APP,                        // toAppId(...) — 0x + 64 hex
+    owner: PUB,
+    namespace: 'media',
+  }]);
+  assert.equal(res.status, 202, await res.text());
+
+  const { sources } = await (await get('/watchlist')).json();
+  assert.deepEqual(sources, [{ app: APP, owner: PUB.toLowerCase(), namespace: 'media' }]);
+});
+
+test('the same app as a name and as an id is ONE source', async () => {
+  await createView(alice, 'byname', [{ app: APP_NAME, owner: PUB, namespace: 'media' }]);
+  await createView(bob, 'byid', [{ app: APP, owner: PUB, namespace: 'media' }]);
+
+  const { sources } = await (await get('/watchlist')).json();
+  assert.equal(sources.length, 1, 'name and id must canonicalise to the same source');
+  assert.equal(sources[0].app, APP, 'the canonical form is the id');
+});
+
+test('an app id is rejected only when it is malformed', async () => {
+  const res = await createView(alice, 'bad', [{ app: '0xnothex', owner: PUB, namespace: 'm' }]);
+  // '0xnothex' is not an id, so it is treated as a NAME and hashed — which is valid.
+  assert.equal(res.status, 202);
+  const { sources } = await (await get('/watchlist')).json();
+  assert.equal(sources[0].app, keccak256(toHex('0xnothex')));
 });
 
 test('removing one view keeps the source for the other; removing the last drops it', async () => {
@@ -235,7 +301,7 @@ test('an unregistered wallet is told to register (403)', async () => {
   rpcResponse = () => accessResult(false, 0);
   const res = await createView(alice, 'v', [src(PUB, 'ns')]);
   assert.equal(res.status, 403);
-  assert.equal(env.REGISTRY_KV.store.size, 0);
+  assert.equal(env.QUICKBEAM_KV.store.size, 0);
 });
 
 test('a lapsed subscription is told to subscribe (402)', async () => {
@@ -250,7 +316,7 @@ test('a malformed source is refused before it reaches KV', async () => {
   assert.equal(bad.status, 400);
   const worse = await createView(alice, 'v', [src(PUB, '../etc/passwd')]);
   assert.equal(worse.status, 400);
-  assert.equal(env.REGISTRY_KV.store.size, 0);
+  assert.equal(env.QUICKBEAM_KV.store.size, 0);
 });
 
 test('a view with no sources is refused', async () => {
@@ -276,9 +342,79 @@ test('search is scoped to the view, and a caller cannot widen it', async () => {
   assert.equal(res.status, 200);
 
   const url = new URL(lastInstanceUrl);
-  assert.deepEqual(url.searchParams.getAll('scope'), [`${PUB.toLowerCase()}:a`]);
+  assert.deepEqual(url.searchParams.getAll('scope'), [`${APP}:${PUB.toLowerCase()}:a`]);
   assert.equal(url.searchParams.get('owner'), null);
   assert.equal(url.searchParams.get('q'), 'hi');
+});
+
+test('a wildcard view scopes to its app, leaving the pair unconstrained', async () => {
+  const v = await (await createView(alice, 'everything', [src('*', '*')])).json();
+  instanceResponse = () => new Response(JSON.stringify({ results: [] }), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  });
+
+  await get(`/q/${v.id}/search?q=hi&scope=0xdead:secret`);
+
+  // An empty part is "unconstrained" on the server, so `app::` means the whole app —
+  // and the caller's own scope is still dropped.
+  const url = new URL(lastInstanceUrl);
+  assert.deepEqual(url.searchParams.getAll('scope'), [`${APP}::`]);
+});
+
+test('export streams the whole view, scoped, as a named NDJSON download', async () => {
+  const v = await (await createView(alice, 'mine', [src(PUB, 'a'), src(PUB2, 'b')])).json();
+  instanceResponse = () => new Response('{"track_id":"1"}\n{"track_id":"2"}\n', {
+    status: 200, headers: { 'content-type': 'text/plain' },
+  });
+
+  // A caller trying to widen the download past its view must not succeed.
+  const res = await get(`/q/${v.id}/export?limit=5&scope=0xdead:secret`);
+  assert.equal(res.status, 200);
+
+  const url = new URL(lastInstanceUrl);
+  assert.equal(url.pathname, '/bundle/export');
+  assert.deepEqual(url.searchParams.getAll('scope').sort(),
+    [`${APP}:${PUB.toLowerCase()}:a`, `${APP}:${PUB2.toLowerCase()}:b`].sort());
+  assert.equal(url.searchParams.get('limit'), '5', 'unrelated params pass through');
+
+  // Named so a browser saves something useful, and typed so tooling knows what it is.
+  assert.equal(res.headers.get('content-type'), 'application/x-ndjson');
+  assert.match(res.headers.get('content-disposition'), new RegExp(`filename="${v.id}.ndjson"`));
+  assert.equal((await res.text()).trim().split('\n').length, 2);
+});
+
+test('an export error is passed through without the download headers', async () => {
+  const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
+  instanceResponse = () => new Response('{"detail":"boom"}', { status: 500 });
+  const res = await get(`/q/${v.id}/export`);
+  assert.equal(res.status, 500);
+  assert.notEqual(res.headers.get('content-type'), 'application/x-ndjson');
+});
+
+test('the stream is scoped to the view domains and stays an event stream', async () => {
+  const v = await (await createView(alice, 'mine', [src(PUB, 'a'), src(PUB2, 'b')])).json();
+  instanceResponse = () => new Response('event: snapshot\ndata: {}\n\n', {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+  });
+
+  const res = await get(`/q/${v.id}/stream`);
+  assert.equal(res.status, 200);
+
+  const url = new URL(lastInstanceUrl);
+  assert.equal(url.pathname, '/events');
+  // One domain per source, and nothing else — a client must not see another view.
+  assert.deepEqual(url.searchParams.getAll('domain').sort(),
+    [`${appSlug(APP)}-147c24c5-a`, `${appSlug(APP)}-9dfa1680-b`].sort());
+
+  // The content type has to survive the proxy or EventSource refuses the response.
+  assert.equal(res.headers.get('content-type'), 'text/event-stream');
+  assert.equal(res.headers.get('access-control-allow-origin'), '*');
+});
+
+test('a view exposes search, export and stream URLs', async () => {
+  const v = await (await createView(alice, 'urls', [src(PUB, 'a')])).json();
+  assert.match(v.streamUrl, /\/q\/qb_[0-9a-f]{8}_urls\/stream$/);
 });
 
 test('the MCP catalog lists only the view domains', async () => {
@@ -286,14 +422,45 @@ test('the MCP catalog lists only the view domains', async () => {
   instanceResponse = () => new Response(JSON.stringify({
     collection: 'fangorn',
     domains: [
-      { name: '147c24c5-a', count: 10 },   // this view's
-      { name: '147c24c5-b', count: 10 },   // same publisher, different namespace
-      { name: '9dfa1680-a', count: 10 },   // different publisher, same namespace
+      { name: `${appSlug(APP)}-147c24c5-a`, count: 10 }, // this view's
+      { name: `${appSlug(APP)}-147c24c5-b`, count: 10 }, // same publisher, different namespace
+      { name: `${appSlug(APP)}-9dfa1680-a`, count: 10 }, // different publisher, same namespace
+      { name: `${appSlug(APP2)}-147c24c5-a`, count: 10 },   // same pair, DIFFERENT app
     ],
   }), { status: 200, headers: { 'content-type': 'application/json' } });
 
   const body = await (await get(`/q/${v.id}/cdn/catalog`)).json();
-  assert.deepEqual(body.domains.map((d) => d.name), ['147c24c5-a']);
+  assert.deepEqual(body.domains.map((d) => d.name), [`${appSlug(APP)}-147c24c5-a`]);
+});
+
+test('a whole-app view gets every domain of that app, and none of another', async () => {
+  const v = await (await createView(alice, 'everything', [src('*', '*')])).json();
+  instanceResponse = () => new Response(JSON.stringify({
+    domains: [
+      { name: `${appSlug(APP)}-147c24c5-a`, count: 10 },
+      { name: `${appSlug(APP)}-9dfa1680-b`, count: 10 },
+      { name: `${appSlug(APP2)}-147c24c5-a`, count: 10 },   // another app entirely
+    ],
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const body = await (await get(`/q/${v.id}/cdn/catalog`)).json();
+  assert.deepEqual(body.domains.map((d) => d.name),
+    [`${appSlug(APP)}-147c24c5-a`, `${appSlug(APP)}-9dfa1680-b`]);
+});
+
+test('a one-publisher-whole-app view keeps other publishers out', async () => {
+  const v = await (await createView(alice, 'justmine', [src(PUB, '*')])).json();
+  instanceResponse = () => new Response(JSON.stringify({
+    domains: [
+      { name: `${appSlug(APP)}-147c24c5-a`, count: 10 },
+      { name: `${appSlug(APP)}-147c24c5-b`, count: 10 },
+      { name: `${appSlug(APP)}-9dfa1680-a`, count: 10 }, // different publisher
+    ],
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const body = await (await get(`/q/${v.id}/cdn/catalog`)).json();
+  assert.deepEqual(body.domains.map((d) => d.name),
+    [`${appSlug(APP)}-147c24c5-a`, `${appSlug(APP)}-147c24c5-b`]);
 });
 
 test('cdn passthrough strips the /cdn prefix (the path MCP pulls shards from)', async () => {
@@ -307,6 +474,18 @@ test('an unrecognised proxy path is 404 rather than forwarded somewhere', async 
   const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
   const res = await get(`/q/${v.id}/admin/secrets`);
   assert.equal(res.status, 404);
+});
+
+test('a wrong path 404s with the route list, not an auth error', async () => {
+  // Regression: /sources (the pre-views name for /watchlist) used to fall through to
+  // the write path and answer "provide a valid EVM address", which reads as an auth
+  // problem and hides the real cause — a mistyped route.
+  const res = await get('/sources');
+  assert.equal(res.status, 404);
+  const body = await res.json();
+  assert.match(body.error, /Unknown route \/sources/);
+  assert.ok(body.routes.some((r) => r.includes('/watchlist')),
+    'the 404 should name the route the caller probably wanted');
 });
 
 test('an unknown view id is 404, not a pass-through', async () => {
@@ -422,7 +601,7 @@ test('a per-view subdomain resolves the same view as /q/{id}', async () => {
 
   const forwarded = new URL(lastInstanceUrl);
   assert.equal(forwarded.pathname, '/search');
-  assert.deepEqual(forwarded.searchParams.getAll('scope'), [`${PUB.toLowerCase()}:a`]);
+  assert.deepEqual(forwarded.searchParams.getAll('scope'), [`${APP}:${PUB.toLowerCase()}:a`]);
 });
 
 test('an unknown subdomain is 404, not a proxy to nowhere', async () => {

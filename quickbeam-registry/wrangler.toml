@@ -71,13 +71,32 @@ POLL_HINT_SECONDS = "60"
 
 # ── Instance endpoints (the query proxy) ─────────────────────────────────────
 # The shared Quickbeam box. Plain HTTP is fine: browsers reach these through this
-# worker, which supplies TLS — that is why the box needs no DNS record or cert.
+# worker, which supplies TLS — so the box needs no certificate.
+#
+# ⚠️ It DOES need a hostname. A Worker's fetch() to a raw IP is refused by Cloudflare
+# with error 1003 ("Direct IP Access Not Allowed"), and since that is a response rather
+# than a connection error, the proxy forwards the error page instead of a clean 502.
+# Use a DNS-ONLY (grey cloud) A record: a proxied one re-enters Cloudflare, which
+# carries 8080 but not 8090, so the CDN half would fail while search looked fine.
 #
 # There is no MCP_URL: a requester's MCP is their own local `quickbeam mcp` client
 # pointed at /q/{viewId}/cdn, whose catalog this worker filters to their namespaces.
 # Nothing MCP-shaped is provisioned per requester.
-SEARCH_URL = "http://CHANGE-ME:8080"
-CDN_URL = "http://CHANGE-ME:8090"
+SEARCH_URL = "http://qb.sond3r.com:8080"
+CDN_URL = "http://qb.sond3r.com:8090"
+
+# ── App scoping ──────────────────────────────────────────────────────────────
+# A source is the whole app:publisher:subspace triple. Apps are stored canonically as
+# their 32-byte id (keccak256 of the name, the SDK's toAppId) — the website only ever
+# has the id, since it reads apps out of StateCommitted topics, which carry no name.
+# Either form is accepted on input; a name is hashed on the way in.
+#
+# This is the app assumed for a source that names none — i.e. every view written before
+# the app dimension existed. It MUST be the app those views were created against, or
+# they resolve to a CDN domain the watcher never bakes and their catalogs come back
+# empty. "fangorn" is the SDK's DEFAULT_APP, which is what the website stamped
+# (APP_ID = toAppId(DEFAULT_APP)) on every view created through it so far.
+DEFAULT_APP = "fangorn"
 
 # Per-view subdomains live under this suffix. Leave EMPTY to serve views only at
 # /q/{viewId}/… on the worker's own hostname; set it once the wildcard route above is
@@ -110,7 +129,7 @@ SIGNATURE_MAX_AGE = "300"
 ALLOWED_ORIGIN = "*"
 
 # KV holding one row per watched source. Create it once, then paste the id:
-#   wrangler kv namespace create REGISTRY_KV
+#   wrangler kv namespace create QUICKBEAM_KV
 [[kv_namespaces]]
-binding = "REGISTRY_KV"
-id = "CHANGE-ME"
+binding = "QUICKBEAM_KV"
+id = "d37a0a0747364fbcb20fd5020cb64a69"

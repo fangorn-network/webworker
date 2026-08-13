@@ -3,6 +3,10 @@
 The control plane for Quickbeam, and the HTTPS front door to the instance that does
 the work.
 
+> Deploying the whole service — worker, instance, website, in order — is
+> [`quickbeam/DEPLOYMENT.md`](../../quickbeam/DEPLOYMENT.md). This file is the worker
+> on its own. `examples/manage-views.mjs` drives the signed routes from a shell.
+
 Two ideas, kept apart:
 
 - **Embedding is per `(owner, namespace)` and happens once.** The watch list this
@@ -54,15 +58,75 @@ and nothing here reads an event log.
 | `POST /views` | signature + subscription | create or replace a view (idempotent on `{requester, name}`); returns its id, search URL and MCP command. `hostedMcp: true` also provisions a Cloud Run MCP |
 | `GET /views?requester=0x…` | none | that wallet's views (omit `requester` for all) |
 | `GET /views/{id}` | none | one view |
-| `GET /watchlist` | none | the deduplicated union the instance polls: `{"sources":[{owner, namespace}]}` |
+| `GET /watchlist` | none | the deduplicated union the instance polls: `{"sources":[{app, owner, namespace}]}`. `owner`/`namespace` may be `*` (that whole app); dedup is on all three, so the same publisher:subspace in two apps stays two entries |
 | `GET /q/{id}/search…` | none | proxied to the instance with the view's `scope` injected |
+| `GET /q/{id}/export` | none | the whole view as one NDJSON stream (vectors included), for searching locally |
+| `GET /q/{id}/stream` | none | SSE: which of the view's domains changed, so a client pulls instead of polling |
 | `GET /q/{id}/cdn/catalog` | none | the instance catalog **filtered** to the view's domains |
 | `GET /q/{id}/cdn/*` | none | proxied to the CDN (shards, manifests, edges) |
 | `POST /admin/remove` | admin signature | delete a view by `{id}` |
 
-The search proxy **strips any caller-supplied `scope`, `owner` or `namespace`** before
-injecting the view's own pairs, so a view URL always means that view's namespaces and
-cannot be widened by editing the query string.
+The search **and export** proxies both **strip any caller-supplied `scope`, `owner` or
+`namespace`** before injecting the view's own pairs, so a view URL always means that
+view's namespaces and cannot be widened by editing the query string.
+
+## Three ways to hold a copy locally
+
+`GET /q/{id}/export` streams the view's entire corpus as NDJSON — `{track_id, fields,
+embedding, owner, meta}` per line — with `content-disposition` set so a browser saves
+`<viewId>.ndjson`. It pipes straight into another instance:
+
+```sh
+curl "$W/q/<viewId>/export" | curl -X POST http://localhost:8080/bundle/import --data-binary @-
+```
+
+`quickbeam pull` is the other route, and the better one once a corpus is large or
+refreshed often:
+
+```sh
+quickbeam pull <domain> --cdn-url $W/q/<viewId>/cdn
+```
+
+| | `pull` (CDN shards) | `/q/{id}/export` (NDJSON) |
+|---|---|---|
+| Unit | one namespace per call | the whole view, one call |
+| Resumable | yes (HTTP Range) | no — restart it |
+| Verified | sha256 per shard | no |
+| Incremental | yes, delta shards only | no, full corpus each time |
+| Lands in | a local Qdrant, ready to serve | a file, parse it how you like |
+
+Export is the simple thing to hand an application. Neither replaces the other.
+
+### Staying current: `GET /q/{id}/stream`
+
+Both of the above are pull. `/q/{id}/stream` is a Server-Sent Events feed that says
+**when** to pull:
+
+```
+event: snapshot
+data: {"domain":"147c24c5-secondbrain","count":27,"shards":1}
+
+event: change
+data: {"domain":"147c24c5-secondbrain","count":41,"added":["shard-0001-9f2c.ndjson.gz"]}
+```
+
+A client holds the connection and, on `change`, fetches the named shard from
+`/q/{id}/cdn/domains/{domain}/shards/{file}` — reusing the sha256 verification and
+dedup `pull` already does. `added` fires when a namespace is baked for the first time.
+
+**Notifications, not rows, on purpose.** Points carry no timestamp or sequence, so a
+row-carrying stream would have to re-send the whole corpus on every reconnect and would
+discard the shard verification. Because the events are advisory, a reconnect just
+re-sends `snapshot` and there is no history to replay.
+
+The feed lives on the CDN service, which already owns the shard directory: the watcher
+rewrites a domain's `manifest.json` when it appends a delta shard, so the manifest *is*
+the change log. Latency is the poll interval (`--events-interval`, default 2s) plus the
+watcher's own cycle. A re-bake that adds no shard emits nothing.
+
+⚠️ The stream is **uncompressed**, and a 256-dim vector as decimal text dominates each
+row — reckon on ~2.5 KB per record, so a 40k-record view is around 100 MB. It streams
+rather than buffering, so size costs time, not memory.
 
 ## Per-view subdomains
 
@@ -109,8 +173,18 @@ an `mcpError` and the view still gets its search endpoint — the feature degrad
 does not fail the view.
 
 ⚠️ The CDN domain name is built the same way in two languages: `domainFor()` here and
-`_domain_for()` in `quickbeam/watcher.py`, both `{owner[2:10]}-{namespace}`. If they
-drift, a view's catalog silently comes back empty.
+`_domain_for()` in `quickbeam/watcher.py`, both `{app}-{owner[2:10]}-{namespace}`. If
+they drift, a view's catalog silently comes back empty — `quickbeam/tests/test_watchlist.py`
+re-derives this file's version from source and fails if one side moves alone.
+
+A wildcard source (`owner` and/or `namespace` = `*`) names no single domain, since the
+watcher only learns its pairs as commits arrive. Those are matched on the parts that are
+pinned — always the app — by `domainMatcher()`, and `/q/{id}/stream` resolves them by
+asking the instance's catalog what actually exists.
+
+⚠️ `DEFAULT_APP` is the app assumed for a source that names none, which is every view
+stored before the app dimension existed. It must stay set to the app those views were
+created against, and match the watcher's `APP`, or their catalogs come back empty.
 
 ## Teardown
 
@@ -162,7 +236,7 @@ keeps working and hides it. Check with `cast call <addr> "dataRegistry()(address
 ```sh
 pnpm install                # or npm install
 npm test                    # node --test, 30 tests, no framework
-npx wrangler kv namespace create REGISTRY_KV   # paste the id into wrangler.toml
+npx wrangler kv namespace create QUICKBEAM_KV   # paste the id into wrangler.toml
 npx wrangler dev            # with STUB_GATE="true" to skip the on-chain check
 npx wrangler deploy
 ```
