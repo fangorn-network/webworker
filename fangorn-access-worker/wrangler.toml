@@ -11,27 +11,15 @@ compatibility_date = "2025-07-18"
 binding = "BUCKET"
 bucket_name = "sond3r"
 
-# The shared worker at fangorn-access-worker.quickbeam.workers.dev predates the
-# rename and holds live content in the old `fttf` bucket. Deploying the default
-# above over it would repoint it at an empty bucket and every already-sold file
-# would 404, so that one deploys as an environment that pins the old name:
-# `pnpm deploy:r2` (see the root package.json) passes --env shared.
-[env.shared]
-name = "fangorn-access-worker"
-
-[[env.shared.r2_buckets]]
-binding = "BUCKET"
-bucket_name = "fttf"
-
 [env.shared.vars]
-SETTLEMENT_REGISTRY_ADDRESS = "0xec43a354e1b375585e58ae1e6b02954f84139feb"
+SETTLEMENT_REGISTRY_ADDRESS = "0x35b6c6a975933c21442a04041b920f80b381d993"
 ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
 
 [vars]
 # The live SettlementRegistry on Arbitrum Sepolia. /access authorizes against this
 # contract, so a worker pointed at the wrong one releases nothing.
-SETTLEMENT_REGISTRY_ADDRESS = "0xec43a354e1b375585e58ae1e6b02954f84139feb"
+SETTLEMENT_REGISTRY_ADDRESS = "0x35b6c6a975933c21442a04041b920f80b381d993"
 ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
 

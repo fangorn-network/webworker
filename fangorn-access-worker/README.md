@@ -62,9 +62,18 @@ buyer's machine.
 ungated is what lets a video stream with ordinary Range requests. Only keys are
 gated.
 
-`/access` releases a DEK when the request is signed by a stealth address for
-which `SettlementRegistry.isSettled(stealthAddress, resourceId)` is true, within
-`TIMESTAMP_WINDOW` seconds. Resources priced at 0 release to any valid signer.
+`/access` releases a DEK when the request is signed, within `TIMESTAMP_WINDOW`
+seconds, by a stealth address the registry says has settled. In order:
+
+1. **The resource must exist** (`getOwner != 0`). An unregistered id reads back a
+   price of 0, so checking the price first would treat every id the registry has
+   never heard of as free.
+2. **It must not be disabled** (`isDisabled`). This check exists here because it
+   exists nowhere else: the registry leaves `isSettled` true after a takedown —
+   the payment is a historical fact — so a taken-down resource is refused by this
+   worker or by no one, including buyers who already paid.
+3. **It must be settled** (`isSettled(stealthAddress, resourceId)`), unless it is
+   priced at 0, which releases to any valid signer.
 
 Object keys must be bytes32 — `resourceId` for chunk 0,
 `keccak256(resourceId ++ uint32 i)` for the rest. Anything else 404s, which is

@@ -25,6 +25,12 @@ import { gcm } from '@noble/ciphers/aes.js'
 //   GET  /pubkey        → the X25519 pubkey sellers seal DEKs to
 //   GET  /ct/:id        → stream the (already-encrypted) R2 object; ungated
 //   POST /access        → settlement-gated: unseal the DEK, return 32 bytes
+//
+// The gate, in order (see `verify`): the resource must exist, must not be
+// disabled, and — if it costs anything — must have been settled by the address
+// that signed the request. The disabled check lives here and nowhere else: the
+// registry keeps `isSettled` true after a takedown because the payment really
+// happened, so refusing a taken-down resource is this worker's job.
 // ------------------------------------------------------------
 
 interface Env {
@@ -82,11 +88,27 @@ const SETTLEMENT_REGISTRY_ABI = [
 		stateMutability: 'view',
 		type: 'function',
 	},
+	{
+		inputs: [{ internalType: 'bytes32', name: 'resource_id', type: 'bytes32' }],
+		name: 'getOwner',
+		outputs: [{ internalType: 'address', name: '', type: 'address' }],
+		stateMutability: 'view',
+		type: 'function',
+	},
+	{
+		inputs: [{ internalType: 'bytes32', name: 'resource_id', type: 'bytes32' }],
+		name: 'isDisabled',
+		outputs: [{ internalType: 'bool', name: '', type: 'bool' }],
+		stateMutability: 'view',
+		type: 'function',
+	},
 ] as const
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 
 const CORS_HEADERS = {
 	'Access-Control-Allow-Origin': '*',
-	'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+	'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
 	'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 }
 
@@ -219,30 +241,44 @@ async function verify(
 		transport: http(env.ARBITRUM_SEPOLIA_RPC),
 	})
 
-	let price: bigint
-	try {
-		price = await client.readContract({
+	const read = <T>(functionName: string, args: readonly unknown[]) =>
+		client.readContract({
 			address: env.SETTLEMENT_REGISTRY_ADDRESS as Address,
 			abi: SETTLEMENT_REGISTRY_ABI,
-			functionName: 'getPrice',
-			args: [req.resourceId as Hex],
-		})
+			functionName,
+			args,
+		} as never) as Promise<T>
+
+	let owner: Address, price: bigint, disabled: boolean
+	try {
+		;[owner, price, disabled] = await Promise.all([
+			read<Address>('getOwner', [req.resourceId as Hex]),
+			read<bigint>('getPrice', [req.resourceId as Hex]),
+			read<boolean>('isDisabled', [req.resourceId as Hex]),
+		])
 	} catch (e) {
-		console.error('price lookup failed:', e)
-		return { ok: false, reason: 'price lookup failed' }
+		console.error('resource lookup failed:', e)
+		return { ok: false, reason: 'resource lookup failed' }
 	}
+
+	// An unregistered resource has no owner — and, being unregistered, also has a
+	// price of zero. Checking the price first would read that as "free" and hand
+	// the DEK to anyone, for any object in the bucket the registry has never
+	// heard of. Existence is the first question, not the second.
+	if (owner === ZERO_ADDRESS) return { ok: false, reason: 'unknown resource' }
+
+	// Takedown. The registry deliberately does NOT un-settle anyone — `isSettled`
+	// stays true because the payment is a historical fact — so a disabled
+	// resource is refused HERE or not at all, and it has to be refused to buyers
+	// who already settled, which is the only case that matters.
+	if (disabled) return { ok: false, reason: 'resource disabled' }
 
 	// Free resources release to any valid signer.
 	if (price === 0n) return { ok: true, address: stealthAddress }
 
 	let settled: boolean
 	try {
-		settled = await client.readContract({
-			address: env.SETTLEMENT_REGISTRY_ADDRESS as Address,
-			abi: SETTLEMENT_REGISTRY_ABI,
-			functionName: 'isSettled',
-			args: [stealthAddress, req.resourceId as Hex],
-		})
+		settled = await read<boolean>('isSettled', [stealthAddress, req.resourceId as Hex])
 	} catch (e) {
 		console.error('RPC error:', e)
 		return { ok: false, reason: 'settlement check failed' }
@@ -449,6 +485,44 @@ async function handleUpload(request: Request, env: Env, resourceId: string): Pro
 }
 
 // ------------------------------------------------------------
+// Route: DELETE /upload/:resourceId — drop an object and its sealed DEK
+//
+// Same path and same gate as upload, because it is the same authority: whoever
+// holds the bucket's upload token put these bytes here and is the only one who
+// may take them away. An ungated delete would let anyone empty a publisher's
+// library over HTTP.
+//
+// Chunked resources are deleted one key at a time by the caller, which knows the
+// chunk count (sond3r's server/settle.js chunkKey). The worker deliberately does
+// not walk or guess the chunk list: `isObjectKey` is what keeps this route away
+// from `.worker-x25519-secret` and `.upload-token`, and it only holds because
+// every key it accepts is a literal bytes32. A "delete all chunks of X" route
+// would have to synthesize keys, and a bug there deletes the wrong publisher's
+// objects.
+//
+// Idempotent: R2 delete succeeds on a key that isn't there, so a retry after a
+// half-finished delete is safe and a caller can always just try again.
+// ------------------------------------------------------------
+
+async function handleDelete(request: Request, env: Env, resourceId: string): Promise<Response> {
+	if (!isObjectKey(resourceId)) return jsonError('resourceId must be 32 bytes of hex', 400)
+	if (!(await authorizeUpload(request, env))) {
+		return jsonError('missing or incorrect upload token', 401)
+	}
+	try {
+		// The DEK goes with the ciphertext. Leaving it behind would keep releasing
+		// a key for bytes that no longer exist.
+		await env.BUCKET.delete([resourceId, dekKey(resourceId)])
+	} catch (e) {
+		console.error('R2 delete failed:', e)
+		return jsonError('delete failed', 500)
+	}
+	return new Response(JSON.stringify({ deleted: resourceId }), {
+		headers: { 'Content-Type': 'application/json' },
+	})
+}
+
+// ------------------------------------------------------------
 // Route: GET /ct/:resourceId — stream the encrypted object (ungated; it's ciphertext)
 // ------------------------------------------------------------
 
@@ -522,6 +596,10 @@ export default {
 			if (pathname.startsWith('/upload/')) {
 				return withCors(await handleUpload(request, env, decodeURIComponent(pathname.slice(8))))
 			}
+		}
+
+		if (method === 'DELETE' && pathname.startsWith('/upload/')) {
+			return withCors(await handleDelete(request, env, decodeURIComponent(pathname.slice(8))))
 		}
 
 		return jsonError('not found', 404)
