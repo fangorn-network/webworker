@@ -10,6 +10,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@fangorn-network/sdk": "2026.8.18-dev",
     "viem": "^2.54.6"
   },
   "devDependencies": {

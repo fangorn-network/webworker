@@ -8,16 +8,46 @@ Example deployed at `https://fangorn-access-worker.quickbeam.workers.dev`
 
 1. Consumer signs `{ nullifier, resourceId, objectKey, timestamp }` with their stealth address private key
 2. Worker recovers the stealth address from the signature
-3. Worker calls `is_settled(stealthAddress, resourceId)` on the Settlement Registry
+3. Worker calls `getPrice(resourceId)` and, unless the resource is free, `isSettled(stealthAddress, resourceId)` on the SettlementRegistry
 4. If settled → bytes proxied directly from R2
 5. If not → 401
 
 The worker is stateless, open-source, and has no logging. Its only capability is verifying settlement and proxying bytes. The content URL is never exposed to the consumer.
 
 
+## Configuration
+
+**The SettlementRegistry address and the RPC endpoint come from
+`@fangorn-network/sdk`** (`FangornConfig`), not from `wrangler.toml`. The SDK is the
+only thing that knows which contracts belong to the current deployment, and checking a
+retired registry answers `isSettled: false` for every buyer who paid on the live one —
+a silent 401 with nothing in the logs to explain it. **Move deployments by bumping the
+SDK, then redeploying.** The same is true of the storage and Quickbeam workers, so all
+three follow one source.
+
+| Var | Meaning |
+|---|---|
+| `SETTLEMENT_REGISTRY_ADDRESS` | **Normally unset.** Overrides the SDK's address, for repointing ahead of an SDK publish; taking it logs a warning naming what it replaced, and a malformed one fails the check rather than falling back to the SDK's |
+| `ARBITRUM_SEPOLIA_RPC` | Optional. Default: the SDK's `FangornConfig.rpcUrl` |
+| `TIMESTAMP_WINDOW` | Seconds a signed request stays valid (default `60`) |
+
+Only `lib/config.js` is imported from the SDK — that module pulls in nothing but
+viem, while the package root reaches node `fs`/`path` and the graph engine, which a
+workerd bundle can't carry.
+
+Re-run `npx wrangler types` after changing `wrangler.toml`.
+
 ## Run locally
 
 npx wrangler dev --local
+
+## Test
+
+npm test    # vitest via @cloudflare/vitest-pool-workers
+
+Two cases, both on the gate: that a read is checked against the SDK's
+SettlementRegistry when nothing is configured, and that a malformed override fails
+instead of silently falling back.
 
 ## Deploy
 

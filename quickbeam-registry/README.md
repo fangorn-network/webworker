@@ -46,7 +46,9 @@ what spends embedding work.
    `Issued-At` bounds replay without any server-side state.
 2. **An active subscription** — one `eth_call` to `access(address)` on the
    SubscriptionRegistry, which returns `(registered, paidAt)`. `registered` is that
-   contract's cross-call to `DataRegistry.isRegistered`, so one read covers both.
+   contract's cross-call to `DataRegistry.isRegistered`, so one read covers both. The
+   contract address comes from `@fangorn-network/sdk`, not from `wrangler.toml` — see
+   *Configuration*.
 
 An active *storage* subscription is the entitlement. There is no Quickbeam contract
 and nothing here reads an event log.
@@ -63,12 +65,18 @@ and nothing here reads an event log.
 | `GET /q/{id}/export` | none | the whole view as one NDJSON stream (vectors included), for searching locally |
 | `GET /q/{id}/stream` | none | SSE: which of the view's domains changed, so a client pulls instead of polling |
 | `GET /q/{id}/cdn/catalog` | none | the instance catalog **filtered** to the view's domains |
-| `GET /q/{id}/cdn/*` | none | proxied to the CDN (shards, manifests, edges) |
+| `GET /q/{id}/cdn/*` | none | proxied to the CDN (shards, manifests, edges); `domains/{name}/…` outside the view is `404`, not forwarded |
 | `POST /admin/remove` | admin signature | delete a view by `{id}` |
 
 The search **and export** proxies both **strip any caller-supplied `scope`, `owner` or
 `namespace`** before injecting the view's own pairs, so a view URL always means that
 view's namespaces and cannot be widened by editing the query string.
+
+The CDN proxy is gated the same way. Filtering `/cdn/catalog` only *hides* other
+views' domains, and a domain name is derivable (`appSlug-owner8-namespace`) — so
+`/q/{id}/cdn/domains/{name}/…` is checked against the view with the same matcher the
+catalog filter uses, and a name outside the view `404`s without reaching the instance.
+Non-`domains/` CDN paths still pass through.
 
 ## Three ways to hold a copy locally
 
@@ -207,14 +215,22 @@ redeploying.
 ## Configuration
 
 All `[vars]` in `wrangler.toml` except `GCP_SA_KEY`, which is a **secret**
-(`wrangler secret put GCP_SA_KEY`) and is only needed if you enable hosted MCPs. A
-`[build]` guard refuses to deploy unless `SUBSCRIPTION_CONTRACT_ADDRESS` is a
-well-formed address, so the gate can never fall back to something wrong.
+(`wrangler secret put GCP_SA_KEY`) and is only needed if you enable hosted MCPs.
+
+**The SubscriptionRegistry address is not configured here.** It comes from
+`@fangorn-network/sdk` (`FangornConfig.subscriptionRegistryContractAddress`), the only
+thing that knows which SubscriptionRegistry pairs with which DataRegistry — `access()`
+cross-calls whichever registry the contract was wired to, so a stale pairing reads as
+"unregistered" for every wallet and rejects every view with nothing in the logs to
+explain it. **Repoint by bumping the SDK, then redeploying** (and redeploy
+`pinata-url-provider`, which reads the same value, so the two gates cannot disagree).
+A `[build]` guard aborts the deploy if the installed SDK carries no valid address.
 
 | Var | Meaning |
 |---|---|
-| `SUBSCRIPTION_CONTRACT_ADDRESS` | SubscriptionRegistry to read `access()` from |
-| `RPC_URL`, `CHAIN_ID`, `ACCESS_FUNCTION` | how to make that call |
+| `SUBSCRIPTION_CONTRACT_ADDRESS` | **Normally unset.** Overrides the SDK's address, for repointing ahead of an SDK publish; taking it logs a warning naming what it replaced, and a malformed one fails the gate rather than falling back |
+| `RPC_URL` | EVM JSON-RPC endpoint. Default: the SDK's `FangornConfig.rpcUrl` |
+| `ACCESS_FUNCTION` | ABI signature of the access view (default `access(address)`) |
 | `SUBSCRIPTION_WINDOW_DAYS` | active window, applied here so it is tunable without a contract redeploy |
 | `STUB_GATE` | `"true"` skips the chain call — local dev only |
 | `ADMIN_WALLETS` | comma-separated wallets allowed to tear down |
@@ -226,16 +242,21 @@ well-formed address, so the gate can never fall back to something wrong.
 | `SIGNATURE_MAX_AGE` | max age of a signed challenge, seconds |
 | `ALLOWED_ORIGIN` | browser CORS only — not the access gate |
 
-⚠️ `SUBSCRIPTION_CONTRACT_ADDRESS` must be the SubscriptionRegistry whose
+⚠️ If you do set the override, it must be a SubscriptionRegistry whose
 `dataRegistry()` matches the registry the SDK publishes to. A mismatch reads as
 "unregistered" for every wallet registered after a redeploy, while the admin wallet
-keeps working and hides it. Check with `cast call <addr> "dataRegistry()(address)"`.
+keeps working and hides it in testing. Check before you set it:
+
+```sh
+cast call <addr> "dataRegistry()(address)" --rpc-url https://sepolia-rollup.arbitrum.io/rpc
+# must equal FangornConfig.dataRegistryContractAddress
+```
 
 ## Develop
 
 ```sh
 pnpm install                # or npm install
-npm test                    # node --test, 30 tests, no framework
+npm test                    # node --test, 48 tests, no framework
 npx wrangler kv namespace create QUICKBEAM_KV   # paste the id into wrangler.toml
 npx wrangler dev            # with STUB_GATE="true" to skip the on-chain check
 npx wrangler deploy

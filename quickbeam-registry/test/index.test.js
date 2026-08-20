@@ -15,12 +15,14 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { keccak256, toHex } from 'viem';
 
 import worker from '../src/index.js';
+import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
 
 /* ── stubs ───────────────────────────────────────────────────────────────── */
 
 const realFetch = globalThis.fetch;
 let rpcResponse = null;      // eth_call result for access(address)
 let instanceResponse = null; // whatever the box returns
+let lastRpcCall = null;      // parsed JSON-RPC body of the last eth_call
 let lastInstanceUrl = null;
 let runCalls = [];           // Cloud Run Admin API calls, in order
 
@@ -43,6 +45,7 @@ before(() => {
       return jsonResponse({ uri: 'https://qb-mcp-abc.run.app' }); // GET → ready
     }
     if (!rpcResponse) throw new Error(`unexpected RPC call: ${href}`);
+    lastRpcCall = JSON.parse(init.body);
     return rpcResponse(href, init);
   };
 });
@@ -113,7 +116,8 @@ let env;
 beforeEach(() => {
   env = {
     QUICKBEAM_KV: kvStub(),
-    SUBSCRIPTION_CONTRACT_ADDRESS: '0xa554a1817a4ec6f2808e55ded21abc707d86b1b9',
+    // No SUBSCRIPTION_CONTRACT_ADDRESS: the gate contract comes from the SDK now.
+    // The tests that care about the override set it explicitly.
     ADMIN_WALLETS: admin.address,
     SEARCH_URL: 'http://box:8080',
     CDN_URL: 'http://box:8090',
@@ -121,6 +125,7 @@ beforeEach(() => {
   };
   rpcResponse = () => accessResult(true, Math.floor(Date.now() / 1000)); // subscribed
   instanceResponse = null;
+  lastRpcCall = null;
   lastInstanceUrl = null;
   runCalls = [];
 });
@@ -466,8 +471,20 @@ test('a one-publisher-whole-app view keeps other publishers out', async () => {
 test('cdn passthrough strips the /cdn prefix (the path MCP pulls shards from)', async () => {
   const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
   instanceResponse = () => new Response('{}', { status: 200 });
-  await get(`/q/${v.id}/cdn/domains/147c24c5-a/manifest`);
-  assert.equal(lastInstanceUrl, 'http://box:8090/domains/147c24c5-a/manifest');
+  await get(`/q/${v.id}/cdn/domains/${appSlug(APP)}-147c24c5-a/manifest`);
+  assert.equal(lastInstanceUrl,
+    `http://box:8090/domains/${appSlug(APP)}-147c24c5-a/manifest`);
+});
+
+test('cdn passthrough refuses a domain outside the view', async () => {
+  // Filtering /catalog only HIDES other domains. Names are derivable
+  // (appSlug-owner8-namespace), so without a gate here a guessed name pulls another
+  // view's shards through this proxy.
+  const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
+  instanceResponse = () => new Response('{}', { status: 200 });
+  const res = await get(`/q/${v.id}/cdn/domains/${appSlug(APP2)}-147c24c5-a/manifest`);
+  assert.equal(res.status, 404);
+  assert.equal(lastInstanceUrl, null, 'must not reach the instance at all');
 });
 
 test('an unrecognised proxy path is 404 rather than forwarded somewhere', async () => {
@@ -518,6 +535,32 @@ test('teardown is admin-only', async () => {
   const ok = await signedPost('/admin/remove', admin, { id: v.id });
   assert.equal(ok.status, 200);
   assert.equal(viewCount(), 0);
+});
+
+test('the gate contract comes from the SDK, with no address configured', async () => {
+  await createView(alice, 'v', [src(PUB, 'ns')]);
+  // The `to` of the access() eth_call IS the deployment gated on. Asserting it against
+  // the SDK is what catches this worker sitting on a retired SubscriptionRegistry
+  // while the SDK — and the storage worker that reads it — have moved on.
+  assert.equal(
+    lastRpcCall.params[0].to.toLowerCase(),
+    FangornConfig.subscriptionRegistryContractAddress.toLowerCase(),
+  );
+});
+
+test('SUBSCRIPTION_CONTRACT_ADDRESS overrides the SDK when set', async () => {
+  const override = '0xa554a1817a4ec6f2808e55ded21abc707d86b1b9';
+  env.SUBSCRIPTION_CONTRACT_ADDRESS = override;
+  await createView(alice, 'v', [src(PUB, 'ns')]);
+  assert.equal(lastRpcCall.params[0].to.toLowerCase(), override);
+});
+
+test('a malformed override fails rather than falling back to the SDK', async () => {
+  // An operator who typo'd an emergency repoint has to hear about it: silently gating
+  // on a different contract than the one they named is the failure this all avoids.
+  env.SUBSCRIPTION_CONTRACT_ADDRESS = '0xnope';
+  const res = await createView(alice, 'v', [src(PUB, 'ns')]);
+  assert.equal(res.status, 502);
 });
 
 test('STUB_GATE skips the chain call entirely', async () => {

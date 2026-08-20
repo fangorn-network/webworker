@@ -7,8 +7,15 @@ binding = "BUCKET"
 bucket_name = "my-first-bucket"
 
 [vars]
-SETTLEMENT_REGISTRY_ADDRESS = "0x282915f5c6f6c9b15c131fa379916da47754fbef"
-ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
+# The SettlementRegistry and the RPC endpoint come from @fangorn-network/sdk
+# (FangornConfig), the only thing that knows which contracts belong to the current
+# deployment — checking a retired registry answers `isSettled: false` for every buyer
+# who paid on the live one. Move deployments by bumping the SDK, then redeploying.
+#
+# Both vars below remain as overrides for repointing ahead of an SDK publish; taking
+# the address override logs a warning naming what it replaced.
+# SETTLEMENT_REGISTRY_ADDRESS = "0x480d54411d77820701fd80f42b81fb6e20176d12"
+# ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
 
 [observability]

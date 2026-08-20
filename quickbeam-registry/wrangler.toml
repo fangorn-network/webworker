@@ -22,10 +22,13 @@ preview_urls = false
 # zone_name = "sond3r.com"
 
 # ── Config guard ─────────────────────────────────────────────────────────────
-# Runs before every `wrangler deploy`/`dev`; a non-zero exit aborts. The worker must
-# never gate on a fallback/wrong contract.
+# Runs before every `wrangler deploy`/`dev`; a non-zero exit aborts. The contract
+# address comes from the installed Fangorn SDK rather than from this file, so the guard
+# checks the SDK: refuses to ship if the installed version carries no well-formed
+# subscriptionRegistryContractAddress. The worker must never gate on a fallback/wrong
+# contract.
 [build]
-command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:space:]]*\"0x[0-9a-fA-F]{40}\"' wrangler.toml || { echo 'ERROR: SUBSCRIPTION_CONTRACT_ADDRESS missing or invalid in wrangler.toml' >&2; exit 1; }"
+command = "node -e \"const {FangornConfig:c}=await import('@fangorn-network/sdk/lib/config.js');if(!/^0x[0-9a-fA-F]{40}$/.test(c.subscriptionRegistryContractAddress||''))throw new Error('SDK has no valid subscriptionRegistryContractAddress; upgrade @fangorn-network/sdk');console.log('gate contract (from SDK):',c.subscriptionRegistryContractAddress)\" --input-type=module"
 
 [vars]
 # ── Entitlement ──────────────────────────────────────────────────────────────
@@ -34,12 +37,21 @@ command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:s
 # the wallet's last subscription payment. An active subscription is the entitlement
 # for Quickbeam monitoring — there is no separate Quickbeam contract.
 #
-# ⚠️ This MUST be the SubscriptionRegistry whose dataRegistry() matches the registry
-# the SDK publishes to, or every wallet registered after a redeploy reads as
-# unregistered. Check with: cast call <addr> "dataRegistry()(address)"
-SUBSCRIPTION_CONTRACT_ADDRESS = "0xa554a1817a4ec6f2808e55ded21abc707d86b1b9"
-RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
-CHAIN_ID = "421614"
+# The address is NOT set here. It comes from @fangorn-network/sdk (FangornConfig), the
+# only thing that knows which SubscriptionRegistry pairs with which DataRegistry — a
+# stale pairing reads as "unregistered" for every wallet registered after a redeploy
+# and rejects every view. Move deployments by bumping the SDK, then redeploying this
+# worker and pinata-url-provider, which reads the same value.
+#
+# SUBSCRIPTION_CONTRACT_ADDRESS still works as an emergency override (repointing ahead
+# of an SDK publish) and logs a warning naming what it replaced. If you set it, verify
+# the pairing first:
+#   cast call <address> "dataRegistry()(address)" --rpc-url https://sepolia-rollup.arbitrum.io/rpc
+# must equal FangornConfig.dataRegistryContractAddress.
+#
+# EVM JSON-RPC endpoint. Defaults to the SDK's (the public Arbitrum Sepolia RPC), which
+# is fine for this read-only call; set your own for higher rate limits.
+# RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
 ACCESS_FUNCTION = "access(address)"
 
 # The subscription is active for this many days after payment. Lives here, not

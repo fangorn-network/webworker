@@ -20,15 +20,26 @@
  * (signature + active subscription) because creating a view is what spends embedding
  * work.
  *
- * Only dependency is `viem` (signature recovery + selector encoding).
+ * Dependencies are `viem` (signature recovery + selector encoding) and the Fangorn
+ * SDK, which supplies the deployment addresses.
  */
 
 import { keccak256, recoverMessageAddress, toFunctionSelector, toHex } from 'viem';
+// Deep import on purpose: `lib/config.js` pulls in nothing but viem, while the SDK's
+// package root reaches the harness (node `fs`/`path`) and the graph engine — none of
+// which a workerd bundle can or should carry.
+import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
 import {
   gcpConfigured, serviceName, createMcpService, getMcpService, deleteMcpService,
 } from './gcp.js';
 
-const DEFAULT_RPC_URL = 'https://sepolia-rollup.arbitrum.io/rpc';
+// The deployment comes from the SDK, the only thing that knows which contracts belong
+// together: `access()` cross-calls whatever `dataRegistry()` the SubscriptionRegistry
+// was wired to, so gating on a stale one makes every wallet read as unregistered and
+// rejects every `POST /views` with nothing in the logs to say why. Same source as the
+// sibling pinata-url-provider worker, so the two gates cannot disagree.
+const DEFAULT_RPC_URL = FangornConfig.rpcUrl;
+const SDK_SUBSCRIPTION_ADDRESS = FangornConfig.subscriptionRegistryContractAddress;
 const DEFAULT_ACCESS_FUNCTION = 'access(address)';
 
 export default {
@@ -479,12 +490,38 @@ async function checkSubscription(env, address) {
   return { ok: true };
 }
 
+/**
+ * Which SubscriptionRegistry to gate on: the SDK's, unless the deployment explicitly
+ * overrides it. The override is an escape hatch for repointing ahead of an SDK publish,
+ * and it is loud — whoever sets it owns checking that the contract's `dataRegistry()`
+ * equals the SDK's `dataRegistryContractAddress`:
+ *
+ *   cast call <override> "dataRegistry()(address)" --rpc-url <rpc>
+ *
+ * Still throws rather than falling back if neither is usable: gating on the wrong
+ * contract silently is worse than failing.
+ */
+function subscriptionAddress(env) {
+  const override = env.SUBSCRIPTION_CONTRACT_ADDRESS;
+  if (override && override.toLowerCase() !== SDK_SUBSCRIPTION_ADDRESS.toLowerCase()) {
+    console.warn(
+      `SUBSCRIPTION_CONTRACT_ADDRESS override in use: gating on ${override}, `
+      + `not the SDK's ${SDK_SUBSCRIPTION_ADDRESS}. Verify its dataRegistry() matches `
+      + `${FangornConfig.dataRegistryContractAddress} or every wallet reads as unregistered.`);
+  }
+  const contract = override || SDK_SUBSCRIPTION_ADDRESS;
+  if (!isAddress(contract)) {
+    throw new Error(
+      'No usable SubscriptionRegistry address: the Fangorn SDK supplied '
+      + `"${SDK_SUBSCRIPTION_ADDRESS}" and SUBSCRIPTION_CONTRACT_ADDRESS is `
+      + `"${override ?? 'unset'}". Upgrade @fangorn-network/sdk or set a valid override.`);
+  }
+  return contract;
+}
+
 async function readAccess(env, address) {
   const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
-  const contract = env.SUBSCRIPTION_CONTRACT_ADDRESS;
-  if (!isAddress(contract)) {
-    throw new Error('SUBSCRIPTION_CONTRACT_ADDRESS is not set (or not a valid address) in wrangler.toml.');
-  }
+  const contract = subscriptionAddress(env);
 
   const data = toFunctionSelector(env.ACCESS_FUNCTION || DEFAULT_ACCESS_FUNCTION) + encodeAddress(address);
   const res = await fetch(rpcUrl, {
@@ -569,7 +606,15 @@ async function proxy(request, env, url, cors, resolved = null) {
   } else if (path === 'cdn/catalog') {
     return filteredCatalog(env, view, cors);
   } else if (path.startsWith('cdn/')) {
-    target = `${trimSlash(env.CDN_URL)}/${path.slice('cdn/'.length)}${url.search}`;
+    const rest = path.slice('cdn/'.length);
+    // Filtering /catalog hides other views' domains but does not gate them: domain names
+    // are derivable (`appSlug-owner8-namespace`), so a guessed name would otherwise pull
+    // another view's shards through this proxy. Same matcher the catalog filter uses.
+    const domain = rest.startsWith('domains/') ? rest.split('/')[1] : null;
+    if (domain && !domainMatcher(view, env)(domain)) {
+      return json(404, { error: `Domain ${domain} is not in view ${id}` }, cors);
+    }
+    target = `${trimSlash(env.CDN_URL)}/${rest}${url.search}`;
   } else {
     return json(404, {
       error: 'Proxy routes: /q/{viewId}/search, /q/{viewId}/export, '
