@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import { privateKeyToAccount } from 'viem/accounts';
 
 import worker from '../src/index.js';
+import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
 
 /* ── outbound fetch stub ─────────────────────────────────────────────────── */
 // Routes by URL: the Pinata sign endpoint → `pinataResponse`, the Pinata groups
@@ -27,6 +28,7 @@ let pinataResponse = null;
 let groupsResponse = null;
 let lastPinataInit = null; // request init captured from the Pinata sign call
 let groupCalls = [];       // { url, init } per Pinata groups API call
+let lastRpcCall = null;    // parsed JSON-RPC body of the last eth_call
 
 before(() => {
   globalThis.fetch = async (url, init) => {
@@ -42,6 +44,7 @@ before(() => {
       return groupsResponse(u, init);
     }
     if (!rpcResponse) throw new Error('unexpected RPC fetch');
+    lastRpcCall = JSON.parse(init.body);
     return rpcResponse(u, init);
   };
 });
@@ -50,6 +53,7 @@ beforeEach(() => {
   rpcResponse = null;
   pinataResponse = null;
   lastPinataInit = null;
+  lastRpcCall = null;
   groupCalls = [];
   // Default: no existing group → the worker creates one.
   groupsResponse = (u, init) =>
@@ -85,7 +89,8 @@ function baseEnv(overrides = {}) {
     PINATA_JWT: 'test-jwt',
     PINATA_GROUP_PREFIX: 'testnet',
     STUB_REGISTRATION_CHECK: 'false',
-    SUBSCRIPTION_CONTRACT_ADDRESS: '0x9a3811b365a4aeea1626eaad185b273424ae5e48',
+    // No SUBSCRIPTION_CONTRACT_ADDRESS: the gate contract comes from the SDK now.
+    // Tests that care about the override set it explicitly.
     ...overrides,
   };
 }
@@ -239,10 +244,34 @@ test('unsupported method → 405', async () => {
   assert.equal(res.status, 405);
 });
 
-test('non-stubbed + missing SUBSCRIPTION_CONTRACT_ADDRESS → 502 (no silent fallback)', async () => {
-  const env = baseEnv();
-  delete env.SUBSCRIPTION_CONTRACT_ADDRESS;
-  const res = await call(env, { body: await proof() }); // throws before any RPC fetch
+test('gate contract comes from the SDK, with no address configured', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 200);
+  // The `to` of the access() eth_call IS the deployment gated on. Asserting it
+  // against the SDK is what would have caught the worker sitting on a stale
+  // SubscriptionRegistry while the SDK had moved on.
+  assert.equal(
+    lastRpcCall.params[0].to.toLowerCase(),
+    FangornConfig.subscriptionRegistryContractAddress.toLowerCase(),
+  );
+});
+
+test('SUBSCRIPTION_CONTRACT_ADDRESS overrides the SDK when set', async () => {
+  rpcResponse = registeredRpc;
+  pinataResponse = pinataOk;
+  const override = '0x9a3811b365a4aeea1626eaad185b273424ae5e48';
+  const res = await call(baseEnv({ SUBSCRIPTION_CONTRACT_ADDRESS: override }), { body: await proof() });
+  assert.equal(res.status, 200);
+  assert.equal(lastRpcCall.params[0].to.toLowerCase(), override);
+});
+
+test('non-stubbed + unusable address → 502 (no silent fallback)', async () => {
+  // The SDK always carries one, so the only way to reach the throw is an override
+  // that is set but malformed. It must fail rather than quietly using the SDK's —
+  // an operator who typo'd an emergency repoint has to hear about it.
+  const res = await call(baseEnv({ SUBSCRIPTION_CONTRACT_ADDRESS: '0xnope' }), { body: await proof() });
   assert.equal(res.status, 502);
 });
 

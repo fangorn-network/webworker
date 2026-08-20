@@ -17,9 +17,13 @@ Per request:
 4. The worker mints a short-lived presigned upload URL scoped to that size, to the
    allowed MIME types, and to the wallet's own Pinata group, and returns it.
 
-The only runtime dependency is [`viem`](https://viem.sh) (signature recovery +
-selector encoding); everything else rides on the Workers `fetch` runtime. All
-behaviour is configured through environment variables.
+Two runtime dependencies: [`viem`](https://viem.sh) (signature recovery + selector
+encoding) and [`@fangorn-network/sdk`](https://www.npmjs.com/package/@fangorn-network/sdk),
+imported only as `lib/config.js` for the deployment addresses — that module pulls in
+nothing but viem, while the SDK's package root reaches node `fs`/`path` and the graph
+engine, which a workerd bundle can't carry. Everything else rides on the Workers
+`fetch` runtime, and the rest of the behaviour is configured through environment
+variables.
 
 ## Setup
 
@@ -27,14 +31,14 @@ This worker is one package in a pnpm workspace. Install once from the repo root,
 then work inside this package:
 
 ```bash
-pnpm install                            # from the repo root — installs viem + wrangler
+pnpm install                            # from the repo root — viem, the Fangorn SDK, wrangler
 
 cd webworker/pinata-url-provider
 cp .dev.vars.example .dev.vars          # add your PINATA_JWT for local dev
 ```
 
-Edit `wrangler.toml` `[vars]` to point at your SubscriptionRegistry, then run
-locally:
+The contracts come from the installed SDK, so there is nothing to point at before
+running locally:
 
 ```bash
 pnpm dev
@@ -45,8 +49,9 @@ pnpm dev
 Set `STUB_REGISTRATION_CHECK = "true"` in `.dev.vars` to develop without an RPC
 endpoint: the signature is still verified, but the chain is not read.
 
-Run the tests with `pnpm test` (`node --test`, no framework, ~35 cases covering the
-handshake, the access gate, the byte budgets, groups, and `/usage`).
+Run the tests with `pnpm test` (`node --test`, no framework, ~37 cases covering the
+handshake, the access gate — including that the contract read really is the SDK's —
+the byte budgets, groups, and `/usage`).
 
 ## Deploy
 
@@ -74,8 +79,8 @@ upload with the short-lived presigned URL it produces.
 pnpm exec wrangler secret put PINATA_JWT    # the Files+Groups JWT from step 2
 ```
 
-`RPC_URL` defaults to the public Arbitrum Sepolia endpoint in `wrangler.toml`, so
-no RPC secret is required — override that var if you want a private endpoint.
+`RPC_URL` defaults to the endpoint the SDK ships, so no RPC secret is required —
+set that var if you want a private endpoint.
 
 **4. Create the KV namespace** backing the byte counters, and paste the id into the
 `[[kv_namespaces]]` block in `wrangler.toml`:
@@ -89,13 +94,16 @@ Without this binding the free tier and daily cap silently do nothing (see
 
 **5. Configure the access check** in `wrangler.toml` `[vars]`:
 
-- `SUBSCRIPTION_CONTRACT_ADDRESS` — the deployed SubscriptionRegistry the worker
-  calls `access(address)` on. **Required, no default**: gating on a fallback
-  contract silently is worse than failing, so the worker errors without it and a
-  `[build]` guard in `wrangler.toml` aborts the deploy if it is missing or
-  malformed.
-- `RPC_URL` — defaults to the public Arbitrum Sepolia RPC; swap in your own for
-  higher rate limits.
+- The SubscriptionRegistry address is **not configured here** — it comes from
+  `@fangorn-network/sdk` (`FangornConfig.subscriptionRegistryContractAddress`).
+  The SDK is the only thing that knows which SubscriptionRegistry pairs with
+  which DataRegistry, and `access()` cross-calls whichever registry the contract
+  was wired to. A stale pairing makes every wallet read as unregistered and 403s
+  all uploads with nothing in the logs to explain it, so the two must move
+  together: **repoint by bumping the SDK, then redeploying this worker.** A
+  `[build]` guard aborts the deploy if the installed SDK carries no valid address.
+- `RPC_URL` — defaults to the SDK's (`FangornConfig.rpcUrl`, currently the public
+  Arbitrum Sepolia RPC); swap in your own for higher rate limits.
 - Keep `STUB_REGISTRATION_CHECK = "false"` in production. Setting it `"true"`
   skips the on-chain read entirely — a valid signature alone yields a URL, and the
   subscription window is treated as active (dev only).
@@ -134,14 +142,13 @@ curl "https://<worker>/?address=0xYourAddress"
 
 | Var | Where | Meaning |
 | --- | --- | --- |
-| `SUBSCRIPTION_CONTRACT_ADDRESS` | var | **Required, no default.** SubscriptionRegistry the worker calls `access(address)` on. A `[build]` guard blocks deploy if it's unset or malformed. |
-| `RPC_URL` | var | EVM JSON-RPC endpoint. Default: public Arbitrum Sepolia. |
+| `SUBSCRIPTION_CONTRACT_ADDRESS` | var | **Normally unset.** The address comes from the installed SDK; this only overrides it, for repointing ahead of an SDK publish. Taking the override logs a warning naming what it replaced. Verify `dataRegistry()` on it matches the SDK's `dataRegistryContractAddress` first. |
+| `RPC_URL` | var | EVM JSON-RPC endpoint. Default: the SDK's `FangornConfig.rpcUrl`. |
 | `ACCESS_FUNCTION` | var | Optional. ABI signature of the access view (default `access(address)`). |
 | `STUB_REGISTRATION_CHECK` | var | `"true"` skips the on-chain read — a valid signature alone yields a URL, and the subscription is treated as active (dev/testing). |
 | `SUBSCRIPTION_WINDOW_DAYS` | var | How long a payment keeps a subscription active (default `30`). Enforced here, not on-chain. |
 | `REGISTER_URL` | var | URL shown in the `403` "not registered" error (default `https://fangorn.network`). |
 | `SUBSCRIBE_URL` | var | URL shown in the `402` "past the free tier" error. |
-| `CHAIN_ID` | var | Informational only (`421614` = Arbitrum Sepolia); the worker never reads it. |
 | `PINATA_JWT` | secret | Pinata JWT used to sign upload URLs and manage groups. Needs the **Files: Write** and **Groups: Write** scopes. |
 | `PINATA_NETWORK` | var | `public` or `private`. Also selects which groups namespace is used. |
 | `PINATA_URL_EXPIRES` | var | Seconds the upload URL stays valid (default `300`). |
@@ -155,8 +162,8 @@ curl "https://<worker>/?address=0xYourAddress"
 | `SIGNATURE_MAX_AGE` | var | Max age in seconds of the challenge's `Issued-At` (default `300`). |
 | `ALLOWED_ORIGIN` | var | Browser CORS: `*` or a comma-separated allowlist. Does not affect CLI/server callers. |
 
-The worker calls `access(address)` (a `view` returning `(bool, uint64)`) on
-`SUBSCRIPTION_CONTRACT_ADDRESS` and gates on the result. That contract is a
+The worker calls `access(address)` (a `view` returning `(bool, uint64)`) on the
+SDK's SubscriptionRegistry and gates on the result. That contract is a
 **Stylus** (Rust) contract whose `access` method is exposed in the ABI as camelCase
 — that is the default; override `ACCESS_FUNCTION` only if yours differs. The worker
 never calls the DataRegistry directly; registration reaches it as the

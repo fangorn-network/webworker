@@ -9,6 +9,11 @@ Reference deployment: `https://fangorn-access-worker.quickbeam.workers.dev`
 
 ## Deploy your own
 
+1. Consumer signs `{ nullifier, resourceId, objectKey, timestamp }` with their stealth address private key
+2. Worker recovers the stealth address from the signature
+3. Worker calls `getPrice(resourceId)` and, unless the resource is free, `isSettled(stealthAddress, resourceId)` on the SettlementRegistry
+4. If settled → bytes proxied directly from R2
+5. If not → 401
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/fangorn-network/webworker/tree/main/fangorn-access-worker)
 
 That is the whole setup. Cloudflare reads `wrangler.toml`, creates the R2 bucket
@@ -19,6 +24,29 @@ The `/tree/main/fangorn-access-worker` suffix is required — this repo is a pnp
 workspace, and a button pointed at the root fails with *"application detection
 logic has been run in the root of a workspace"*.
 
+## Configuration
+
+**The SettlementRegistry address and the RPC endpoint come from
+`@fangorn-network/sdk`** (`FangornConfig`), not from `wrangler.toml`. The SDK is the
+only thing that knows which contracts belong to the current deployment, and checking a
+retired registry answers `isSettled: false` for every buyer who paid on the live one —
+a silent 401 with nothing in the logs to explain it. **Move deployments by bumping the
+SDK, then redeploying.** The same is true of the storage and Quickbeam workers, so all
+three follow one source.
+
+| Var | Meaning |
+|---|---|
+| `SETTLEMENT_REGISTRY_ADDRESS` | **Normally unset.** Overrides the SDK's address, for repointing ahead of an SDK publish; taking it logs a warning naming what it replaced, and a malformed one fails the check rather than falling back to the SDK's |
+| `ARBITRUM_SEPOLIA_RPC` | Optional. Default: the SDK's `FangornConfig.rpcUrl` |
+| `TIMESTAMP_WINDOW` | Seconds a signed request stays valid (default `60`) |
+
+Only `lib/config.js` is imported from the SDK — that module pulls in nothing but
+viem, while the package root reaches node `fs`/`path` and the graph engine, which a
+workerd bundle can't carry.
+
+Re-run `npx wrangler types` after changing `wrangler.toml`.
+
+## Run locally
 There is nothing to configure, because the two things that would normally need
 configuring configure themselves:
 
@@ -31,6 +59,15 @@ configuring configure themselves:
   and can rotate the token later against the same wallet — so losing the token
   never strands the bucket.
 
+## Test
+
+npm test    # vitest via @cloudflare/vitest-pool-workers
+
+Two cases, both on the gate: that a read is checked against the SDK's
+SettlementRegistry when nothing is configured, and that a malformed override fails
+instead of silently falling back.
+
+## Deploy
 Prefer the CLI:
 
 ```sh

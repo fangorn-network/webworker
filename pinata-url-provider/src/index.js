@@ -14,11 +14,16 @@
  *      and returns it, so the caller can pin one file to IPFS without ever seeing
  *      your Pinata JWT.
  *
- * The only dependency is `viem` (signature recovery + selector encoding). All
- * behaviour is driven by environment variables (see wrangler.toml / README).
+ * Dependencies are `viem` (signature recovery + selector encoding) and the Fangorn
+ * SDK, which supplies the deployment addresses. Everything else is driven by
+ * environment variables (see wrangler.toml / README).
  */
 
 import { recoverMessageAddress, toFunctionSelector } from 'viem';
+// Deep import on purpose: `lib/config.js` pulls in nothing but viem, while the SDK's
+// package root reaches the harness (node `fs`/`path`) and the graph engine — none of
+// which a workerd bundle can or should carry.
+import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
 
 export default {
   async fetch(request, env) {
@@ -199,17 +204,55 @@ export default {
 
 /* ───────────────────────── on-chain access gate ────────────────────────── */
 
-// Default RPC endpoint (the public Arbitrum Sepolia RPC is fine for a read-only
-// eth_call). The subscription *contract* deliberately has NO default: gating on the
-// wrong contract silently is worse than failing, so it must be set explicitly in
-// wrangler.toml (a `[build]` guard there also blocks deploy if it's absent).
-const DEFAULT_RPC_URL = 'https://sepolia-rollup.arbitrum.io/rpc';
+// The deployment comes from the SDK, which is the only thing that knows which
+// contracts belong together. A SubscriptionRegistry is usable only if its
+// `dataRegistry()` equals the registry the SDK publishes to — cross-calling
+// `isRegistered` on a stale one makes `access()` return `registered: false` for every
+// wallet, so uploads 403 network-wide with nothing in the logs to say why. Pinning
+// the address here separately from the SDK is exactly how that pair drifts apart, so
+// the version bump is the repoint: both move together or neither does.
+const DEFAULT_RPC_URL = FangornConfig.rpcUrl;
+const SDK_SUBSCRIPTION_ADDRESS = FangornConfig.subscriptionRegistryContractAddress;
 
 // The SubscriptionRegistry view `access(address) -> (bool registered, uint64 paidAt)`.
 // It cross-calls DataRegistry.isRegistered internally, so this single read gives the
 // worker both the registration gate and the subscription timestamp. Stylus exposes
 // the Rust method as camelCase.
 const DEFAULT_ACCESS_FUNCTION = 'access(address)';
+
+/**
+ * Which SubscriptionRegistry to gate on. The SDK's, unless the deployment explicitly
+ * overrides it.
+ *
+ * The override exists so a redeployed contract can be pointed at without waiting on an
+ * SDK publish — the worker is the upload gate, and "all uploads 403" should not need a
+ * package release to fix. It is loud on purpose: an override that silently disagreed
+ * with the SDK is the failure this whole change is undoing, so taking one logs what it
+ * replaced. Whoever sets it owns checking that the contract's `dataRegistry()` equals
+ * the SDK's `dataRegistryContractAddress`:
+ *
+ *   cast call <override> "dataRegistry()(address)" --rpc-url <rpc>
+ *
+ * Still throws rather than falling back if neither is a usable address — gating on the
+ * wrong contract silently is worse than failing.
+ */
+function subscriptionAddress(env) {
+  const override = env.SUBSCRIPTION_CONTRACT_ADDRESS;
+  if (override && override.toLowerCase() !== SDK_SUBSCRIPTION_ADDRESS.toLowerCase()) {
+    console.warn(
+      `SUBSCRIPTION_CONTRACT_ADDRESS override in use: gating on ${override}, `
+      + `not the SDK's ${SDK_SUBSCRIPTION_ADDRESS}. Verify its dataRegistry() matches `
+      + `${FangornConfig.dataRegistryContractAddress} or every wallet reads as unregistered.`);
+  }
+  const contract = override || SDK_SUBSCRIPTION_ADDRESS;
+  if (!isAddress(contract)) {
+    throw new Error(
+      'No usable SubscriptionRegistry address: the Fangorn SDK supplied '
+      + `"${SDK_SUBSCRIPTION_ADDRESS}" and SUBSCRIPTION_CONTRACT_ADDRESS is `
+      + `"${override ?? 'unset'}". Upgrade @fangorn-network/sdk or set a valid override.`);
+  }
+  return contract;
+}
 
 /**
  * One `eth_call` to the SubscriptionRegistry's `access(address)` view, returning
@@ -220,14 +263,15 @@ const DEFAULT_ACCESS_FUNCTION = 'access(address)';
  *
  * Env:
  *   RPC_URL                        EVM JSON-RPC endpoint (optional; defaults to the
- *                                  public Arbitrum Sepolia RPC).
- *   SUBSCRIPTION_CONTRACT_ADDRESS  SubscriptionRegistry to call — REQUIRED, no default.
+ *                                  SDK's, currently the public Arbitrum Sepolia RPC).
+ *   SUBSCRIPTION_CONTRACT_ADDRESS  Optional override of the SDK's address. An escape
+ *                                  hatch for repointing ahead of an SDK publish, not
+ *                                  routine config — see subscriptionAddress().
  *   ACCESS_FUNCTION                ABI signature (optional; default "access(address)").
  */
 async function readAccess(env, address) {
   const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
-  const contract = env.SUBSCRIPTION_CONTRACT_ADDRESS;
-  if (!isAddress(contract)) throw new Error('SUBSCRIPTION_CONTRACT_ADDRESS is not set (or not a valid address) in wrangler.toml.');
+  const contract = subscriptionAddress(env);
 
   const data = toFunctionSelector(env.ACCESS_FUNCTION || DEFAULT_ACCESS_FUNCTION) + encodeAddress(address);
 
