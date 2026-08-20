@@ -13,7 +13,6 @@ import {
 // package root reaches the harness (node `fs`/`path`) and the graph engine — none of
 // which a workerd bundle can or should carry.
 import { FangornConfig } from '@fangorn-network/sdk/lib/config.js'
-import { arbitrumSepolia } from 'viem/chains'
 import { x25519 } from '@noble/curves/ed25519.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 import { hkdf } from '@noble/hashes/hkdf.js'
@@ -279,7 +278,7 @@ async function verify(
 
 	const read = <T>(functionName: string, args: readonly unknown[]) =>
 		client.readContract({
-			address: env.SETTLEMENT_REGISTRY_ADDRESS as Address,
+			address: registry,
 			abi: SETTLEMENT_REGISTRY_ABI,
 			functionName,
 			args,

@@ -190,7 +190,12 @@ for w in "${deploy_list[@]}"; do
     echo "🚀 $w ($dir)$($DRY_RUN && echo ' — dry run')" >&2
     echo "==================================================" >&2
     if $DRY_RUN; then
-        (cd "$SCRIPT_DIR/$dir" && pnpm exec wrangler deploy --dry-run)
+        # Derive the real command from the package rather than assuming `wrangler
+        # deploy`: the access worker deploys with `--env shared`, and a dry run of a
+        # different config checks nothing. (`pnpm run deploy -- --dry-run` passes the
+        # `--` through to wrangler, which ignores it and deploys for real.)
+        (cd "$SCRIPT_DIR/$dir" \
+            && pnpm exec $(node -p "require('./package.json').scripts.deploy") --dry-run)
         [[ "$w" == quickbeam ]] && echo "  (would ask whether to clear the KV store)" >&2
     else
         (cd "$SCRIPT_DIR/$dir" && pnpm run deploy)
