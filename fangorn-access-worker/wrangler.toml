@@ -2,21 +2,32 @@ name = "fangorn-access-worker"
 main = "src/index.ts"
 compatibility_date = "2025-07-18"
 
+# This file is also a TEMPLATE: publishers deploy it into their own Cloudflare
+# account via the Deploy to Cloudflare button, which reads the binding below and
+# creates the bucket for them. Nothing else needs configuring — the worker mints
+# its own X25519 key and claims its own upload token on first request.
+#
 [[r2_buckets]]
 binding = "BUCKET"
-bucket_name = "my-first-bucket"
+bucket_name = "sond3r"
+
+[env.shared.vars]
+SETTLEMENT_REGISTRY_ADDRESS = "0x35b6c6a975933c21442a04041b920f80b381d993"
+ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
+TIMESTAMP_WINDOW = "60"
 
 [vars]
-# The SettlementRegistry and the RPC endpoint come from @fangorn-network/sdk
-# (FangornConfig), the only thing that knows which contracts belong to the current
-# deployment — checking a retired registry answers `isSettled: false` for every buyer
-# who paid on the live one. Move deployments by bumping the SDK, then redeploying.
-#
-# Both vars below remain as overrides for repointing ahead of an SDK publish; taking
-# the address override logs a warning naming what it replaced.
-# SETTLEMENT_REGISTRY_ADDRESS = "0x480d54411d77820701fd80f42b81fb6e20176d12"
-# ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
+# The live SettlementRegistry on Arbitrum Sepolia. /access authorizes against this
+# contract, so a worker pointed at the wrong one releases nothing.
+SETTLEMENT_REGISTRY_ADDRESS = "0x35b6c6a975933c21442a04041b920f80b381d993"
+ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
+
+# Optional, and unset on a publisher-owned worker:
+#   WORKER_X25519_SECRET  pins the identity instead of minting one. REQUIRED on a
+#                         worker that already has DEKs sealed to a key.
+#   UPLOAD_TOKEN          pins the upload token instead of claiming on first use
+# Both are secrets: `wrangler secret put <NAME>`.
 
 [observability]
 enabled = true
