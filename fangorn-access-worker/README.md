@@ -1,5 +1,20 @@
 # Fangorn access worker
 
+
+``` sh
+cd ~/fangorn/webworker/fangorn-access-worker && pnpm deploy
+node -e 'import("viem").then(({keccak256,stringToBytes:s})=>console.log(keccak256(s(`sond3r:upload-token:${process.env.K}`))))' # K=<ETH_PRIVATE_KEY>
+
+node -e 'import("viem").then(({keccak256,stringToBytes:s})=>console.log(keccak256(s
+(`sond3r:upload-token:0xde0e6c1c331fcd8692463d6ffcf20f9f2e1847264f7a3f578cf54f62f05196cb`))))'
+# K=<ETH_PRIVATE_KEY>
+npx wrangler secret put UPLOAD_HMAC_SECRET      # ← that value
+openssl rand -hex 32 | npx wrangler secret put WORKER_X25519_SECRET
+# then WORKER_URL=https://fangorn-access-worker.<subdomain>.workers.dev ./deploy.sh
+
+Pin WORKER_X25519_SECRET before anyone publishes — unset, the worker mints a key into the bucket it protects.
+```
+
 A Cloudflare Worker that releases decryption keys against on-chain settlement.
 **Publishers deploy their own** — one worker per R2 bucket — so the content sits
 in their Cloudflare account, on their bill, under their own terms with
@@ -19,17 +34,16 @@ The `/tree/main/fangorn-access-worker` suffix is required — this repo is a pnp
 workspace, and a button pointed at the root fails with *"application detection
 logic has been run in the root of a workspace"*.
 
-There is nothing to configure, because the two things that would normally need
-configuring configure themselves:
+One deployment serves **every publisher on a relay**, so there are two secrets
+to install and both matter:
 
-- **The X25519 identity** is minted into your bucket on first request. It is the
-  key every DEK in your bucket is sealed to, it never leaves your Cloudflare
-  account, and it is generated once and kept.
-- **The upload gate** claims itself. `POST /claim` stores the hash of an upload
-  token plus the address of the wallet that signed for it, and every later upload
-  must present that token. SOND3R does this the moment you connect the worker,
-  and can rotate the token later against the same wallet — so losing the token
-  never strands the bucket.
+- **`UPLOAD_HMAC_SECRET`** — REQUIRED. Without it the worker authorizes nobody
+  and every upload 401s, deliberately: it would otherwise be an open write
+  endpoint on a bucket you pay for. It must equal the relay's own
+  `keccak256(utf8("sond3r:upload-token:" + ETH_PRIVATE_KEY))`.
+- **`WORKER_X25519_SECRET`** — 32 bytes of hex, the key every DEK in the bucket
+  is sealed to. Unset, the worker mints one *into the bucket it protects*, so pin
+  it and keep a copy: losing it strands every resource ever published here.
 
 Prefer the CLI:
 
@@ -50,17 +64,24 @@ public key and stored beside it. **The worker never sees plaintext** — it hand
 back a 32-byte key to callers who have paid, and the decryption happens on the
 buyer's machine.
 
-| route | gated? | does |
-|---|---|---|
-| `GET /pubkey` | no | the X25519 key publishers seal DEKs to |
-| `GET /ct/:id` | no | streams ciphertext, with HTTP Range support |
-| `POST /access` | **yes** | checks settlement, unseals the DEK, returns 32 bytes |
-| `POST /upload/:id` | **yes** | stores ciphertext + sealed DEK |
-| `POST /claim` | **yes** | claims (or rotates) the bucket's upload token |
+| route                | gated?  | does                                                 |
+| -------------------- | ------- | ---------------------------------------------------- |
+| `GET /pubkey`        | no      | the X25519 key publishers seal DEKs to               |
+| `GET /ct/:id`        | no      | streams ciphertext, with HTTP Range support          |
+| `POST /access`       | **yes** | checks settlement, unseals the DEK, returns 32 bytes |
+| `GET /upload/:id`    | **yes** | reads an object back (a publisher's own manifest)    |
+| `POST /upload/:id`   | **yes** | stores ciphertext + sealed DEK                       |
+| `DELETE /upload/:id` | **yes** | drops an object and its sealed DEK                   |
 
 `/ct/` is deliberately open: ciphertext is safe to hand to anyone, and leaving it
 ungated is what lets a video stream with ordinary Range requests. Only keys are
 gated.
+
+**Free tier.** The relay mints an upload token for *any* signed-in address, so
+holding a token no longer means anyone vouched for the bearer — this worker is
+what bounds the bill. Each owner gets `FREE_BYTES` (a `[vars]` entry, 50 MiB by
+default), metered in `usage/<owner>` beside the bytes it counts and credited back
+on delete. Over the cap, `POST /upload` answers `413 {"reason":"quota"}`.
 
 `/access` releases a DEK when the request is signed, within `TIMESTAMP_WINDOW`
 seconds, by a stealth address the registry says has settled. In order:
@@ -79,34 +100,45 @@ Object keys must be bytes32 — `resourceId` for chunk 0,
 `keccak256(resourceId ++ uint32 i)` for the rest. Anything else 404s, which is
 what keeps `/ct/` from serving the bucket's own `.dek` blobs and worker secret.
 
-## Taking back a claimed bucket
+## One bucket, many publishers
 
-`POST /claim` with a token the bucket doesn't hold answers 401 and a `reason`:
+The `/upload/` routes are gated on a token that **names its bearer**:
 
-| `reason` | means | fix |
-|---|---|---|
-| `needs-signature` | claimed by another token | sign the claim message with the owning wallet — retry Connect in the publisher portal, which prompts for it |
-| `not-owner` | claimed, and owned by a different address | connect with the wallet named in the error |
-| `pinned` | the worker has an `UPLOAD_TOKEN` secret, which overrides everything | paste that value into the portal's *Upload token* field, or `npx wrangler secret delete UPLOAD_TOKEN` |
+```
+Authorization: Bearer <owner>.<keccak256(UPLOAD_HMAC_SECRET ++ owner)>
+```
 
-The claim message is `sond3r storage claim\ntoken: <sha256 of token>\ntime:
-<unix>`, valid for 10 minutes. The first claim records the signer as the bucket's
-owner; only that address can point the bucket at a different token afterwards.
-Nothing else in the bucket is touched — ciphertext, sealed DEKs and the X25519
-identity all survive, so already-published files keep working.
+The relay derives it from its service key (`uploadTokenFor` in sond3r's
+`server/index.js`); this worker recomputes the MAC (`macFor`) and reads the owner
+address straight out of the token. No bucket state, no round trip, nothing to
+claim — a publisher who has never touched this worker can upload immediately, and
+the same wallet derives the same token from any machine. That is what replaced the
+old first-upload-claims-the-bucket gate, which could only ever hold one publisher.
 
-A bucket claimed before this shipped has no recorded owner, so the first valid
-signature adopts it. That is the migration path for buckets stranded by the old
-token-only gate.
+Object keys are already namespaced per publisher (`resourceIdFor(owner, uid)`,
+`manifestKey(owner)`), so accidental collisions are impossible. Deliberate ones
+are not — uids are public, so any publisher can compute another's `resourceId`.
+So the owner is stamped on every object as R2 custom metadata and re-checked on
+every write, delete and read-back:
 
-## Optional env
+| status | means                                                                |
+| ------ | -------------------------------------------------------------------- |
+| `401`  | no token, or a MAC that does not verify against `UPLOAD_HMAC_SECRET` |
+| `403`  | a valid token, but this object belongs to another publisher          |
 
-Both are for the shared deployment and neither is needed for your own:
+First writer keeps the key. An existing object with **no** owner recorded is
+refused rather than adopted — it predates the shared bucket and there is nobody to
+attribute it to.
 
-| var | effect |
-|---|---|
-| `WORKER_X25519_SECRET` | pins the identity instead of minting one. **Required** on a worker that already has DEKs sealed to a key — minting a new one strands every published file. `openssl rand -hex 32 \| npx wrangler secret put WORKER_X25519_SECRET` |
-| `UPLOAD_TOKEN` | pins the upload token instead of claiming on first use |
+**Rotating the relay's key** re-derives every token at once; update
+`UPLOAD_HMAC_SECRET` here in the same breath and publishers do nothing. Nothing
+else in the bucket is touched by any of this: ciphertext, sealed DEKs and the
+X25519 identity all survive, so already-published files keep working.
+
+**Bring your own storage** — a publisher deploying this into their own Cloudflare
+account, with the bucket claiming its own token on first upload — is gone for now
+and will come back as an option. It is in git, along with sond3r's
+`server/cloudflare.js`.
 
 ## Develop
 

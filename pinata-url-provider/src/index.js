@@ -59,6 +59,8 @@ export default {
     // Read the request once (the POST body can only be consumed a single time):
     // address plus the optional ownership proof (message + signature).
     const input = await readInput(request);
+    // TODO: make address an env var
+    // const address = process.env.STORAGE_SUBSCRIPTION_ADDR;
     const address = (input.address || '').toLowerCase();
     if (!isAddress(address)) {
       return json(400, { error: 'Provide a valid EVM address via ?address=0x… or JSON body { "address": "0x…" }.' }, cors);
@@ -80,6 +82,7 @@ export default {
     // view returns both registration status (it cross-calls DataRegistry internally)
     // and the subscription timestamp. STUB_REGISTRATION_CHECK skips the chain
     // entirely (a valid signature alone suffices — dev/testing without an RPC).
+    // TODO: is this needed?
     const stubbed = (env.STUB_REGISTRATION_CHECK ?? 'false') === 'true';
     let access = null;
     if (!stubbed) {
@@ -102,6 +105,7 @@ export default {
     // length). Absent → a back-compat default. Bounded per-request so nobody can
     // mint a URL for an absurd file.
     const maxUpload = Number(env.MAX_UPLOAD_SIZE || DEFAULT_MAX_UPLOAD);
+    // TODO: this seems gratuitious
     let size;
     if (input.size == null || input.size === '') {
       size = Number(env.DEFAULT_UPLOAD_SIZE || DEFAULT_UPLOAD_SIZE);

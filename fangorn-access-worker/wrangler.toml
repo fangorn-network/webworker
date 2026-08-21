@@ -1,33 +1,48 @@
 name = "fangorn-access-worker"
 main = "src/index.ts"
 compatibility_date = "2025-07-18"
+# Pinned: this wrangler login can see two accounts, and `wrangler deploy` with a
+# choice to make stops and asks — which fails in CI and, worse, can put the
+# storage every publisher depends on in the wrong account.
+account_id = "0beaeb0776ca9e8404297afe0da73e5a"  # Fangorn@fangorn.network
 
-# This file is also a TEMPLATE: publishers deploy it into their own Cloudflare
-# account via the Deploy to Cloudflare button, which reads the binding below and
-# creates the bucket for them. Nothing else needs configuring — the worker mints
-# its own X25519 key and claims its own upload token on first request.
+# ONE deployment, one bucket, every sond3r publisher. Objects are attributed to
+# the publisher who wrote them (R2 custom metadata) and keys are already derived
+# from the publisher's address, so a shared bucket is not a shared library.
 #
+# Bring-your-own-storage — a publisher deploying this into their own Cloudflare
+# account — is gone for now; it lived in sond3r's server/cloudflare.js and the
+# bucket-claim path here, and both are in git if it comes back.
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "sond3r"
 
-[env.shared.vars]
-SETTLEMENT_REGISTRY_ADDRESS = "0x35b6c6a975933c21442a04041b920f80b381d993"
-ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
-TIMESTAMP_WINDOW = "60"
-
 [vars]
 # The live SettlementRegistry on Arbitrum Sepolia. /access authorizes against this
 # contract, so a worker pointed at the wrong one releases nothing.
-SETTLEMENT_REGISTRY_ADDRESS = "0x35b6c6a975933c21442a04041b920f80b381d993"
+SETTLEMENT_REGISTRY_ADDRESS = "0x480d54411d77820701fd80f42b81fb6e20176d12"
 ARBITRUM_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 TIMESTAMP_WINDOW = "60"
 
-# Optional, and unset on a publisher-owned worker:
-#   WORKER_X25519_SECRET  pins the identity instead of minting one. REQUIRED on a
-#                         worker that already has DEKs sealed to a key.
-#   UPLOAD_TOKEN          pins the upload token instead of claiming on first use
-# Both are secrets: `wrangler secret put <NAME>`.
+# The free tier: bytes per wallet, metered in `usage/<owner>` in this bucket.
+# Every signed-in address on the relay gets an upload token now, registered
+# publisher or not, so this cap is the only thing between a stranger's wallet and
+# the R2 bill. Raise it here and redeploy; nothing per-publisher is re-issued.
+FREE_BYTES = "52428800"  # 50 MiB
+
+# Secrets — `wrangler secret put <NAME>`:
+#
+#   UPLOAD_HMAC_SECRET    REQUIRED. Uploads are refused outright without it. Must
+#                         equal the relay's RELAY_SECRET:
+#                           keccak256(utf8("sond3r:upload-token:" + ETH_PRIVATE_KEY))
+#                         Rotating the relay's key rotates this; publishers'
+#                         tokens are re-derived and nothing has to be re-claimed.
+#
+#   WORKER_X25519_SECRET  32 bytes of hex. Pins the identity every DEK in the
+#                         bucket is sealed to, instead of minting one into the
+#                         bucket on first use. SET IT on a real deployment: a
+#                         minted key lives in the bucket it protects, and losing
+#                         it strands every resource already published.
 
 [observability]
 enabled = true
