@@ -9,7 +9,10 @@ import {
 	type Address,
 	recoverMessageAddress,
 } from 'viem'
-import { arbitrumSepolia } from 'viem/chains'
+// Deep import on purpose: `lib/config.js` pulls in nothing but viem, while the SDK's
+// package root reaches the harness (node `fs`/`path`) and the graph engine — none of
+// which a workerd bundle can or should carry.
+import { FangornConfig } from '@fangorn-network/sdk/lib/config.js'
 import { x25519 } from '@noble/curves/ed25519.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 import { hkdf } from '@noble/hashes/hkdf.js'
@@ -39,8 +42,10 @@ import { gcm } from '@noble/ciphers/aes.js'
 
 interface Env {
 	BUCKET: R2Bucket
-	SETTLEMENT_REGISTRY_ADDRESS: string
-	ARBITRUM_SEPOLIA_RPC: string
+	/** Optional override of the SDK's SettlementRegistry — see settlementAddress(). */
+	SETTLEMENT_REGISTRY_ADDRESS?: string
+	/** Optional override of the SDK's RPC endpoint. */
+	ARBITRUM_SEPOLIA_RPC?: string
 	TIMESTAMP_WINDOW: string
 	/** 32-byte X25519 secret (hex). Optional — minted into the bucket if unset. */
 	WORKER_X25519_SECRET?: string
@@ -48,6 +53,27 @@ interface Env {
 	UPLOAD_HMAC_SECRET?: string
 	/** Free bytes per wallet. Optional — defaults to 50 MiB. */
 	FREE_BYTES?: string
+}
+
+/**
+ * Which SettlementRegistry to check: the SDK's, unless the deployment explicitly
+ * overrides it. The SDK is the only thing that knows which contracts belong to the
+ * current deployment, so pinning an address here separately is how the two drift
+ * apart — gating reads on a retired registry answers `isSettled: false` for every
+ * buyer who paid on the live one. The override exists for repointing ahead of an SDK
+ * publish, and says so in the log when it is taken.
+ */
+function settlementAddress(env: Env): Address {
+	const sdk = FangornConfig.settlementRegistryContractAddress
+	const override = env.SETTLEMENT_REGISTRY_ADDRESS
+	if (override && override.toLowerCase() !== sdk.toLowerCase()) {
+		console.warn(`SETTLEMENT_REGISTRY_ADDRESS override in use: checking ${override}, not the SDK's ${sdk}`)
+	}
+	const address = override || sdk
+	if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+		throw new Error(`No usable SettlementRegistry address: SDK gave "${sdk}", override is "${override ?? 'unset'}"`)
+	}
+	return address as Address
 }
 
 interface AccessRequest {
@@ -246,13 +272,22 @@ async function verify(
 	}
 
 	const client = createPublicClient({
-		chain: arbitrumSepolia,
-		transport: http(env.ARBITRUM_SEPOLIA_RPC),
+		chain: FangornConfig.chain,
+		transport: http(env.ARBITRUM_SEPOLIA_RPC || FangornConfig.rpcUrl),
 	})
+	// A bad override is the only way this throws (the SDK always carries an address);
+	// surface it as a reason rather than an unhandled 500.
+	let registry: Address
+	try {
+		registry = settlementAddress(env)
+	} catch (e) {
+		console.error(e)
+		return { ok: false, reason: 'settlement registry not configured' }
+	}
 
 	const read = <T>(functionName: string, args: readonly unknown[]) =>
 		client.readContract({
-			address: env.SETTLEMENT_REGISTRY_ADDRESS as Address,
+			address: registry,
 			abi: SETTLEMENT_REGISTRY_ABI,
 			functionName,
 			args,

@@ -10,11 +10,13 @@ workers_dev = true
 preview_urls = false
 
 # ── Config guard ─────────────────────────────────────────────────────────────
-# Runs before every `wrangler deploy`/`dev`; a non-zero exit aborts. Refuses to
-# ship unless a well-formed SUBSCRIPTION_CONTRACT_ADDRESS is set below — the worker
-# must never silently gate access on a fallback/wrong contract.
+# Runs before every `wrangler deploy`/`dev`; a non-zero exit aborts. The contract
+# address now comes from the installed Fangorn SDK rather than from this file, so the
+# guard checks the SDK instead of a grep: refuses to ship if the installed version does
+# not carry a well-formed subscriptionRegistryContractAddress. The worker must never
+# silently gate access on a fallback/wrong contract.
 [build]
-command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:space:]]*\"0x[0-9a-fA-F]{40}\"' wrangler.toml || { echo 'ERROR: SUBSCRIPTION_CONTRACT_ADDRESS missing or invalid in wrangler.toml' >&2; exit 1; }"
+command = "node -e \"const {FangornConfig:c}=await import('@fangorn-network/sdk/lib/config.js');if(!/^0x[0-9a-fA-F]{40}$/.test(c.subscriptionRegistryContractAddress||''))throw new Error('SDK has no valid subscriptionRegistryContractAddress; upgrade @fangorn-network/sdk');console.log('gate contract (from SDK):',c.subscriptionRegistryContractAddress)\" --input-type=module"
 
 # ── Public (non-secret) configuration ────────────────────────────────────────
 # Edit these to point at your registry. The only secret is PINATA_JWT — set it
@@ -24,14 +26,23 @@ command = "grep -qE '^[[:space:]]*SUBSCRIPTION_CONTRACT_ADDRESS[[:space:]]*=[[:s
 # The worker calls access(address) on the SubscriptionRegistry, which returns
 # (registered, paidAt): `registered` is a cross-contract call to the DataRegistry's
 # isRegistered, and `paidAt` is the wallet's last subscription timestamp. So one
-# read gives both the registration gate and the subscription window check. Point
-# this at the deployed SubscriptionRegistry (Stylus contract) on Arbitrum Sepolia.
-SUBSCRIPTION_CONTRACT_ADDRESS = "0xa554a1817a4ec6f2808e55ded21abc707d86b1b9"
-# EVM JSON-RPC endpoint. The public Arbitrum Sepolia RPC is fine for this
-# read-only call; swap in your own (e.g. Alchemy) for higher rate limits.
-RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
-# Which chain the RPC points at (informational only). 421614 = Arbitrum Sepolia.
-CHAIN_ID = "421614"
+# read gives both the registration gate and the subscription window check.
+#
+# The address is NOT set here. It comes from @fangorn-network/sdk (FangornConfig), the
+# only thing that knows which SubscriptionRegistry pairs with which DataRegistry —
+# `access()` cross-calls the registry the contract was wired to, so a stale pairing
+# makes every wallet read as unregistered and 403s all uploads with nothing in the logs
+# to explain it. Move deployments by bumping the SDK, then redeploying this worker.
+#
+# SUBSCRIPTION_CONTRACT_ADDRESS still works as an emergency override (repointing ahead
+# of an SDK publish) and logs a warning naming what it replaced. If you set it, verify
+# the pairing first:
+#   cast call <address> "dataRegistry()(address)" --rpc-url https://sepolia-rollup.arbitrum.io/rpc
+# must equal FangornConfig.dataRegistryContractAddress.
+#
+# EVM JSON-RPC endpoint. Defaults to the SDK's (the public Arbitrum Sepolia RPC), which
+# is fine for this read-only call; set your own (e.g. Alchemy) for higher rate limits.
+# RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc"
 # Advanced: the ABI signature of the access view. Stylus exposes the Rust `access`
 # method as camelCase `access(address)`; override only if yours differs.
 ACCESS_FUNCTION = "access(address)"

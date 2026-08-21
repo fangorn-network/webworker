@@ -6,8 +6,6 @@
   "scripts": {
     "dev:r2": "pnpm --filter ./fangorn-access-worker run dev",
     "dev:gate": "pnpm --filter ./pinata-url-provider run dev",
-    "deploy:r2": "pnpm --filter ./fangorn-access-worker run deploy",
-    "deploy:gate": "pnpm --filter ./pinata-url-provider run deploy",
     "typecheck": "pnpm -r typecheck"
   },
   "dependencies": {

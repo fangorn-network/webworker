@@ -1,7 +1,9 @@
-import { env, SELF } from "cloudflare:test";
+import { env, SELF, createExecutionContext } from "cloudflare:test";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { encodePacked, keccak256, toBytes, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { FangornConfig } from "@fangorn-network/sdk/lib/config.js";
+import worker from "../src/index";
 
 // The worker is a key-release oracle over a bucket it shares between EVERY
 // publisher on the relay. These cover what makes that safe: it mints its own
@@ -225,12 +227,15 @@ describe("/access gate", () => {
 	});
 
 	/** Stub the registry: every eth_call is answered from `state`. */
+	let lastTo: string | undefined;
 	function mockRegistry(state: { owner?: string; price?: bigint; disabled?: boolean; settled?: boolean }) {
+		lastTo = undefined;
 		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 			if (!url.includes("arbitrum")) return realFetch(input as RequestInfo, init);
 
 			const rpc = JSON.parse(String(init?.body));
+			lastTo = rpc.params?.[0]?.to;
 			const data: string = rpc.params?.[0]?.data ?? "";
 			const answer = data.startsWith(SEL.getOwner)
 				? word(state.owner ?? `0x${"00".repeat(20)}`)
@@ -248,7 +253,7 @@ describe("/access gate", () => {
 		}) as typeof fetch;
 	}
 
-	const access = async (resourceId: string = RID) => {
+	const access = async (resourceId: string = RID, envOverride?: Record<string, unknown>) => {
 		const nullifier = `0x${"07".repeat(32)}` as const;
 		const timestamp = Math.floor(Date.now() / 1000);
 		const signature = await BUYER.signMessage({
@@ -258,13 +263,25 @@ describe("/access gate", () => {
 				),
 			},
 		});
-		const res = await SELF.fetch("https://w/access", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ nullifier, resourceId, timestamp, signature }),
-		});
+		const body = JSON.stringify({ nullifier, resourceId, timestamp, signature });
+		const init = { method: "POST", headers: { "Content-Type": "application/json" }, body };
+		// SELF ignores env mutations, so a test that needs a different env calls the
+		// worker directly instead.
+		const res = envOverride
+			? await worker.fetch(new Request("https://w/access", init), envOverride as never, createExecutionContext())
+			: await SELF.fetch("https://w/access", init);
 		return { status: res.status, reason: (await res.json<{ reason?: string; error?: string }>()).error };
 	};
+
+	// The merge that brought the read helper in left it addressing the raw env var
+	// while the resolved address sat unused, so an unset var (the state a publisher's
+	// own deploy is in) aimed every call at `undefined`. Pin the source, not the value.
+	it("reads the registry the SDK names when no override is configured", async () => {
+		mockRegistry({ owner: OWNER, price: 0n });
+		const { SETTLEMENT_REGISTRY_ADDRESS: _omitted, ...bare } = env as Record<string, unknown>;
+		expect((await access(RID, bare)).status).toBe(404); // past the gate; no DEK uploaded
+		expect(lastTo?.toLowerCase()).toBe(FangornConfig.settlementRegistryContractAddress.toLowerCase());
+	});
 
 	// The registry keeps `isSettled` true after a takedown on purpose — the
 	// payment happened. So a disabled resource is refused here or nowhere, and
