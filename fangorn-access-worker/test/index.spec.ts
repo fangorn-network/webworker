@@ -1,17 +1,28 @@
 import { env, SELF, createExecutionContext } from "cloudflare:test";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { encodePacked, keccak256, toBytes } from "viem";
+import { encodePacked, keccak256, toBytes, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { FangornConfig } from "@fangorn-network/sdk/lib/config.js";
 import worker from "../src/index";
 
-// The worker is a key-release oracle over a bucket it also owns. These cover the
-// three things that make a PUBLISHER-OWNED deployment safe to hand someone who
-// has never heard of R2: it mints its own identity, it does not serve that
-// identity back out, and it will not let a stranger overwrite their ciphertext.
+// The worker is a key-release oracle over a bucket it shares between EVERY
+// publisher on the relay. These cover what makes that safe: it mints its own
+// identity, it does not serve that identity back out, only a relay-minted token
+// can write at all, and one publisher cannot touch another's objects.
 
 const RID = `0x${"ab".repeat(32)}` as const;
 const HEX64 = /^0x[0-9a-f]{64}$/;
+
+// The secret the relay and the worker share. Installed on `env` here because
+// wrangler.toml deliberately does not carry it — it is a `wrangler secret`.
+const SECRET = `0x${"5e".repeat(32)}` as Hex;
+
+const ALICE = "0x1111111111111111111111111111111111111111" as Address;
+const BOB = "0x2222222222222222222222222222222222222222" as Address;
+
+/** What sond3r's `uploadTokenFor` hands a publisher's browser. */
+const tokenFor = (owner: Address, secret: Hex = SECRET) =>
+	`${owner}.${keccak256(encodePacked(["bytes32", "address"], [secret, owner]))}`;
 
 const upload = (body: string, token?: string, id: string = RID) =>
 	SELF.fetch(`https://w/upload/${id}`, {
@@ -23,9 +34,9 @@ const upload = (body: string, token?: string, id: string = RID) =>
 		body,
 	});
 
-// Each test starts on a fresh, unclaimed bucket — the state a publisher's worker
-// is in the moment the Deploy to Cloudflare button finishes.
+// Each test starts on an empty bucket with the shared secret configured.
 beforeEach(async () => {
+	(env as { UPLOAD_HMAC_SECRET?: string }).UPLOAD_HMAC_SECRET = SECRET;
 	const { objects } = await env.BUCKET.list();
 	await Promise.all(objects.map((o) => env.BUCKET.delete(o.key)));
 });
@@ -54,25 +65,81 @@ describe("worker identity", () => {
 });
 
 describe("upload gate", () => {
+	// A cross-repo contract, and the quietest one to get wrong: sond3r's relay
+	// mints this token independently (server/index.js, `uploadTokenWith`) and its
+	// --selfcheck asserts the identical literal. If either side drifts, one of the
+	// two suites goes red instead of every upload silently 401ing.
+	it("agrees with the relay on the token format", () => {
+		expect(tokenFor("0x1111111111111111111111111111111111111111", `0x${"5e".repeat(32)}`)).toBe(
+			"0x1111111111111111111111111111111111111111.0x7908a77e560b9353c8bfc501f7654a7c3ba31939f0b83d123edac190f797c7fd",
+		);
+	});
+
 	it("refuses an unauthenticated upload", async () => {
 		expect((await upload("ciphertext")).status).toBe(401);
 	});
 
-	it("claims an unclaimed bucket to the first token, then rejects others", async () => {
-		expect((await upload("mine", "token-a")).status).toBe(201);
-		// Same token again: still the owner.
-		expect((await upload("mine too", "token-a")).status).toBe(201);
-		// A stranger who learned the URL cannot overwrite the publisher's bytes.
-		expect((await upload("theirs", "token-b")).status).toBe(401);
+	it("accepts a relay-minted token and refuses a forged one", async () => {
+		expect((await upload("mine", tokenFor(ALICE))).status).toBe(201);
+		// Same publisher again: overwriting your own object is an ordinary republish.
+		expect((await upload("mine too", tokenFor(ALICE))).status).toBe(201);
+		// Right shape, wrong secret — the whole point of the MAC.
+		expect((await upload("theirs", tokenFor(ALICE, `0x${"99".repeat(32)}`))).status).toBe(401);
+		// A bare address with no MAC authorizes nobody.
+		expect((await upload("theirs", ALICE)).status).toBe(401);
 	});
 
-	it("stores only the token's hash, never the token", async () => {
-		await upload("mine", "token-a");
-		expect(await (await env.BUCKET.get(".upload-token"))!.text()).not.toContain("token-a");
+	// The bucket is shared, so this is THE isolation property: uids are public, so
+	// Bob can compute Alice's resourceId — he just cannot write to it.
+	it("refuses a publisher writing over another publisher's object", async () => {
+		expect((await upload("alice", tokenFor(ALICE))).status).toBe(201);
+		expect((await upload("bob", tokenFor(BOB))).status).toBe(403);
+		expect(await (await env.BUCKET.get(RID))!.text()).toBe("alice");
+	});
+
+	it("stamps the owner on the ciphertext AND its sealed DEK", async () => {
+		await upload("alice", tokenFor(ALICE));
+		expect((await env.BUCKET.head(RID))!.customMetadata?.owner).toBe(ALICE);
+		// Unstamped, the DEK would be writable by anyone — and swapping a DEK is how
+		// you make a publisher's file decrypt to something else.
+		expect((await env.BUCKET.head(`${RID}.dek`))!.customMetadata?.owner).toBe(ALICE);
+	});
+
+	// An object left by the pre-shared-bucket deployment has nobody to attribute
+	// it to. Adopting it would hand it to whoever asked first.
+	it("refuses an existing object with no owner recorded", async () => {
+		await env.BUCKET.put(RID, "from the old deployment");
+		expect((await upload("mine now", tokenFor(ALICE))).status).toBe(403);
+	});
+
+	// Uploads are refused outright rather than falling open — a misconfigured
+	// worker would otherwise be an open write endpoint on a bucket we pay for.
+	it("authorizes nobody when the shared secret is missing", async () => {
+		delete (env as { UPLOAD_HMAC_SECRET?: string }).UPLOAD_HMAC_SECRET;
+		expect((await upload("mine", tokenFor(ALICE))).status).toBe(401);
 	});
 
 	it("rejects a key that is not a bytes32", async () => {
-		expect((await upload("x", "token-a", ".upload-token")).status).toBe(400);
+		expect((await upload("x", tokenFor(ALICE), ".worker-x25519-secret")).status).toBe(400);
+	});
+});
+
+// The mirror of upload, and the reason it is gated: a publisher's manifest is
+// read back through here, and on a shared bucket that is somebody's library
+// index, not ciphertext.
+describe("read-back", () => {
+	const fetchOwn = (token?: string, id: string = RID) =>
+		SELF.fetch(`https://w/upload/${id}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+
+	it("gives a publisher their own object back", async () => {
+		await upload("alice", tokenFor(ALICE));
+		expect(await (await fetchOwn(tokenFor(ALICE))).text()).toBe("alice");
+	});
+
+	it("refuses another publisher's object, and anyone with no token", async () => {
+		await upload("alice", tokenFor(ALICE));
+		expect((await fetchOwn(tokenFor(BOB))).status).toBe(403);
+		expect((await fetchOwn()).status).toBe(401);
 	});
 });
 
@@ -87,123 +154,41 @@ describe("delete", () => {
 		});
 
 	it("removes the ciphertext and its sealed DEK together", async () => {
-		await upload("ciphertext", "token-a");
+		await upload("ciphertext", tokenFor(ALICE));
 		expect(await env.BUCKET.get(RID)).not.toBeNull();
 		expect(await env.BUCKET.get(`${RID}.dek`)).not.toBeNull();
 
-		expect((await del("token-a")).status).toBe(200);
+		expect((await del(tokenFor(ALICE))).status).toBe(200);
 		expect(await env.BUCKET.get(RID)).toBeNull();
 		// A DEK left behind would go on releasing a key for bytes that are gone.
 		expect(await env.BUCKET.get(`${RID}.dek`)).toBeNull();
 	});
 
 	it("refuses an unauthenticated delete", async () => {
-		await upload("ciphertext", "token-a");
+		await upload("ciphertext", tokenFor(ALICE));
 		expect((await del()).status).toBe(401);
 		expect(await env.BUCKET.get(RID)).not.toBeNull();
 	});
 
-	it("refuses a stranger who learned the URL", async () => {
-		await upload("ciphertext", "token-a");
-		expect((await del("token-b")).status).toBe(401);
+	// A registered publisher is still a stranger to someone else's library. Without
+	// this, any one of them could empty the shared bucket.
+	it("refuses another publisher, token and all", async () => {
+		await upload("ciphertext", tokenFor(ALICE));
+		expect((await del(tokenFor(BOB))).status).toBe(403);
 		expect(await env.BUCKET.get(RID)).not.toBeNull();
 	});
 
 	// The same guard that keeps /ct/ off the private key keeps DELETE off it.
-	it("cannot delete the worker's own secret or the token record", async () => {
-		await upload("ciphertext", "token-a");
-		expect((await del("token-a", ".worker-x25519-secret")).status).toBe(400);
-		expect((await del("token-a", ".upload-token")).status).toBe(400);
-		expect(await env.BUCKET.get(".upload-token")).not.toBeNull();
+	it("cannot delete the worker's own secret", async () => {
+		await SELF.fetch("https://w/pubkey"); // force the mint
+		expect((await del(tokenFor(ALICE), ".worker-x25519-secret")).status).toBe(400);
+		expect(await env.BUCKET.get(".worker-x25519-secret")).not.toBeNull();
 	});
 
 	it("is idempotent, so a retry after a half-finished delete is safe", async () => {
-		await upload("ciphertext", "token-a");
-		expect((await del("token-a")).status).toBe(200);
-		expect((await del("token-a")).status).toBe(200);
-	});
-});
-
-// The publisher's wallet is the authority over the bucket — see handleClaim.
-const PUBLISHER = privateKeyToAccount(`0x${"11".repeat(32)}`);
-const STRANGER = privateKeyToAccount(`0x${"22".repeat(32)}`);
-
-const digestOf = async (token: string) =>
-	`0x${[...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)))]
-		.map((b) => b.toString(16).padStart(2, "0")).join("")}`;
-
-// Duplicated from the worker on purpose: if src/ changes this string, this test
-// should fail rather than follow along — sond3r's relay builds it independently
-// (server/index.js, `claimMessage`) and both sides must keep producing the same
-// bytes. CLAIM_VECTOR below pins the format for the relay's own self-check.
-const claimMessage = async (token: string, timestamp: number) =>
-	`sond3r storage claim\ntoken: ${await digestOf(token)}\ntime: ${timestamp}`;
-
-const claim = async (token: string, signer?: typeof PUBLISHER, timestamp = Math.floor(Date.now() / 1000)) =>
-	SELF.fetch("https://w/claim", {
-		method: "POST",
-		headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-		body: JSON.stringify({
-			timestamp,
-			signature: signer ? await signer.signMessage({ message: await claimMessage(token, timestamp) }) : undefined,
-		}),
-	});
-
-describe("/claim", () => {
-	it("pins the message format the relay signs against", async () => {
-		// sond3r/server/upload-token.js asserts the same literal. Two repos, one
-		// string: change it in one place only and the pair of tests catches it.
-		expect(await claimMessage("token-a", 1700000000)).toBe(
-			"sond3r storage claim\ntoken: 0xa70bf50e531ce1a817561f2f5d5b6645d4e806becf58ccc5e8cf6b8045a090a8\ntime: 1700000000"
-		);
-	});
-
-	it("claims without uploading, and is idempotent", async () => {
-		expect((await claim("token-a", PUBLISHER)).status).toBe(200);
-		// Re-presenting the winning token is idempotent and needs no signature.
-		expect((await claim("token-a")).status).toBe(200);
-		expect((await claim("token-b")).status).toBe(401);
-
-		// The claim really gated uploads, not just itself.
-		expect((await upload("theirs", "token-b")).status).toBe(401);
-		expect((await upload("mine", "token-a")).status).toBe(201);
-	});
-
-	it("refuses an unsigned claim on a bucket held by another token", async () => {
-		await claim("token-a", PUBLISHER);
-		const res = await claim("token-b");
-		expect(res.status).toBe(401);
-		expect((await res.json<{ reason: string }>()).reason).toBe("needs-signature");
-	});
-
-	// The bug this whole path exists for: rotating ETH_PRIVATE_KEY changes the
-	// relay's derived token, and used to strand the publisher's own bucket behind
-	// a wrangler command.
-	it("lets the owning wallet rotate to a new token", async () => {
-		await claim("old-token", PUBLISHER);
-		expect((await claim("new-token", PUBLISHER)).status).toBe(200);
-
-		expect((await upload("mine", "new-token")).status).toBe(201);
-		expect((await upload("stale", "old-token")).status).toBe(401);
-	});
-
-	it("refuses a takeover signed by a different wallet", async () => {
-		await claim("token-a", PUBLISHER);
-		const res = await claim("token-b", STRANGER);
-		expect(res.status).toBe(401);
-		expect((await res.json<{ reason: string }>()).reason).toBe("not-owner");
-	});
-
-	it("says so when the worker pins a token, which no signature can override", async () => {
-		(env as { UPLOAD_TOKEN?: string }).UPLOAD_TOKEN = "pinned-secret";
-		try {
-			const res = await claim("token-a", PUBLISHER);
-			expect(res.status).toBe(401);
-			expect((await res.json<{ reason: string }>()).reason).toBe("pinned");
-			expect((await claim("pinned-secret")).status).toBe(200);
-		} finally {
-			delete (env as { UPLOAD_TOKEN?: string }).UPLOAD_TOKEN;
-		}
+		await upload("ciphertext", tokenFor(ALICE));
+		expect((await del(tokenFor(ALICE))).status).toBe(200);
+		expect((await del(tokenFor(ALICE))).status).toBe(200);
 	});
 });
 
@@ -345,5 +330,48 @@ describe("/access gate", () => {
 			}),
 		});
 		expect(res.status).toBe(403);
+	});
+});
+
+// The free tier is the only thing left between a stranger's wallet and the
+// operator's R2 bill: the relay hands an upload token to ANY signed-in address
+// now, registered publisher or not, so the cap has to hold here.
+describe("free tier", () => {
+	const OTHER = `0x${"cd".repeat(32)}` as const;
+
+	beforeEach(() => { (env as { FREE_BYTES?: string }).FREE_BYTES = "10"; });
+	afterEach(() => { delete (env as { FREE_BYTES?: string }).FREE_BYTES; });
+
+	it("refuses an upload that would exceed the wallet's free bytes", async () => {
+		expect((await upload("12345678", tokenFor(ALICE))).status).toBe(201);
+		const over = await upload("345", tokenFor(ALICE), OTHER);
+		expect(over.status).toBe(413);
+		expect(await over.json<{ reason: string }>()).toMatchObject({ reason: "quota" });
+		// Metered per owner, so one wallet filling up cannot lock out another.
+		expect((await upload("12345678", tokenFor(BOB), OTHER)).status).toBe(201);
+	});
+
+	it("gives the bytes back on delete", async () => {
+		await upload("12345678", tokenFor(ALICE));
+		expect((await upload("1234", tokenFor(ALICE), OTHER)).status).toBe(413);
+		await SELF.fetch(`https://w/upload/${RID}`, {
+			method: "DELETE", headers: { Authorization: `Bearer ${tokenFor(ALICE)}` },
+		});
+		expect((await upload("1234", tokenFor(ALICE), OTHER)).status).toBe(201);
+	});
+
+	// Re-publishing the same file replaces bytes rather than adding them; counting
+	// the new copy on top of the old would shrink the tier on every re-upload.
+	it("counts an overwrite once", async () => {
+		expect((await upload("12345678", tokenFor(ALICE))).status).toBe(201);
+		expect((await upload("87654321", tokenFor(ALICE))).status).toBe(201);
+		expect((await upload("12", tokenFor(ALICE), OTHER)).status).toBe(201);
+	});
+
+	// `usage/<owner>` is not a bytes32, which is what keeps the ungated ciphertext
+	// route from serving one wallet's bill to anyone who guesses the address.
+	it("does not expose the meter through /ct", async () => {
+		await upload("12345678", tokenFor(ALICE));
+		expect((await SELF.fetch(`https://w/ct/usage/${ALICE}`)).status).toBe(404);
 	});
 });

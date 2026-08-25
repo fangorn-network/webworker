@@ -97,6 +97,16 @@ POLL_HINT_SECONDS = "60"
 SEARCH_URL = "http://qb.sond3r.com:8080"
 CDN_URL = "http://qb.sond3r.com:8090"
 
+# How long the instance may take to ANSWER before a proxied request is a 502. Bounds
+# the wait for headers only — /stream (SSE) and /export keep streaming afterwards for
+# as long as they like.
+#
+# A box that is off, or a firewall that DROPs rather than refuses, black-holes the SYN:
+# without this the request hangs until Cloudflare kills it near 100s, and the caller is
+# told "the endpoint timed out" about the wrong hop entirely. 502 "Instance unreachable"
+# in 15s names the real one.
+INSTANCE_TIMEOUT_MS = "15000"
+
 # ── App scoping ──────────────────────────────────────────────────────────────
 # A source is the whole app:publisher:subspace triple. Apps are stored canonically as
 # their 32-byte id (keccak256 of the name, the SDK's toAppId) — the website only ever

@@ -18,7 +18,8 @@
  * it embedded. And there is no access control on reads: the source graphs are public
  * on-chain data, so a view id is a convenience, not a secret. Writes are gated
  * (signature + active subscription) because creating a view is what spends embedding
- * work.
+ * work. Removing one spends nothing, so it needs only the signature — and only the
+ * requester's own: unwatching is theirs to do, not an admin's.
  *
  * Dependencies are `viem` (signature recovery + selector encoding) and the Fangorn
  * SDK, which supplies the deployment addresses.
@@ -107,10 +108,12 @@ export default {
     // falling through to "provide a valid EVM address" for a mistyped *path* sends the
     // reader hunting for an auth problem that does not exist — which is exactly what a
     // watcher pointed at the old `/sources` route used to see.
-    if (url.pathname !== '/views' && url.pathname !== '/admin/remove') {
+    if (url.pathname !== '/views' && url.pathname !== '/views/remove'
+        && url.pathname !== '/admin/remove') {
       return json(404, {
         error: `Unknown route ${url.pathname}`,
         routes: ['GET /watchlist', 'GET /views', 'GET /views/{id}', 'POST /views',
+                 'POST /views/remove',
                  'GET /q/{viewId}/search', 'GET /q/{viewId}/export',
                  'GET /q/{viewId}/stream', 'GET /q/{viewId}/cdn/*',
                  'POST /admin/remove'],
@@ -131,25 +134,24 @@ export default {
       return json(401, { ok: false, address, error: ownership.error, challenge: ownership.challenge }, cors);
     }
 
-    // ── Founder-only teardown ───────────────────────────────────────────────
-    if (url.pathname === '/admin/remove') {
-      if (!isAdmin(env, address)) return json(403, { error: 'Not an admin wallet.' }, cors);
+    // ── Teardown ────────────────────────────────────────────────────────────
+    // Two routes, same deletion, different people. `/views/remove` is how a requester
+    // stops watching what they asked for: OWNERSHIP ONLY — an admin wallet gets no
+    // pass here, and there is no subscription check, because unwatching has to keep
+    // working after the subscription that created the view lapses. Dropping the last
+    // view over a namespace is what takes it off /watchlist and cancels the
+    // instance's stream from that on-chain head.
+    if (url.pathname === '/views/remove' || url.pathname === '/admin/remove') {
+      const asAdmin = url.pathname === '/admin/remove';
       const id = (input.id || '').trim();
       const view = await readView(env, id);
       if (!view) return json(404, { error: `No view ${id}` }, cors);
-
-      // Delete the hosted MCP before the row, so a failure here leaves the view
-      // visible rather than orphaning a Cloud Run service nothing points at.
-      let mcpError = null;
-      if (view.mcp) {
-        try {
-          await deleteMcpService(env, id);
-        } catch (err) {
-          mcpError = err.message;
-        }
+      if (asAdmin ? !isAdmin(env, address) : view.requester !== address) {
+        return json(403, {
+          error: asAdmin ? 'Not an admin wallet.' : `View ${id} belongs to another wallet.`,
+        }, cors);
       }
-      await env.QUICKBEAM_KV.delete(viewKey(id));
-      await env.QUICKBEAM_KV.delete(dnsKey(dnsLabel(id)));
+      const mcpError = await deleteView(env, id, view);
       return json(mcpError ? 207 : 200, { ok: !mcpError, removed: id, ...(mcpError ? { mcpError } : {}) }, cors);
     }
 
@@ -187,18 +189,30 @@ export default {
 
       const id = viewId(address, name);
       const existing = await readView(env, id);
+      const mine = (await listViews(env)).filter((v) => v.requester === address);
 
-      if (!existing) {
-        const cap = Number(env.MAX_VIEWS_PER_WALLET || 0);
-        if (cap > 0) {
-          const mine = (await listViews(env)).filter((v) => v.requester === address);
-          if (mine.length >= cap) {
-            return json(429, {
-              ok: false,
-              error: `This wallet already has ${mine.length} view(s), the current limit.`,
-            }, cors);
-          }
-        }
+      // The same sources under a SECOND name is an accident, not a feature: a view is a
+      // filter over the shared collection, so two of them over one source set are the
+      // same search twice — two URLs, two catalogs and (hosted) two Cloud Run services
+      // to keep in step. Re-sending a view under its own name is the intended way to
+      // change one; that lands on the same `id` and replaces, which is why the twin
+      // search skips it.
+      const twin = mine.find((v) => v.id !== id && sameSources(v.sources, sources, env));
+      if (twin) {
+        return json(409, {
+          ok: false,
+          error: `You already have a view over these sources, called "${twin.name}". `
+               + `Use it, or name this one "${twin.name}" to replace it.`,
+          existing: withUrls(twin, url, env),
+        }, cors);
+      }
+
+      const cap = Number(env.MAX_VIEWS_PER_WALLET || 0);
+      if (!existing && cap > 0 && mine.length >= cap) {
+        return json(429, {
+          ok: false,
+          error: `This wallet already has ${mine.length} view(s), the current limit.`,
+        }, cors);
       }
 
       const view = {
@@ -228,6 +242,7 @@ export default {
 
       await env.QUICKBEAM_KV.put(viewKey(id), JSON.stringify(view));
       await env.QUICKBEAM_KV.put(dnsKey(dnsLabel(id)), id);
+      await invalidateViews(env);
       return json(existing ? 200 : 202, {
         ok: true,
         ...withUrls(view, url, env),
@@ -299,6 +314,19 @@ function toAppId(nameOrId) {
 /** A stored source with its app resolved — views predating the app dimension have none. */
 const withApp = (s, env) => ({ app: toAppId(s.app || env.DEFAULT_APP), owner: s.owner || '*',
                                namespace: s.namespace || '*' });
+
+/**
+ * Do two source lists cover exactly the same thing? Compared as a set of canonical
+ * triples, so order, a repeated source, or an app spelled as a name on one side and as
+ * its id on the other cannot make a duplicate look new.
+ */
+function sameSources(a, b, env) {
+  const key = (sources) => [...new Set(sources.map((s) => {
+    const { app, owner, namespace } = withApp(s, env);
+    return `${app}:${owner}:${namespace}`;
+  }))].sort().join('|');
+  return key(a) === key(b);
+}
 
 /**
  * CDN domain for one source. MUST match `_domain_for` in quickbeam/watcher.py — the
@@ -405,6 +433,7 @@ async function withMcpStatus(env, view) {
       const updated = { ...view, mcp: { ...view.mcp, status: live.status, url: live.url } };
       const { searchUrl, cdnUrl, mcpCommand, ...row } = updated;
       await env.QUICKBEAM_KV.put(viewKey(view.id), JSON.stringify(row));
+      await invalidateViews(env);  // the cached set still holds the pre-URL row
       return updated;
     }
   } catch {
@@ -425,17 +454,60 @@ async function ensureMcp(env, view, url) {
   return { service: serviceName(view.id), status: live.status, url: live.url ?? null };
 }
 
+/**
+ * Delete a view and everything provisioned for it, returning the Cloud Run error if
+ * the hosted MCP could not be torn down. The MCP goes first, so a failure there is
+ * reported (207) rather than silently orphaning a service nothing points at; the row
+ * goes either way, because a view whose delete half-failed is worse than a stray
+ * service an admin can sweep.
+ */
+async function deleteView(env, id, view) {
+  let mcpError = null;
+  if (view.mcp) {
+    try {
+      await deleteMcpService(env, id);
+    } catch (err) {
+      mcpError = err.message;
+    }
+  }
+  await env.QUICKBEAM_KV.delete(viewKey(id));
+  await env.QUICKBEAM_KV.delete(dnsKey(dnsLabel(id)));
+  await invalidateViews(env);
+  return mcpError;
+}
+
 async function readView(env, id) {
   if (!id) return null;
   const raw = await env.QUICKBEAM_KV.get(viewKey(id));
   return raw ? JSON.parse(raw) : null;
 }
 
+/** One key holding every view, so the common read is a `get` and not a `list`. */
+const SNAPSHOT_KEY = 'snapshot:views';
+/** Rebuild at most this often. A missed invalidation self-heals within one TTL. */
+const SNAPSHOT_TTL = 600;
+
 /**
- * Every view. KV list pages at 1000 keys — fine for a prototype, and the ceiling to
- * remember before this becomes the product.
+ * Every view, from one cached key.
+ *
+ * The uncached form — `list({prefix:'view:'})` plus a `get` per row — was a LIST
+ * OPERATION ON EVERY REQUEST, and `/watchlist` is polled by each instance forever:
+ * at --sources-refresh=60 that is 1440/day against a free-plan ceiling of 1000, before
+ * the website's own /views calls. Cached, a poll is one `get` (100k/day) and the list
+ * runs at most once per SNAPSHOT_TTL — 144/day at the current value.
+ *
+ * Writers call `invalidateViews`, so the TTL is a safety net for the paths that do not:
+ * a `wrangler kv key put` straight into the namespace shows up within one TTL, or
+ * immediately if you delete this key too.
+ *
+ * ponytail: one key for the whole set. KV list pages at 1000 keys and a value caps at
+ * 25 MB, so the ceiling is the same prototype ceiling as before — per-app snapshot keys
+ * if a deployment ever outgrows it.
  */
 async function listViews(env) {
+  const cached = await env.QUICKBEAM_KV.get(SNAPSHOT_KEY);
+  if (cached) return JSON.parse(cached);
+
   const out = [];
   let cursor;
   do {
@@ -446,8 +518,17 @@ async function listViews(env) {
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
+  await env.QUICKBEAM_KV.put(SNAPSHOT_KEY, JSON.stringify(out), { expirationTtl: SNAPSHOT_TTL });
   return out;
 }
+
+/**
+ * Drop the cached set. Called after every write, BEFORE the response goes out, so the
+ * caller's next read cannot see the set it just changed as stale — KV's own eventual
+ * consistency (up to 60s) is the remaining window, and it applied to the uncached form
+ * just the same.
+ */
+const invalidateViews = (env) => env.QUICKBEAM_KV.delete(SNAPSHOT_KEY);
 
 /* ───────────────────────────── entitlement ──────────────────────────────── */
 
@@ -630,7 +711,7 @@ async function proxy(request, env, url, cors, resolved = null) {
   headers.delete('host');
   let upstream;
   try {
-    upstream = await fetch(target, {
+    upstream = await instanceFetch(target, env, {
       method: request.method,
       headers,
       body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
@@ -658,7 +739,7 @@ async function proxy(request, env, url, cors, resolved = null) {
 async function filteredCatalog(env, view, cors) {
   let catalog;
   try {
-    const res = await fetch(`${trimSlash(env.CDN_URL)}/catalog`);
+    const res = await instanceFetch(`${trimSlash(env.CDN_URL)}/catalog`, env);
     if (!res.ok) return json(502, { error: `Catalog HTTP ${res.status}` }, cors);
     catalog = await res.json();
   } catch (err) {
@@ -683,12 +764,39 @@ async function resolveDomains(env, view) {
   }
   const match = domainMatcher(view, env);
   try {
-    const res = await fetch(`${trimSlash(env.CDN_URL)}/catalog`);
+    const res = await instanceFetch(`${trimSlash(env.CDN_URL)}/catalog`, env);
     if (!res.ok) return [];
     const catalog = await res.json();
     return (catalog.domains || []).map((d) => d.name).filter(match);
   } catch {
     return [];
+  }
+}
+
+/**
+ * A fetch at the shared instance, bounded on how long it may take to ANSWER — not on
+ * how long it may stream.
+ *
+ * `SEARCH_URL`/`CDN_URL` are a grey-cloud A record straight at a VM, so a box that is
+ * off, or a firewall that DROPs instead of refusing, black-holes the SYN. A plain
+ * fetch then hangs until Cloudflare gives up around 100s and the `catch` below never
+ * runs — which reads to a caller as "the endpoint is timing out" when what happened is
+ * "the instance is unreachable", the single most misleading failure this worker has.
+ *
+ * The timer is cleared the moment headers arrive, so `/stream` (SSE, open for hours)
+ * and `/export` (a whole corpus) stream for as long as they like — only the wait for
+ * a first answer is capped.
+ */
+async function instanceFetch(url, env, init) {
+  const ms = Number(env.INSTANCE_TIMEOUT_MS || 15000);
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: abort.signal });
+  } catch (err) {
+    throw abort.signal.aborted ? new Error(`no answer within ${ms}ms`) : err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
