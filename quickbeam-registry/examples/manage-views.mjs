@@ -13,8 +13,11 @@
  *   node examples/manage-views.mjs --worker https://…workers.dev --key 0xKEY \
  *        --name my-view --source 0xOWNER:namespace [--source 0xOWNER:other] [--hosted-mcp]
  *
- *   node examples/manage-views.mjs --worker https://…workers.dev --key 0xADMINKEY \
- *        --remove qb_147c24c5_my-view
+ *   node examples/manage-views.mjs --worker https://…workers.dev --key 0xKEY \
+ *        --remove qb_147c24c5_my-view [--admin]
+ *
+ *   --remove deletes YOUR OWN view (the wallet that created it). --admin sends it to
+ *   the founder route instead, which is the only way to remove somebody else's.
  *
  *   node examples/manage-views.mjs --worker https://…workers.dev --watchlist
  *
@@ -33,6 +36,7 @@ function parseArgs(argv) {
     else if (arg === '--name') out.name = next();
     else if (arg === '--source') out.sources.push(next());
     else if (arg === '--remove') out.remove = next();
+    else if (arg === '--admin') out.admin = true;
     else if (arg === '--hosted-mcp') out.hostedMcp = true;
     else if (arg === '--watchlist') out.watchlist = true;
     else throw new Error(`Unknown argument: ${arg}`);
@@ -104,8 +108,9 @@ async function main() {
   console.log(`address: ${account.address}`);
 
   if (args.remove) {
-    report(`POST /admin/remove ${args.remove}`,
-      await signedPost(worker, '/admin/remove', account, { id: args.remove }));
+    const route = args.admin ? '/admin/remove' : '/views/remove';
+    report(`POST ${route} ${args.remove}`,
+      await signedPost(worker, route, account, { id: args.remove }));
     return;
   }
 

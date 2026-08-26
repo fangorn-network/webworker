@@ -302,6 +302,30 @@ test('re-creating a view replaces it and keeps createdAt', async () => {
   assert.equal(viewCount(), 1);
 });
 
+test('the same sources under a second name is refused, not duplicated', async () => {
+  const first = await (await createView(alice, 'music', [src(PUB, 'x')])).json();
+
+  const dupe = await createView(alice, 'tunes', [src(PUB, 'x')]);
+  assert.equal(dupe.status, 409);
+  const body = await dupe.json();
+  assert.match(body.error, /music/);
+  assert.equal(body.existing.id, first.id);
+  assert.equal(viewCount(), 1);
+
+  // Order, a repeat, and the app spelled as a name rather than its id are all the same
+  // source set — none of them is a way in.
+  const shuffled = await createView(alice, 'tunes', [
+    src(PUB2, 'y'), src(PUB, 'x'), src(PUB, 'x', APP_NAME),
+  ]);
+  assert.equal(shuffled.status, 202, 'a genuinely different set still creates');
+  assert.equal((await createView(alice, 'more', [src(PUB, 'x'), src(PUB2, 'y')])).status, 409);
+  assert.equal(viewCount(), 2);
+
+  // Another wallet asking for the same namespaces is not a duplicate — that is the
+  // whole point of embedding once and filtering per requester.
+  assert.equal((await createView(bob, 'music', [src(PUB, 'x')])).status, 202);
+});
+
 test('an unregistered wallet is told to register (403)', async () => {
   rpcResponse = () => accessResult(false, 0);
   const res = await createView(alice, 'v', [src(PUB, 'ns')]);
@@ -487,6 +511,21 @@ test('cdn passthrough refuses a domain outside the view', async () => {
   assert.equal(lastInstanceUrl, null, 'must not reach the instance at all');
 });
 
+test('a box that never answers is a 502, not a hang', async () => {
+  const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
+  env.INSTANCE_TIMEOUT_MS = '50';
+  // A black hole, not a refusal: an off box or a DROP firewall never completes the
+  // handshake, so without the bound this request runs until Cloudflare kills it ~100s
+  // later and the caller is told "timed out" about the wrong hop.
+  instanceResponse = (href, init) => new Promise((_, reject) => {
+    init.signal.addEventListener('abort', () => reject(init.signal.reason));
+  });
+
+  const res = await get(`/q/${v.id}/stream`);
+  assert.equal(res.status, 502);
+  assert.match((await res.json()).error, /no answer within 50ms/);
+});
+
 test('an unrecognised proxy path is 404 rather than forwarded somewhere', async () => {
   const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
   const res = await get(`/q/${v.id}/admin/secrets`);
@@ -524,6 +563,35 @@ test('views are readable without a signature', async () => {
   assert.equal(mine.views.length, 1);
   const theirs = await (await get(`/views?requester=${bob.address}`)).json();
   assert.equal(theirs.views.length, 0);
+});
+
+test('a requester can remove their own view, and only their own', async () => {
+  const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
+
+  // Neither a stranger nor an admin wallet can remove somebody else's view here —
+  // /views/remove answers to the requester alone.
+  assert.equal((await signedPost('/views/remove', bob, { id: v.id })).status, 403);
+  assert.equal((await signedPost('/views/remove', admin, { id: v.id })).status, 403);
+  assert.equal(viewCount(), 1);
+
+  const ok = await signedPost('/views/remove', alice, { id: v.id });
+  assert.equal(ok.status, 200);
+  assert.equal(viewCount(), 0);
+  // Off the watch list: the instance stops following that on-chain head.
+  assert.deepEqual((await (await get('/watchlist')).json()).sources, []);
+});
+
+test('removing a view needs a signature, and works without a subscription', async () => {
+  const v = await (await createView(alice, 'mine', [src(PUB, 'a')])).json();
+
+  const unsigned = await post('/views/remove', { address: alice.address, id: v.id });
+  assert.equal(unsigned.status, 401);
+  assert.equal(viewCount(), 1);
+
+  // A lapsed subscription must not trap a requester into being watched forever.
+  rpcResponse = () => accessResult(true, 0);
+  assert.equal((await signedPost('/views/remove', alice, { id: v.id })).status, 200);
+  assert.equal(viewCount(), 0);
 });
 
 test('teardown is admin-only', async () => {
@@ -651,4 +719,46 @@ test('an unknown subdomain is 404, not a proxy to nowhere', async () => {
   env.VIEW_DOMAIN_SUFFIX = 'qb.sond3r.com';
   const res = await worker.fetch(new Request('https://qb-dead-beef.qb.sond3r.com/search?q=x'), env);
   assert.equal(res.status, 404);
+});
+
+/* ── watch-list caching ──────────────────────────────────────────────────── */
+
+/** Count `list` operations from here on — the KV op with a 1000/day free-plan cap. */
+function countLists(kv) {
+  const real = kv.list.bind(kv);
+  let n = 0;
+  kv.list = async (opts) => { n += 1; return real(opts); };
+  return () => n;
+}
+
+test('POLLING IS A GET, NOT A LIST: repeated /watchlist lists KV once', async () => {
+  // Every instance polls /watchlist forever. Uncached this was one list operation per
+  // poll — 1440/day at --sources-refresh=60 against a free-plan ceiling of 1000, which
+  // is what took the real deployment over its quota.
+  await createView(alice, 'music', [src(PUB, 'tracks')]);
+  const lists = countLists(env.QUICKBEAM_KV);
+
+  for (let i = 0; i < 5; i += 1) await get('/watchlist');
+
+  assert.equal(lists(), 1, 'the set must be rebuilt once, then served from the snapshot');
+});
+
+test('a view created after the cache was warmed still reaches the watch list', async () => {
+  await createView(alice, 'music', [src(PUB, 'tracks')]);
+  await get('/watchlist');                       // warm it
+
+  await createView(bob, 'more', [src(PUB2, 'other')]);
+
+  const { sources } = await (await get('/watchlist')).json();
+  assert.equal(sources.length, 2, 'a stale snapshot would leave the new namespace unwatched');
+});
+
+test('removing a view drops it from the watch list immediately', async () => {
+  const v = await (await createView(alice, 'music', [src(PUB, 'tracks')])).json();
+  await get('/watchlist');                       // warm it
+
+  await signedPost('/admin/remove', admin, { id: v.id });
+
+  const { sources } = await (await get('/watchlist')).json();
+  assert.deepEqual(sources, [], 'teardown must not wait out the snapshot TTL');
 });

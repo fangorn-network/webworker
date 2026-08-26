@@ -56,7 +56,8 @@ The script exits non-zero on a refusal and names it:
 |---|---|
 | `202` / `200` | created / replaced, or removed |
 | `402` | that wallet has no active subscription |
-| `403` | not a registered publisher, or not an admin for `/admin/remove` |
+| `403` | not a registered publisher; not an admin for `/admin/remove`; not the requester for `/views/remove` |
+| `409` | another of your views already covers exactly these sources |
 | `401` | the signature did not verify — wrong key for that address |
 | `429` | per-wallet view cap (`MAX_VIEWS_PER_WALLET`) |
 

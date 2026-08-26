@@ -57,7 +57,7 @@ and nothing here reads an event log.
 
 | Route | Auth | Does |
 |---|---|---|
-| `POST /views` | signature + subscription | create or replace a view (idempotent on `{requester, name}`); returns its id, search URL and MCP command. `hostedMcp: true` also provisions a Cloud Run MCP |
+| `POST /views` | signature + subscription | create or replace a view (idempotent on `{requester, name}`); returns its id, search URL and MCP command. `hostedMcp: true` also provisions a Cloud Run MCP. `409` if another of your views already covers exactly these sources |
 | `GET /views?requester=0x…` | none | that wallet's views (omit `requester` for all) |
 | `GET /views/{id}` | none | one view |
 | `GET /watchlist` | none | the deduplicated union the instance polls: `{"sources":[{app, owner, namespace}]}`. `owner`/`namespace` may be `*` (that whole app); dedup is on all three, so the same publisher:subspace in two apps stays two entries |
@@ -66,7 +66,18 @@ and nothing here reads an event log.
 | `GET /q/{id}/stream` | none | SSE: which of the view's domains changed, so a client pulls instead of polling |
 | `GET /q/{id}/cdn/catalog` | none | the instance catalog **filtered** to the view's domains |
 | `GET /q/{id}/cdn/*` | none | proxied to the CDN (shards, manifests, edges); `domains/{name}/…` outside the view is `404`, not forwarded |
-| `POST /admin/remove` | admin signature | delete a view by `{id}` |
+| `POST /views/remove` | requester signature | delete one of **your own** views by `{id}` |
+| `POST /admin/remove` | admin signature | delete any view by `{id}` |
+
+A wallet cannot end up with the same view twice. Sending a view under a name it
+already uses **replaces** it — the id is `(requester, name)`, so that is how you change
+what a view watches without changing its URLs. Sending the same source set under a
+*second* name is refused with `409` naming the view that already covers it: a view is a
+filter over the shared collection, so a duplicate would be the same search under two
+URLs, two catalogs and two hosted MCPs to keep in step. Sources are compared as a set of
+canonical `app:owner:namespace` triples, so order, a repeat, or an app spelled as a name
+on one side and its id on the other make no difference. Two *different* wallets asking
+for the same namespaces is not a duplicate — that is the whole design.
 
 The search **and export** proxies both **strip any caller-supplied `scope`, `owner` or
 `namespace`** before injecting the view's own pairs, so a view URL always means that
@@ -175,8 +186,8 @@ catalog, and returns its URL. An MCP is stateless, holds no connections and need
 disk, so it scales to zero — an idle user's MCP costs nothing. That is the opposite of
 the watcher, which is why the watcher lives on a VM.
 
-Unticking the box on a later `POST /views` deletes the service; so does
-`POST /admin/remove`. If Cloud Run is unconfigured (`GCP_*` unset), the request returns
+Unticking the box on a later `POST /views` deletes the service; so does removing the
+view (`POST /views/remove`, `POST /admin/remove`). If Cloud Run is unconfigured (`GCP_*` unset), the request returns
 an `mcpError` and the view still gets its search endpoint — the feature degrades, it
 does not fail the view.
 
@@ -196,21 +207,32 @@ created against, and match the watcher's `APP`, or their catalogs come back empt
 
 ## Teardown
 
-Nothing expires on its own — a lapsed subscription keeps running until someone removes
-its view. That is deliberate: teardown is a founder action.
+Nothing expires on its own — a view keeps being watched until somebody removes it.
+Two routes, because they answer to different people:
+
+**`POST /views/remove` — the requester's own.** Ownership only: the signing wallet must
+be the view's `requester`, and an admin wallet gets **no** override here (that is what
+`/admin/remove` is for). There is no subscription check either — a wallet whose
+subscription has lapsed must still be able to stop being watched.
 
 ```sh
-# Any wallet in ADMIN_WALLETS. Two steps: collect the challenge, sign, resend.
-curl -s -X POST "$WORKER/admin/remove" -H 'content-type: application/json' \
-  -d '{"address":"0xYOURADMIN","id":"qb_147c24c5_music"}'
+# Two steps, like every write here: collect the challenge, sign it, resend.
+curl -s -X POST "$WORKER/views/remove" -H 'content-type: application/json' \
+  -d '{"address":"0xYOU","id":"qb_147c24c5_music"}'
 # → { "challenge": "..." }   sign it, then:
-curl -s -X POST "$WORKER/admin/remove" -H 'content-type: application/json' \
-  -d '{"address":"0xYOURADMIN","id":"qb_147c24c5_music","message":"<challenge>","signature":"0x…"}'
+curl -s -X POST "$WORKER/views/remove" -H 'content-type: application/json' \
+  -d '{"address":"0xYOU","id":"qb_147c24c5_music","message":"<challenge>","signature":"0x…"}'
 ```
 
-Removing a view drops its sources from the watchlist **only if no other view wants
-them**. Add a founder by appending to `ADMIN_WALLETS` in `wrangler.toml` and
-redeploying.
+The website exposes this as **Stop watching** inside each view on the dashboard.
+
+**`POST /admin/remove` — any view.** Same body, same handshake, but the signer must be
+in `ADMIN_WALLETS`. Add a founder by appending to it in `wrangler.toml` and redeploying.
+
+Either route deletes the view's row, its `dns:` label and its hosted MCP (a Cloud Run
+failure comes back as `207` + `mcpError`; the row is gone regardless). Its sources leave
+the watchlist **only if no other view wants them** — the instance cancels its stream
+from that on-chain head once the last view referencing it goes.
 
 ## Configuration
 
@@ -236,6 +258,7 @@ A `[build]` guard aborts the deploy if the installed SDK carries no valid addres
 | `ADMIN_WALLETS` | comma-separated wallets allowed to tear down |
 | `MAX_VIEWS_PER_WALLET` | abuse cap, not an entitlement; `"0"` disables |
 | `SEARCH_URL`, `CDN_URL` | the instance, plain HTTP |
+| `INSTANCE_TIMEOUT_MS` | how long the instance may take to *answer* a proxied request before it is a `502` (default `15000`). Bounds time-to-headers only — `/stream` and `/export` still stream for as long as they like |
 | `VIEW_DOMAIN_SUFFIX` | per-view subdomains live under this; empty serves views at `/q/{id}/…` |
 | `GCP_PROJECT`, `GCP_REGION`, `GCP_SA_EMAIL`, `QUICKBEAM_IMAGE` | hosted MCP; unset disables the feature |
 | `GCP_SA_KEY` (**secret**) | the service-account JSON's `private_key`; needs `roles/run.admin` + `roles/iam.serviceAccountUser` |
@@ -273,7 +296,12 @@ production.
 
 ## Known ceilings
 
-- `GET /watchlist` and `GET /views` read every row. KV lists page at 1000 keys; fine
-  for a prototype, and the first thing to change if this becomes the product.
+- `GET /watchlist` and `GET /views` read every row, cached in one `snapshot:views` key
+  (10 min TTL, dropped on every write) so a poll costs a `get` and not a KV **list** —
+  the op capped at 1000/day on the free plan, which an instance polling every 60s
+  exceeds on its own. Editing a `view:` row directly with `wrangler kv key put` does
+  NOT invalidate it: delete `snapshot:views` too, or wait out the TTL.
+- The rebuilt snapshot is one value, and KV lists page at 1000 keys; fine for a
+  prototype, and the first thing to change if this becomes the product.
 - KV is eventually consistent, so a just-created view can take a moment to appear in
   `/watchlist`. The instance converges on the next poll either way.
