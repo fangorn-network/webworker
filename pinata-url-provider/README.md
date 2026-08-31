@@ -170,7 +170,7 @@ Without the `RATE_KV` binding the free tier and daily cap do nothing and `/usage
 | `PINATA_URL_EXPIRES` | var | Seconds the upload URL stays valid (default `300`). |
 | `PINATA_ALLOW_MIME_TYPES` | var | Optional CSV of MIME types signed into the URL. |
 | `RPC_URL` | var | EVM JSON-RPC endpoint. Default: the SDK's `FangornConfig.rpcUrl`. |
-| `SUBSCRIPTION_CONTRACT_ADDRESS` | var | **Normally unset**, but used as fallback. Worker uses address from Fangorn's SDK. |
+| `SUBSCRIPTION_CONTRACT_ADDRESS` | var | **Normally unset**. Worker uses address from Fangorn's SDK. |
 | `ACCESS_FUNCTION` | var | ABI signature of the access view (default `access(address)`). |
 | `STUB_REGISTRATION_CHECK` | var | `"true"` skips the chain read entirely: a valid signature alone mints, and the subscription reads as active. Dev only. |
 | `SUBSCRIPTION_WINDOW_DAYS` | var | How long a payment keeps a subscription active (default `30`). |
