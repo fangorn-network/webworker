@@ -13,6 +13,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { privateKeyToAccount } from 'viem/accounts';
+import { toFunctionSelector } from 'viem';
 
 import worker from '../src/index.js';
 import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
@@ -80,9 +81,49 @@ const notRegisteredRpc = accessRpc({ registered: false });
 const BASE_URL = 'https://worker.test/';
 const nowSec = () => Math.floor(Date.now() / 1000);
 
-// Two throwaway deterministic keys (never use anywhere real).
+// Three throwaway deterministic keys (never use anywhere real). OWNER stands in
+// for the app owner whose subscription pays for an app-scoped upload.
 const ACCOUNT = privateKeyToAccount('0x' + '11'.repeat(32));
 const OTHER = privateKeyToAccount('0x' + '22'.repeat(32));
+const OWNER = privateKeyToAccount('0x' + '33'.repeat(32));
+
+/* ── app-scoped eth_call stub ────────────────────────────────────────────── */
+// An app-scoped request makes up to four eth_calls, so route them by selector:
+// the caller's access(), AppRegistry.isRegisteredForApp(), isAppSubscribed(),
+// and — only when the app has ever paid — the owner's access() for paidAt.
+const APP_ID = '0x' + 'ab'.repeat(32);
+const SELECTOR = {
+  access: toFunctionSelector('access(address)'),
+  member: toFunctionSelector('isRegisteredForApp(bytes32,address)'),
+  appSubscribed: toFunctionSelector('isAppSubscribed(bytes32)'),
+};
+
+function appRpc({
+  registered = true,
+  member = true,
+  subscribed = true,
+  owner = OWNER.address,
+  ownerPaidAt = nowSec(),
+} = {}) {
+  return (_url, init) => {
+    const data = JSON.parse(init.body).params[0].data;
+    switch (data.slice(0, 10)) {
+      case SELECTOR.member:
+        return jsonResponse(200, { result: '0x' + wordHex(member ? 1 : 0) });
+      case SELECTOR.appSubscribed:
+        return jsonResponse(200, { result: '0x' + wordHex(subscribed ? 1 : 0) + wordHex(BigInt(owner)) });
+      case SELECTOR.access: {
+        // access() is read for the caller (registration) and, past the free tier,
+        // for the owner (paidAt) — tell them apart by the address argument.
+        const arg = '0x' + data.slice(34, 74);
+        const isOwner = arg.toLowerCase() === owner.toLowerCase();
+        return jsonResponse(200, { result: '0x' + wordHex(registered ? 1 : 0) + wordHex(isOwner ? ownerPaidAt : 0) });
+      }
+      default:
+        throw new Error(`unexpected eth_call selector ${data.slice(0, 10)}`);
+    }
+  };
+}
 
 function baseEnv(overrides = {}) {
   return {
@@ -476,6 +517,75 @@ test('retry past the free tier (same uploadId) is charged once', async () => {
   assert.equal(first.status, 200);
   assert.equal(second.status, 200);
   assert.equal(kv._store.get(totalKey(ACCOUNT)), '11000'); // 9000 + 2000 once, not twice
+});
+
+/* ── app-level subscription ──────────────────────────────────────────────── */
+
+test('appId → group is <prefix>:<appId>:<wallet>, and bytes bill the app owner', async () => {
+  rpcResponse = appRpc();
+  pinataResponse = pinataOk;
+  const kv = mockKV();
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 4000, appId: APP_ID } });
+  assert.equal(res.status, 200);
+  const name = `testnet:${APP_ID}:${ACCOUNT.address.toLowerCase()}`;
+  assert.equal(JSON.parse(groupCalls.at(-1).init.body).name, name);
+  // The app owner's counter moved; the caller's did not.
+  assert.equal(kv._store.get(totalKey(OWNER)), '4000');
+  assert.equal(kv._store.get(totalKey(ACCOUNT)), undefined);
+});
+
+test('registered publisher who never joined the app → 403 (never mints)', async () => {
+  rpcResponse = appRpc({ member: false }); // pinataResponse null: a mint would throw
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /not an active publisher for app/i);
+  assert.equal(groupCalls.length, 0);
+});
+
+test('app past the free tier with an active owner subscription → 200', async () => {
+  rpcResponse = appRpc({ ownerPaidAt: nowSec() });
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [totalKey(OWNER)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000, appId: APP_ID } });
+  assert.equal(res.status, 200);
+  assert.equal(kv._store.get(totalKey(OWNER)), '11000');
+});
+
+test('app past the free tier whose owner never subscribed → 402', async () => {
+  rpcResponse = appRpc({ subscribed: false });
+  const kv = mockKV({ [totalKey(OWNER)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000, appId: APP_ID } });
+  assert.equal(res.status, 402);
+  assert.match(res.json.error, new RegExp(OWNER.address, 'i'));
+  assert.equal(kv._store.get(totalKey(OWNER)), '9000');
+});
+
+test('app past the free tier with a stale (>30d) owner subscription → 402', async () => {
+  // isAppSubscribed is "has ever paid" — the 30-day window is applied here.
+  rpcResponse = appRpc({ subscribed: true, ownerPaidAt: nowSec() - 40 * 86400 });
+  const kv = mockKV({ [totalKey(OWNER)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000, appId: APP_ID } });
+  assert.equal(res.status, 402);
+});
+
+test('unclaimed app (owner 0x0) → 403, never billed to the zero address', async () => {
+  rpcResponse = appRpc({ owner: '0x' + '0'.repeat(40) });
+  const kv = mockKV();
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /no owner on-chain/i);
+  assert.equal(kv._store.size, 0);
+});
+
+test('malformed appId → 400 before any chain call', async () => {
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: '0xdeadbeef' } });
+  assert.equal(res.status, 400);
+  assert.match(res.json.error, /32-byte hex/);
 });
 
 /* ── usage endpoint ──────────────────────────────────────────────────────── */

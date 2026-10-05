@@ -7,8 +7,9 @@ Requests get validated on:
 1. **Ownership proof.** The caller signs a timestamped challenge with the address's key (EIP-191 `personal_sign`). The worker recovers the signer and requires it to equal the claimed address.
 2. **Access check.** One `eth_call` to `access(address)` on the SubscriptionRegistry returns `(registered, paidAt)`. The contract cross-calls `DataRegistry.isRegistered` internally, so a single read answers both "is this
    a publisher?" and "when did they last pay?".
-3. **Budgets.** The declared upload size is checked against the wallet's lifetime free tier (past it, an active subscription is required) and its daily byte budget.
-4. **Mint.** `POST /v3/files/sign` at Pinata, scoped to that size, to `PINATA_ALLOW_MIME_TYPES`, and to the wallet's own Pinata group.
+3. **App membership** *(only when the caller sends an `appId`)*. `AppRegistry.isRegisteredForApp(appId, caller)`. The same per-app check `DataRegistry.commitStateRoot` enforces then `SubscriptionRegistry.isAppSubscribed(appId)` for the app's owner. Budgets are then billed to that app's **owner**, not the caller.
+4. **Budgets.** The declared upload size is checked against the billed wallet's lifetime free tier (past it, an active subscription is required) and its daily byte budget.
+5. **Mint.** `POST /v3/files/sign` at Pinata, scoped to that size, to `PINATA_ALLOW_MIME_TYPES`, and to the wallet's own Pinata group.
 
 ## Endpoints
 
@@ -29,16 +30,17 @@ Query parameters (`GET`) or a JSON body (`POST`).
 | `signature` | 65-byte `personal_sign` signature of `message`. |
 | `size` | Declared upload size in bytes. The minted URL is scoped to `size + 4096` (multipart headroom). This is what gets debited to the account's storage limit. Omitted → `DEFAULT_UPLOAD_SIZE`. |
 | `uploadId` | Idempotency key. A retry reusing it re-mints a fresh single-use URL but is charged once. |
+| `appId` | Optional 32-byte hex app id. Publishes under an app: the caller must also be an active publisher in it, and the bytes are billed to the **app owner's** subscription. See *App-level subscriptions*. |
 
 ### Minting: responses
 
 | Status | Body |
 | --- | --- |
 | `200` | `{ ok, address, uploadUrl, network, maxFileSize, expiresIn }` (plus `stubbed: true` under `STUB_REGISTRATION_CHECK`) |
-| `400` | invalid/missing address, or a non-positive-integer `size` |
+| `400` | invalid/missing address, a non-positive-integer `size`, or a malformed `appId` |
 | `401` | `{ ok: false, address, error, challenge }`. No signature or it failed to verify. Sign `challenge` and retry. |
-| `402` | past the free tier with no active subscription (points at `SUBSCRIBE_URL`) |
-| `403` | ownership proven, but the address is not a registered publisher (points at `REGISTER_URL`) |
+| `402` | past the free tier with no active subscription. The caller's, or the app owner's for an app-scoped upload (points at `SUBSCRIBE_URL`) |
+| `403` | ownership proven, but the address is not a registered publisher, not an active publisher in `appId`, or the app is unclaimed (points at `REGISTER_URL`) |
 | `405` | method other than `GET`/`POST`/`OPTIONS` |
 | `413` | declared `size` exceeds `MAX_UPLOAD_SIZE` |
 | `429` | daily byte budget exhausted (resets 00:00 UTC) |
@@ -90,9 +92,28 @@ const pin = await fetch(uploadUrl, { method: 'POST', body: fd }).then((r) => r.j
 // pin.data.cid → the IPFS CID
 ```
 
+## App-level subscriptions
+
+A publisher may send an `appId` alongside the proof. The upload is then charged to the **app owner's** storage subscription, so one subscription covers every publisher in that app.
+
+The caller still proves address ownership and still has to be registered in the DataRegistry. On top of that:
+
+| Check | Contract | Failure |
+| --- | --- | --- |
+| `isRegisteredForApp(appId, caller)` | AppRegistry (from the SDK) | `403`. false for a suspended app, a suspended publisher, or stale accepted terms |
+| `isAppSubscribed(appId) → (subscribed, owner)` | SubscriptionRegistry | `403` when `owner` is `0x0` (unclaimed app) |
+
+Everything downstream then uses `owner` instead of the caller: the free-tier counter (`total:{owner}`), the daily cap, the `uploadId` idempotency marker, and the subscription window. `isAppSubscribed` only reports whether the owner has *ever* paid, so when the free tier is crossed the worker also reads `access(owner)` for `paidAt` and applies `SUBSCRIPTION_WINDOW_DAYS` exactly as it does for a solo publisher. Pins are grouped `<prefix>:<appId>:<caller>` and billed to the app owner and attributable to the publisher.
+
+`GET /usage` is unchanged: query the **owner's** address to see an app's usage.
+
+Both contract addresses come from `@fangorn-network/sdk` with no env override — `isAppSubscribed` resolves the AppRegistry through the DataRegistry itself, so an override here could only disagree with the contract.
+
 ## Byte budgets
 
 There are two independent limits, both backed by `RATE_KV` and both **opt-in**. Each is inactive unless its limit is `> 0` *and* the namespace is bound.
+
+In this section "wallet" means the wallet being **billed**: the caller, or the app owner when the request carries an `appId`.
 
 **Lifetime free tier**: `FREE_BYTE_LIMIT`, KV key `total:{wallet}`, no expiry. The first `FREE_BYTE_LIMIT` bytes are free. Once an upload would cross that threshold (including the one that crosses it), the worker requires an active subscription: `now − paidAt < SUBSCRIPTION_WINDOW_DAYS`, using the `paidAt` from the `access()` read. Otherwise `402`. The counter keeps climbing past the limit, so a wallet can't dip back under it.
 
@@ -106,7 +127,7 @@ KV is eventually consistent, so a concurrent burst across edge locations can ove
 
 ## Upload groups
 
-Every presigned URL is scoped to a Pinata **group** named `<PINATA_GROUP_PREFIX>:<wallet>`. Resolved KV cache → lookup by name → create on first use. `group_id` is signed into the URL, so the uploader cannot file the pin anywhere else. If the group can't be resolved the request `502`s and **no URL is minted**.
+Every presigned URL is scoped to a Pinata **group** named `<PINATA_GROUP_PREFIX>:<wallet>` (or `<PINATA_GROUP_PREFIX>:<appId>:<wallet>` for an app-scoped upload). Resolved KV cache → lookup by name → create on first use. `group_id` is signed into the URL, so the uploader cannot file the pin anywhere else. If the group can't be resolved the request `502`s and **no URL is minted**.
 
 To retire testnet data:
 

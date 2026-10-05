@@ -10,6 +10,10 @@
  *      check whether that public key is registered. If not, the caller is told to
  *      register at fangorn.network. This can be stubbed for local dev with
  *      STUB_REGISTRATION_CHECK="true".
+ *   2b. If the caller passes an `appId`, the upload is billed to the APP's storage
+ *      subscription rather than the caller's own: they must also be an active
+ *      publisher in that app (AppRegistry.isRegisteredForApp), and the quota +
+ *      subscription window are the app owner's (SubscriptionRegistry.isAppSubscribed).
  *   3. If registered, the worker mints a short-lived Pinata *presigned upload URL*
  *      and returns it, so the caller can pin one file to IPFS without ever seeing
  *      your Pinata JWT.
@@ -71,6 +75,13 @@ export default {
       return json(400, { error: 'Provide a valid EVM address via ?address=0x… or JSON body { "address": "0x…" }.' }, cors);
     }
 
+    // Optional app scope. Publishing under an app charges the app owner's storage
+    // subscription instead of the caller's own. See the app block below.
+    const appId = input.appId ? input.appId.toLowerCase() : null;
+    if (appId && !isBytes32(appId)) {
+      return json(400, { error: 'appId must be a 32-byte hex string (0x + 64 hex chars).' }, cors);
+    }
+
     // Prove the caller controls `address` via a signed challenge (always required).
     const ownership = await verifyCallerOwnsAddress(input, address, env);
     if (!ownership.ok) {
@@ -90,6 +101,7 @@ export default {
     // TODO: is this needed?
     const stubbed = (env.STUB_REGISTRATION_CHECK ?? 'false') === 'true';
     let access = null;
+    let app = null; // { subscribed, owner, paidAt } when publishing under an appId
     if (!stubbed) {
       try {
         access = await readAccess(env, address);
@@ -104,7 +116,44 @@ export default {
           error: `This public key is not registered. Please login on ${registerUrl} to register.`,
         }, cors);
       }
+
+      // App-level subscription. Registration in the DataRegistry (above) says the
+      // wallet is a publisher at all. Publishing under an app additionally
+      // requires active membership in that app, since the app owner's storage is
+      // what pays for it.
+      if (appId) {
+        try {
+          if (!(await isAppMember(env, appId, address))) {
+            const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
+            return json(403, {
+              ok: false,
+              address,
+              error: `This public key is not an active publisher for app ${appId}. Please join the app on ${registerUrl}.`,
+            }, cors);
+          }
+          app = await readAppSubscription(env, appId);
+          if (app.owner === ZERO_ADDRESS) {
+            // Unclaimed app: nobody's subscription can pay, and billing quota to
+            // the zero address would pool every unknown app into one bucket.
+            return json(403, {
+              ok: false,
+              address,
+              error: `App ${appId} has no owner on-chain.`,
+            }, cors);
+          }
+          // The owner's last payment, for the same window a solo publisher gets.
+          // `subscribed === false` already means paidAt is 0, so skip that read.
+          app.paidAt = app.subscribed ? (await readAccess(env, app.owner)).paidAt : 0n;
+        } catch (err) {
+          return json(502, { error: 'On-chain app check failed.', detail: String(err?.message || err) }, cors);
+        }
+      }
     }
+
+    // Whose storage this upload is billed to: the app owner when publishing under
+    // an appId (one subscription covers all of that app's publishers), otherwise
+    // the caller themselves. Stub mode has no owner, so it bills the caller.
+    const quota = app ? app.owner : address;
 
     // Resolve the upload size the caller declared (the SDK sends its exact byte
     // length). Absent → a back-compat default. Bounded per-request so nobody can
@@ -142,7 +191,7 @@ export default {
     let total = 0;
     let charge = cap.active || free.active;
     if (charge && input.uploadId) {
-      const paid = await paidSize(env, address, input.uploadId);
+      const paid = await paidSize(env, quota, input.uploadId);
       if (paid !== null && size <= paid) charge = false; // already granted on a prior attempt
     }
     if (charge) {
@@ -150,25 +199,28 @@ export default {
       // the wallet must have an active on-chain subscription (fee paid within the
       // window). The upload that first crosses the limit already needs one.
       if (free.active) {
-        total = await currentTotal(env, address);
+        total = await currentTotal(env, quota);
         if (total + size > free.limit) {
           // Past the free tier: require an active subscription (fee paid within the
-          // window). We already have paidAt from the access() read above. Stub mode
-          // has no chain data → treat as active for dev.
-          const active = stubbed || isWithinWindow(env, access.paidAt);
+          // window) from whoever is being billed — the app owner's paidAt for an
+          // app-scoped upload, else the caller's from the access() read above. Stub
+          // mode has no chain data → treat as active for dev.
+          const active = stubbed || isWithinWindow(env, app ? app.paidAt : access.paidAt);
           if (!active) {
             const subscribeUrl = env.SUBSCRIBE_URL || 'https://fangorn.network/subscribe';
             return json(402, {
               ok: false,
               address,
-              error: `To continue using Fangorn's storage, please sign up for a subscription at ${subscribeUrl}`,
+              error: app
+                ? `The storage subscription for app ${appId} is inactive. Its owner (${app.owner}) must subscribe at ${subscribeUrl}`
+                : `To continue using Fangorn's storage, please sign up for a subscription at ${subscribeUrl}`,
             }, cors);
           }
         }
       }
       // Daily ceiling still applies to everyone (free and subscribed) as an abuse guard.
       if (cap.active) {
-        used = await currentUsage(env, address);
+        used = await currentUsage(env, quota);
         if (used + size > cap.limit) {
           return json(429, {
             ok: false,
@@ -183,13 +235,13 @@ export default {
     // the requested size (plus a little multipart/form-data headroom).
     try {
       const maxFileSize = size + UPLOAD_HEADROOM;
-      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address);
+      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, appId);
       if (charge) {
         // Keep the lifetime counter climbing (even past the free limit) so a
         // wallet can't dip back under it after crossing and get free uploads again.
-        if (free.active) await recordTotal(env, address, total, size);
-        if (cap.active) await recordUsage(env, address, used, size);
-        if (input.uploadId) await markPaid(env, address, input.uploadId, size);
+        if (free.active) await recordTotal(env, quota, total, size);
+        if (cap.active) await recordUsage(env, quota, used, size);
+        if (input.uploadId) await markPaid(env, quota, input.uploadId, size);
       }
       return json(200, {
         ok: true,
@@ -217,12 +269,21 @@ export default {
 // the version bump is the repoint: both move together or neither does.
 const DEFAULT_RPC_URL = FangornConfig.rpcUrl;
 const SDK_SUBSCRIPTION_ADDRESS = FangornConfig.subscriptionRegistryContractAddress;
+const SDK_APP_REGISTRY_ADDRESS = FangornConfig.appRegistryContractAddress;
 
 // The SubscriptionRegistry view `access(address) -> (bool registered, uint64 paidAt)`.
 // It cross-calls DataRegistry.isRegistered internally, so this single read gives the
 // worker both the registration gate and the subscription timestamp. Stylus exposes
 // the Rust method as camelCase.
 const DEFAULT_ACCESS_FUNCTION = 'access(address)';
+
+// Per-app views. `isRegisteredForApp` lives on the AppRegistry (false for a
+// suspended app, a suspended publisher, or stale accepted terms); `isAppSubscribed`
+// on the SubscriptionRegistry resolves the app's owner through the DataRegistry and
+// reports whether that owner has ever paid.
+const APP_MEMBER_FUNCTION = 'isRegisteredForApp(bytes32,address)';
+const APP_SUBSCRIBED_FUNCTION = 'isAppSubscribed(bytes32)';
+const ZERO_ADDRESS = '0x' + '0'.repeat(40);
 
 /**
  * Which SubscriptionRegistry to gate on. The SDK's, unless the deployment explicitly
@@ -259,6 +320,68 @@ function subscriptionAddress(env) {
 }
 
 /**
+ * Which AppRegistry to check membership against. Always the SDK's: it is the same
+ * deployment set as the SubscriptionRegistry above (whose `isAppSubscribed` resolves
+ * the AppRegistry through the DataRegistry), so an override here could only
+ * disagree with the contract's own view of the world.
+ */
+function appRegistryAddress() {
+  if (!isAddress(SDK_APP_REGISTRY_ADDRESS || '')) {
+    throw new Error(
+      `The Fangorn SDK supplied no valid appRegistryContractAddress ("${SDK_APP_REGISTRY_ADDRESS}"); `
+      + 'upgrade @fangorn-network/sdk to one that carries it.');
+  }
+  return SDK_APP_REGISTRY_ADDRESS;
+}
+
+/** One `eth_call`: ABI signature + already-encoded 32-byte argument words → raw hex. */
+async function ethCall(env, to, signature, words) {
+  const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
+  const data = toFunctionSelector(signature) + words.join('');
+
+  const res = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'eth_call',
+      params: [{ to, data }, 'latest'],
+    }),
+  });
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+
+  const body = await res.json();
+  if (body.error) throw new Error(`RPC error: ${body.error.message || JSON.stringify(body.error)}`);
+  return body.result;
+}
+
+/**
+ * Is `address` an active publisher *in this app*? DataRegistry registration (the
+ * `access()` read above) is network-wide; this is the per-app membership the
+ * DataRegistry itself enforces on `commitStateRoot`, checked here so the upload
+ * can't be minted for a push that would revert.
+ */
+async function isAppMember(env, appId, address) {
+  const result = await ethCall(env, appRegistryAddress(), APP_MEMBER_FUNCTION, [
+    encodeBytes32(appId),
+    encodeAddress(address),
+  ]);
+  return wordAt(result, 0) !== 0n;
+}
+
+/**
+ * `isAppSubscribed(bytes32) -> (bool subscribed, address owner)` on the
+ * SubscriptionRegistry. `owner` is ZERO for an unclaimed app; `subscribed` is
+ * "has ever paid" — the active *window* is applied here, off-chain, from the
+ * owner's paidAt (see isWithinWindow).
+ */
+async function readAppSubscription(env, appId) {
+  const result = await ethCall(env, subscriptionAddress(env), APP_SUBSCRIBED_FUNCTION, [encodeBytes32(appId)]);
+  return { subscribed: wordAt(result, 0) !== 0n, owner: addressAt(result, 1) };
+}
+
+/**
  * One `eth_call` to the SubscriptionRegistry's `access(address)` view, returning
  * `{ registered, paidAt }`. `registered` is the contract's cross-call to
  * DataRegistry.isRegistered; `paidAt` is the wallet's last subscription timestamp
@@ -274,28 +397,11 @@ function subscriptionAddress(env) {
  *   ACCESS_FUNCTION                ABI signature (optional; default "access(address)").
  */
 async function readAccess(env, address) {
-  const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
-  const contract = subscriptionAddress(env);
-
-  const data = toFunctionSelector(env.ACCESS_FUNCTION || DEFAULT_ACCESS_FUNCTION) + encodeAddress(address);
-
-  const res = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'eth_call',
-      params: [{ to: contract, data }, 'latest'],
-    }),
-  });
-  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-
-  const body = await res.json();
-  if (body.error) throw new Error(`RPC error: ${body.error.message || JSON.stringify(body.error)}`);
-
+  const result = await ethCall(env, subscriptionAddress(env), env.ACCESS_FUNCTION || DEFAULT_ACCESS_FUNCTION, [
+    encodeAddress(address),
+  ]);
   // access() returns two 32-byte words: [0] bool registered, [1] uint64 paidAt.
-  return { registered: wordAt(body.result, 0) !== 0n, paidAt: wordAt(body.result, 1) };
+  return { registered: wordAt(result, 0) !== 0n, paidAt: wordAt(result, 1) };
 }
 
 /**
@@ -395,10 +501,11 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
  * job lists groups by name prefix and unpins their files, without needing any
  * record of what was uploaded.
  *
- * Name is `${PINATA_GROUP_PREFIX}:${address}` — per wallet, namespaced by
- * deployment. The prefix is REQUIRED: a pin filed under no group (or under an
- * unlabelled one) is a pin no cleanup job can find, which defeats the point, so
- * an unset prefix fails the request rather than minting.
+ * Name is `${PINATA_GROUP_PREFIX}:${address}`, or `${prefix}:${appId}:${address}`
+ * when publishing under an app — per wallet, namespaced by deployment and by app,
+ * so an app's pins sweep as a unit. The prefix is REQUIRED: a pin filed under no
+ * group (or under an unlabelled one) is a pin no cleanup job can find, which
+ * defeats the point, so an unset prefix fails the request rather than minting.
  *
  * Resolution order: KV cache → look up by name → create. The by-name lookup is
  * what stops a lost KV entry from forking one wallet's pins across two groups.
@@ -408,10 +515,10 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
  * both get caught — and self-heals once one wins the cache. A Durable Object
  * would serialize it, same trade-off as the KV byte counters above.
  */
-async function walletGroupId(env, address) {
+async function walletGroupId(env, address, appId) {
   const prefix = (env.PINATA_GROUP_PREFIX || '').trim();
   if (!prefix) throw new Error('PINATA_GROUP_PREFIX is not set (every upload must be filed under a group).');
-  const name = `${prefix}:${address}`;
+  const name = [prefix, appId, address].filter(Boolean).join(':');
   const key = `group:${name}`;
 
   // Lifetime cache (no TTL) — a wallet's group never changes.
@@ -461,7 +568,7 @@ async function pinataJson(url, init) {
  *
  * Docs: https://docs.pinata.cloud/files/presigned-urls
  */
-async function createPinataUploadUrl(env, maxFileSize, address) {
+async function createPinataUploadUrl(env, maxFileSize, address, appId) {
   if (!env.PINATA_JWT) throw new Error('PINATA_JWT is not set.');
 
   const payload = {
@@ -469,7 +576,7 @@ async function createPinataUploadUrl(env, maxFileSize, address) {
     expires: Number(env.PINATA_URL_EXPIRES || 300),
     date: Math.floor(Date.now() / 1000),
     max_file_size: maxFileSize,
-    group_id: await walletGroupId(env, address),
+    group_id: await walletGroupId(env, address, appId),
   };
   if (env.PINATA_ALLOW_MIME_TYPES) {
     payload.allow_mime_types = env.PINATA_ALLOW_MIME_TYPES.split(',').map((s) => s.trim()).filter(Boolean);
@@ -599,6 +706,7 @@ async function readInput(request) {
     signature: q.get('signature')?.trim() || undefined,
     size: q.get('size')?.trim() || undefined,        // declared upload size, bytes
     uploadId: q.get('uploadId')?.trim() || undefined, // idempotency key across retries
+    appId: q.get('appId')?.trim() || undefined,      // bill the app owner's subscription
   };
   if (request.method === 'POST') {
     const body = await request.json().catch(() => null);
@@ -610,6 +718,7 @@ async function readInput(request) {
         out.size = String(body.size);
       }
       if (!out.uploadId && typeof body.uploadId === 'string') out.uploadId = body.uploadId.trim();
+      if (!out.appId && typeof body.appId === 'string') out.appId = body.appId.trim();
     }
   }
   return out;
@@ -619,9 +728,23 @@ function isAddress(a) {
   return /^0x[0-9a-fA-F]{40}$/.test(a);
 }
 
+function isBytes32(v) {
+  return /^0x[0-9a-fA-F]{64}$/.test(v);
+}
+
+/** A 32-byte hex value as a bare ABI word (hex, no 0x prefix). */
+function encodeBytes32(value) {
+  return value.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+}
+
 /** Left-pads a 20-byte address to a 32-byte ABI word (hex, no 0x prefix). */
 function encodeAddress(address) {
   return address.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+}
+
+/** Reads the i-th 32-byte word of an eth_call result as a lowercase address. */
+function addressAt(result, i) {
+  return '0x' + wordAt(result, i).toString(16).padStart(40, '0');
 }
 
 /** Reads the i-th 32-byte word (0-indexed) of an eth_call result as a bigint. */
