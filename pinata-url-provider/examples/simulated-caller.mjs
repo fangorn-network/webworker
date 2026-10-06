@@ -15,6 +15,8 @@
  *   WORKER_URL    Worker base URL (default http://localhost:8787).
  *   PRIVATE_KEY   0x-prefixed 32-byte secp256k1 key. Omit to use the demo key
  *                 below — NEVER use that key for anything real.
+ *   APP_ID        Optional 32-byte hex app id to publish under (billed to the app
+ *                 owner). Omit to publish to the default app on your own budget.
  */
 
 import { privateKeyToAccount } from 'viem/accounts';
@@ -24,6 +26,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 const DEMO_PRIVATE_KEY = '0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
 const WORKER_URL = process.argv[2] || process.env.WORKER_URL || 'http://localhost:8787';
+const appId = process.env.APP_ID || undefined; // undefined drops out of the JSON body
 
 async function postJson(body) {
   const res = await fetch(WORKER_URL, {
@@ -47,7 +50,7 @@ async function main() {
 
   // 1) Ask the worker for a challenge (no signature yet → 401).
   console.log('\n[1] Requesting challenge (unsigned)…');
-  const first = await postJson({ address });
+  const first = await postJson({ address, appId });
   console.log(`    → HTTP ${first.status}`);
   const challenge = first.json.challenge;
   if (first.status !== 401 || !challenge) {
@@ -62,7 +65,7 @@ async function main() {
 
   // 3) Resend with the proof.
   console.log('\n[3] Resending with { address, message, signature }…');
-  const second = await postJson({ address, message: challenge, signature });
+  const second = await postJson({ address, message: challenge, signature, appId });
   console.log(`    → HTTP ${second.status}`);
   console.log('    ' + JSON.stringify(second.json, null, 2).split('\n').join('\n    '));
 
@@ -71,7 +74,7 @@ async function main() {
     console.log('  ✔ Ownership proven AND address registered — got an upload URL.');
     console.log(`uploadUrl: ${JSON.stringify(second.json.uploadUrl)}`)
   } else if (second.status === 403) {
-    console.log('  ✔ Ownership proven (signature accepted). ✘ This address is not registered.');
+    console.log('  ✔ Ownership proven (signature accepted). ✘ Publishing refused — see `error` above.');
   } else if (second.status === 401) {
     console.log('  ✘ Ownership check rejected the signature. See the error above.');
   } else {

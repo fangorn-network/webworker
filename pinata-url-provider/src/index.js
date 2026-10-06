@@ -10,10 +10,12 @@
  *      check whether that public key is registered. If not, the caller is told to
  *      register at fangorn.network. This can be stubbed for local dev with
  *      STUB_REGISTRATION_CHECK="true".
- *   2b. If the caller passes an `appId`, the upload is billed to the APP's storage
- *      subscription rather than the caller's own: they must also be an active
- *      publisher in that app (AppRegistry.isRegisteredForApp), and the quota +
- *      subscription window are the app owner's (SubscriptionRegistry.isAppSubscribed).
+ *   2b. The caller must also be an active publisher in the app they publish to
+ *      (AppRegistry.isRegisteredForApp — false for a suspended app, a suspended
+ *      publisher, or stale accepted terms). That app is the `appId` they pass, else
+ *      the SDK's default app. Passing an `appId` additionally bills the upload to
+ *      the APP owner's storage subscription (AppRegistry.getAppOwner) rather than
+ *      the caller's own: the quota + subscription window are then the owner's.
  *   3. If registered, the worker mints a short-lived Pinata *presigned upload URL*
  *      and returns it, so the caller can pin one file to IPFS without ever seeing
  *      your Pinata JWT.
@@ -27,7 +29,7 @@ import { recoverMessageAddress, toFunctionSelector } from 'viem';
 // Deep import on purpose: `lib/config.js` pulls in nothing but viem, while the SDK's
 // package root reaches the harness (node `fs`/`path`) and the graph engine — none of
 // which a workerd bundle can or should carry.
-import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
+import { DEFAULT_APP, FangornConfig, toAppId } from '@fangorn-network/sdk/lib/config.js';
 
 export default {
   async fetch(request, env) {
@@ -101,10 +103,14 @@ export default {
     // TODO: is this needed?
     const stubbed = (env.STUB_REGISTRATION_CHECK ?? 'false') === 'true';
     let access = null;
-    let app = null; // { subscribed, owner, paidAt } when publishing under an appId
+    let app = null; // { owner, paidAt } when publishing under an appId
     if (!stubbed) {
+      let suspended = false;
       try {
         access = await readAccess(env, address);
+        // Failure path only: `registered` is false for a suspended publisher too,
+        // and telling them to register is the wrong advice.
+        if (!access.registered) suspended = await isSuspendedPublisher(env, address);
       } catch (err) {
         return json(502, { error: 'On-chain access check failed.', detail: String(err?.message || err) }, cors);
       }
@@ -113,26 +119,32 @@ export default {
         return json(403, {
           ok: false,
           address,
-          error: `This public key is not registered. Please login on ${registerUrl} to register.`,
+          error: suspended
+            ? 'This public key has been suspended from publishing on Fangorn.'
+            : `This public key is not registered. Please login on ${registerUrl} to register.`,
         }, cors);
       }
 
-      // App-level subscription. Registration in the DataRegistry (above) says the
-      // wallet is a publisher at all. Publishing under an app additionally
-      // requires active membership in that app, since the app owner's storage is
-      // what pays for it.
-      if (appId) {
-        try {
-          if (!(await isAppMember(env, appId, address))) {
-            const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
-            return json(403, {
-              ok: false,
-              address,
-              error: `This public key is not an active publisher for app ${appId}. Please join the app on ${registerUrl}.`,
-            }, cors);
-          }
-          app = await readAppSubscription(env, appId);
-          if (app.owner === ZERO_ADDRESS) {
+      // App membership. Registration in the DataRegistry (above) says the wallet is
+      // a publisher at all; every publish also lands in an app, and the DataRegistry
+      // rejects the commit unless the wallet is an active publisher there. So this
+      // runs on every request — against the SDK's default app when none is named —
+      // rather than minting a URL for a push that would revert.
+      try {
+        const publishApp = appId || DEFAULT_APP_ID;
+        if (!(await isAppMember(env, publishApp, address))) {
+          return json(403, {
+            ok: false,
+            address,
+            error: await appDenialReason(env, publishApp, address),
+          }, cors);
+        }
+
+        // App-level subscription: only an explicit appId moves the bill to the
+        // app owner. The default app's owner does not pay for everyone.
+        if (appId) {
+          const owner = await readAppOwner(env, appId);
+          if (owner === ZERO_ADDRESS) {
             // Unclaimed app: nobody's subscription can pay, and billing quota to
             // the zero address would pool every unknown app into one bucket.
             return json(403, {
@@ -142,11 +154,12 @@ export default {
             }, cors);
           }
           // The owner's last payment, for the same window a solo publisher gets.
-          // `subscribed === false` already means paidAt is 0, so skip that read.
-          app.paidAt = app.subscribed ? (await readAccess(env, app.owner)).paidAt : 0n;
-        } catch (err) {
-          return json(502, { error: 'On-chain app check failed.', detail: String(err?.message || err) }, cors);
+          // An owner publishing to their own app was already read above.
+          const paidAt = owner === address ? access.paidAt : (await readAccess(env, owner)).paidAt;
+          app = { owner, paidAt };
         }
+      } catch (err) {
+        return json(502, { error: 'On-chain app check failed.', detail: String(err?.message || err) }, cors);
       }
     }
 
@@ -277,13 +290,23 @@ const SDK_APP_REGISTRY_ADDRESS = FangornConfig.appRegistryContractAddress;
 // the Rust method as camelCase.
 const DEFAULT_ACCESS_FUNCTION = 'access(address)';
 
-// Per-app views. `isRegisteredForApp` lives on the AppRegistry (false for a
-// suspended app, a suspended publisher, or stale accepted terms); `isAppSubscribed`
-// on the SubscriptionRegistry resolves the app's owner through the DataRegistry and
-// reports whether that owner has ever paid.
+// Per-app views, all on the AppRegistry. `isRegisteredForApp` is the gate (false for
+// a suspended app, a suspended publisher, or stale accepted terms); `getAppOwner`
+// names who an app-scoped upload is billed to. The other two are read only to
+// explain a denial — see appDenialReason().
 const APP_MEMBER_FUNCTION = 'isRegisteredForApp(bytes32,address)';
-const APP_SUBSCRIBED_FUNCTION = 'isAppSubscribed(bytes32)';
+const APP_OWNER_FUNCTION = 'getAppOwner(bytes32)';
+const APP_SUSPENDED_FUNCTION = 'isAppSuspended(bytes32)';
+const APP_STATUS_FUNCTION = 'statusForApp(bytes32,address)';
+// DataRegistry's network-wide lifecycle status, likewise only to explain a denial.
+const PUBLISHER_STATUS_FUNCTION = 'getPublisherStatus(address)';
+// Lifecycle codes shared by both registries (0 = unregistered).
+const STATUS_ACTIVE = 1n;
+const STATUS_SUSPENDED = 2n;
 const ZERO_ADDRESS = '0x' + '0'.repeat(40);
+// The app a publish lands in when the caller names none — the same fallback the SDK
+// applies to its registry clients, so the check here matches the commit that follows.
+const DEFAULT_APP_ID = toAppId(DEFAULT_APP);
 
 /**
  * Which SubscriptionRegistry to gate on. The SDK's, unless the deployment explicitly
@@ -320,10 +343,9 @@ function subscriptionAddress(env) {
 }
 
 /**
- * Which AppRegistry to check membership against. Always the SDK's: it is the same
- * deployment set as the SubscriptionRegistry above (whose `isAppSubscribed` resolves
- * the AppRegistry through the DataRegistry), so an override here could only
- * disagree with the contract's own view of the world.
+ * Which AppRegistry to check membership against. Always the SDK's: it is the one the
+ * SDK's DataRegistry consults on `commitStateRoot`, so an override here could only
+ * disagree with the contract that decides whether the publish lands.
  */
 function appRegistryAddress() {
   if (!isAddress(SDK_APP_REGISTRY_ADDRESS || '')) {
@@ -371,14 +393,51 @@ async function isAppMember(env, appId, address) {
 }
 
 /**
- * `isAppSubscribed(bytes32) -> (bool subscribed, address owner)` on the
- * SubscriptionRegistry. `owner` is ZERO for an unclaimed app; `subscribed` is
- * "has ever paid" — the active *window* is applied here, off-chain, from the
- * owner's paidAt (see isWithinWindow).
+ * `getAppOwner(bytes32) -> address` on the AppRegistry: whose storage subscription
+ * an app-scoped upload is billed to. ZERO for an unclaimed app.
  */
-async function readAppSubscription(env, appId) {
-  const result = await ethCall(env, subscriptionAddress(env), APP_SUBSCRIBED_FUNCTION, [encodeBytes32(appId)]);
-  return { subscribed: wordAt(result, 0) !== 0n, owner: addressAt(result, 1) };
+async function readAppOwner(env, appId) {
+  const result = await ethCall(env, appRegistryAddress(), APP_OWNER_FUNCTION, [encodeBytes32(appId)]);
+  return addressAt(result, 0);
+}
+
+/**
+ * Why `isRegisteredForApp` said no. That view folds several causes into one bool,
+ * and "join the app" is the wrong advice for most of them, so ask the AppRegistry
+ * which it was. Failure path only — a granted upload makes none of these reads.
+ */
+async function appDenialReason(env, appId, address) {
+  const apps = appRegistryAddress();
+  const id = encodeBytes32(appId);
+  const [owner, suspended, status] = await Promise.all([
+    ethCall(env, apps, APP_OWNER_FUNCTION, [id]),
+    ethCall(env, apps, APP_SUSPENDED_FUNCTION, [id]),
+    ethCall(env, apps, APP_STATUS_FUNCTION, [id, encodeAddress(address)]),
+  ]);
+  const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
+  if (addressAt(owner, 0) === ZERO_ADDRESS) return `App ${appId} has no owner on-chain.`;
+  if (wordAt(suspended, 0) !== 0n) return `App ${appId} is suspended.`;
+  switch (wordAt(status, 0)) {
+    case STATUS_SUSPENDED:
+      return `This public key is suspended from app ${appId}.`;
+    case STATUS_ACTIVE:
+      // Still a member, but on a terms hash the app has since moved off (or the
+      // app has none set).
+      return `This public key has not accepted the current terms of app ${appId}. Please accept them on ${registerUrl}.`;
+    default:
+      return `This public key is not an active publisher for app ${appId}. Please join the app on ${registerUrl}.`;
+  }
+}
+
+/**
+ * Is `address` suspended network-wide? `access()` only reports `registered: false`,
+ * which is also what a wallet that never registered reads as.
+ */
+async function isSuspendedPublisher(env, address) {
+  const result = await ethCall(env, FangornConfig.dataRegistryContractAddress, PUBLISHER_STATUS_FUNCTION, [
+    encodeAddress(address),
+  ]);
+  return wordAt(result, 0) === STATUS_SUSPENDED;
 }
 
 /**

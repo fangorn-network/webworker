@@ -3,8 +3,8 @@
  *
  * The worker is a plain `(request, env) => Response` over standard Web APIs, so
  * we call it directly (no miniflare) and stub the three outbound `fetch`es it
- * makes: the SubscriptionRegistry `access()` eth_call (RPC), the Pinata groups
- * API, and the Pinata `sign` endpoint. Ownership signatures are real EIP-191
+ * makes: the registry eth_calls (RPC — `access()` plus the AppRegistry views), the
+ * Pinata groups API, and the Pinata `sign` endpoint. Ownership signatures are real EIP-191
  * personal_signs via viem, the same lib the worker uses to recover them.
  *
  * Run:  node --test   (from pinata-url-provider/)
@@ -16,7 +16,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { toFunctionSelector } from 'viem';
 
 import worker from '../src/index.js';
-import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
+import { DEFAULT_APP, FangornConfig, toAppId } from '@fangorn-network/sdk/lib/config.js';
 
 /* ── outbound fetch stub ─────────────────────────────────────────────────── */
 // Routes by URL: the Pinata sign endpoint → `pinataResponse`, the Pinata groups
@@ -29,7 +29,7 @@ let pinataResponse = null;
 let groupsResponse = null;
 let lastPinataInit = null; // request init captured from the Pinata sign call
 let groupCalls = [];       // { url, init } per Pinata groups API call
-let lastRpcCall = null;    // parsed JSON-RPC body of the last eth_call
+let rpcCalls = [];         // parsed JSON-RPC body of each eth_call, in order
 
 before(() => {
   globalThis.fetch = async (url, init) => {
@@ -45,7 +45,7 @@ before(() => {
       return groupsResponse(u, init);
     }
     if (!rpcResponse) throw new Error('unexpected RPC fetch');
-    lastRpcCall = JSON.parse(init.body);
+    rpcCalls.push(JSON.parse(init.body));
     return rpcResponse(u, init);
   };
 });
@@ -54,7 +54,7 @@ beforeEach(() => {
   rpcResponse = null;
   pinataResponse = null;
   lastPinataInit = null;
-  lastRpcCall = null;
+  rpcCalls = [];
   groupCalls = [];
   // Default: no existing group → the worker creates one.
   groupsResponse = (u, init) =>
@@ -71,7 +71,9 @@ const pinataOk = () => jsonResponse(200, { data: 'https://uploads.pinata.cloud/s
 const GROUP_ID = 'ad4bc3bf-8794-49e7-94ff-fea1ce745779';
 
 // The SubscriptionRegistry `access(address)` view returns two 32-byte words:
-// [0] bool registered, [1] uint64 paidAt (Unix seconds). One eth_call per request.
+// [0] bool registered, [1] uint64 paidAt (Unix seconds). This stub answers every
+// eth_call with that shape, so word [0] doubles as the follow-up read: a registered
+// wallet's isRegisteredForApp reads true, an unregistered one's status reads 0.
 const accessRpc = ({ registered = true, paidAt = 0 } = {}) =>
   () => jsonResponse(200, { result: '0x' + wordHex(registered ? 1 : 0) + wordHex(paidAt) });
 const registeredRpc = accessRpc({ registered: true });
@@ -87,21 +89,28 @@ const ACCOUNT = privateKeyToAccount('0x' + '11'.repeat(32));
 const OTHER = privateKeyToAccount('0x' + '22'.repeat(32));
 const OWNER = privateKeyToAccount('0x' + '33'.repeat(32));
 
-/* ── app-scoped eth_call stub ────────────────────────────────────────────── */
-// An app-scoped request makes up to four eth_calls, so route them by selector:
-// the caller's access(), AppRegistry.isRegisteredForApp(), isAppSubscribed(),
-// and — only when the app has ever paid — the owner's access() for paidAt.
+/* ── per-view eth_call stub ──────────────────────────────────────────────── */
+// Routes eth_calls by selector, for tests that need the views to disagree: the
+// caller's access(), AppRegistry.isRegisteredForApp(), getAppOwner() and the owner's
+// access() for an app-scoped upload, plus the reads that explain a denial.
 const APP_ID = '0x' + 'ab'.repeat(32);
+const DEFAULT_APP_ID = toAppId(DEFAULT_APP);
 const SELECTOR = {
   access: toFunctionSelector('access(address)'),
   member: toFunctionSelector('isRegisteredForApp(bytes32,address)'),
-  appSubscribed: toFunctionSelector('isAppSubscribed(bytes32)'),
+  owner: toFunctionSelector('getAppOwner(bytes32)'),
+  appSuspended: toFunctionSelector('isAppSuspended(bytes32)'),
+  status: toFunctionSelector('statusForApp(bytes32,address)'),
+  publisherStatus: toFunctionSelector('getPublisherStatus(address)'),
 };
+const callsTo = (selector) => rpcCalls.filter((c) => c.params[0].data.startsWith(selector));
 
 function appRpc({
   registered = true,
+  publisherStatus = registered ? 1 : 0, // DataRegistry: 0 unregistered, 1 active, 2 suspended
   member = true,
-  subscribed = true,
+  appSuspended = false,
+  status = member ? 1 : 0,              // AppRegistry, same codes, per app
   owner = OWNER.address,
   ownerPaidAt = nowSec(),
 } = {}) {
@@ -110,11 +119,17 @@ function appRpc({
     switch (data.slice(0, 10)) {
       case SELECTOR.member:
         return jsonResponse(200, { result: '0x' + wordHex(member ? 1 : 0) });
-      case SELECTOR.appSubscribed:
-        return jsonResponse(200, { result: '0x' + wordHex(subscribed ? 1 : 0) + wordHex(BigInt(owner)) });
+      case SELECTOR.owner:
+        return jsonResponse(200, { result: '0x' + wordHex(BigInt(owner)) });
+      case SELECTOR.appSuspended:
+        return jsonResponse(200, { result: '0x' + wordHex(appSuspended ? 1 : 0) });
+      case SELECTOR.status:
+        return jsonResponse(200, { result: '0x' + wordHex(status) });
+      case SELECTOR.publisherStatus:
+        return jsonResponse(200, { result: '0x' + wordHex(publisherStatus) });
       case SELECTOR.access: {
-        // access() is read for the caller (registration) and, past the free tier,
-        // for the owner (paidAt) — tell them apart by the address argument.
+        // access() is read for the caller (registration) and for the app owner
+        // (paidAt) — tell them apart by the address argument.
         const arg = '0x' + data.slice(34, 74);
         const isOwner = arg.toLowerCase() === owner.toLowerCase();
         return jsonResponse(200, { result: '0x' + wordHex(registered ? 1 : 0) + wordHex(isOwner ? ownerPaidAt : 0) });
@@ -285,7 +300,7 @@ test('unsupported method → 405', async () => {
   assert.equal(res.status, 405);
 });
 
-test('gate contract comes from the SDK, with no address configured', async () => {
+test('gate contracts come from the SDK, with no address configured', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = pinataOk;
   const res = await call(baseEnv(), { body: await proof() });
@@ -294,9 +309,12 @@ test('gate contract comes from the SDK, with no address configured', async () =>
   // against the SDK is what would have caught the worker sitting on a stale
   // SubscriptionRegistry while the SDK had moved on.
   assert.equal(
-    lastRpcCall.params[0].to.toLowerCase(),
+    rpcCalls[0].params[0].to.toLowerCase(),
     FangornConfig.subscriptionRegistryContractAddress.toLowerCase(),
   );
+  // Likewise the membership read, which goes to the AppRegistry.
+  const [member] = callsTo(SELECTOR.member);
+  assert.equal(member.params[0].to.toLowerCase(), FangornConfig.appRegistryContractAddress.toLowerCase());
 });
 
 test('SUBSCRIPTION_CONTRACT_ADDRESS overrides the SDK when set', async () => {
@@ -305,7 +323,7 @@ test('SUBSCRIPTION_CONTRACT_ADDRESS overrides the SDK when set', async () => {
   const override = '0x9a3811b365a4aeea1626eaad185b273424ae5e48';
   const res = await call(baseEnv({ SUBSCRIPTION_CONTRACT_ADDRESS: override }), { body: await proof() });
   assert.equal(res.status, 200);
-  assert.equal(lastRpcCall.params[0].to.toLowerCase(), override);
+  assert.equal(rpcCalls[0].params[0].to.toLowerCase(), override);
 });
 
 test('non-stubbed + unusable address → 502 (no silent fallback)', async () => {
@@ -362,6 +380,14 @@ test('address not registered → 403', async () => {
   const res = await call(baseEnv({ REGISTER_URL: 'https://fangorn.network' }), { body: await proof() });
   assert.equal(res.status, 403);
   assert.match(res.json.error, /not registered/);
+});
+
+test('publisher suspended network-wide → 403 that says so, not "register"', async () => {
+  rpcResponse = appRpc({ registered: false, publisherStatus: 2 }); // pinataResponse null: a mint would throw
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /suspended from publishing/i);
+  assert.doesNotMatch(res.json.error, /register/i);
 });
 
 test('RPC failure → 502', async () => {
@@ -519,6 +545,68 @@ test('retry past the free tier (same uploadId) is charged once', async () => {
   assert.equal(kv._store.get(totalKey(ACCOUNT)), '11000'); // 9000 + 2000 once, not twice
 });
 
+/* ── app membership (every request) ──────────────────────────────────────── */
+
+test('no appId → membership is checked against the default app, caller is billed', async () => {
+  rpcResponse = appRpc();
+  pinataResponse = pinataOk;
+  const kv = mockKV();
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 4000 } });
+  assert.equal(res.status, 200);
+  // isRegisteredForApp(defaultApp, caller): selector, then the two argument words.
+  const [member] = callsTo(SELECTOR.member);
+  assert.equal(
+    member.params[0].data,
+    SELECTOR.member + DEFAULT_APP_ID.slice(2) + ACCOUNT.address.slice(2).toLowerCase().padStart(64, '0'),
+  );
+  // No appId named → nobody else pays, and the owner is never looked up.
+  assert.equal(kv._store.get(totalKey(ACCOUNT)), '4000');
+  assert.equal(callsTo(SELECTOR.owner).length, 0);
+});
+
+test('no appId + not a member of the default app → 403 (never mints)', async () => {
+  rpcResponse = appRpc({ member: false }); // pinataResponse null: a mint would throw
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, new RegExp(`not an active publisher for app ${DEFAULT_APP_ID}`));
+});
+
+test('suspended app → 403 that names the suspension (never mints)', async () => {
+  // Memberships survive an app takedown, so the caller is still ACTIVE underneath.
+  rpcResponse = appRpc({ member: false, appSuspended: true, status: 1 });
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, new RegExp(`App ${APP_ID} is suspended`));
+  assert.equal(groupCalls.length, 0);
+});
+
+test('publisher suspended from the app → 403 that names the suspension (never mints)', async () => {
+  rpcResponse = appRpc({ member: false, status: 2 });
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, new RegExp(`suspended from app ${APP_ID}`));
+  assert.equal(groupCalls.length, 0);
+});
+
+test('member on stale terms → 403 asking them to re-accept', async () => {
+  rpcResponse = appRpc({ member: false, status: 1 });
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /has not accepted the current terms/);
+});
+
+test('RPC failure on the app check → 502 (never mints)', async () => {
+  const ok = appRpc();
+  rpcResponse = (url, init) =>
+    JSON.parse(init.body).params[0].data.startsWith(SELECTOR.member)
+      ? jsonResponse(500, { error: 'rpc down' })
+      : ok(url, init);
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 502);
+  assert.match(res.json.error, /app check failed/i);
+});
+
 /* ── app-level subscription ──────────────────────────────────────────────── */
 
 test('appId → group is <prefix>:<appId>:<wallet>, and bytes bill the app owner', async () => {
@@ -553,8 +641,18 @@ test('app past the free tier with an active owner subscription → 200', async (
   assert.equal(kv._store.get(totalKey(OWNER)), '11000');
 });
 
+test('app owner publishing to their own app is read once, and pays for it', async () => {
+  rpcResponse = appRpc({ owner: ACCOUNT.address, ownerPaidAt: nowSec() });
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
+  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 2000, appId: APP_ID } });
+  assert.equal(res.status, 200);
+  assert.equal(callsTo(SELECTOR.access).length, 1); // paidAt reused, not re-read
+});
+
 test('app past the free tier whose owner never subscribed → 402', async () => {
-  rpcResponse = appRpc({ subscribed: false });
+  rpcResponse = appRpc({ ownerPaidAt: 0 });
   const kv = mockKV({ [totalKey(OWNER)]: 9000 });
   const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const res = await call(env, { body: { ...(await proof()), size: 2000, appId: APP_ID } });
@@ -564,8 +662,7 @@ test('app past the free tier whose owner never subscribed → 402', async () => 
 });
 
 test('app past the free tier with a stale (>30d) owner subscription → 402', async () => {
-  // isAppSubscribed is "has ever paid" — the 30-day window is applied here.
-  rpcResponse = appRpc({ subscribed: true, ownerPaidAt: nowSec() - 40 * 86400 });
+  rpcResponse = appRpc({ ownerPaidAt: nowSec() - 40 * 86400 });
   const kv = mockKV({ [totalKey(OWNER)]: 9000 });
   const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const res = await call(env, { body: { ...(await proof()), size: 2000, appId: APP_ID } });
@@ -573,13 +670,17 @@ test('app past the free tier with a stale (>30d) owner subscription → 402', as
 });
 
 test('unclaimed app (owner 0x0) → 403, never billed to the zero address', async () => {
-  rpcResponse = appRpc({ owner: '0x' + '0'.repeat(40) });
-  const kv = mockKV();
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', RATE_KV: kv });
-  const res = await call(env, { body: { ...(await proof()), appId: APP_ID } });
-  assert.equal(res.status, 403);
-  assert.match(res.json.error, /no owner on-chain/i);
-  assert.equal(kv._store.size, 0);
+  // member: false is what the chain reports (nobody can join an app nobody owns);
+  // member: true cannot happen on-chain and pins the billing guard behind it.
+  for (const member of [false, true]) {
+    rpcResponse = appRpc({ member, owner: '0x' + '0'.repeat(40) });
+    const kv = mockKV();
+    const env = baseEnv({ FREE_BYTE_LIMIT: '10000', RATE_KV: kv });
+    const res = await call(env, { body: { ...(await proof()), appId: APP_ID } });
+    assert.equal(res.status, 403);
+    assert.match(res.json.error, /no owner on-chain/i);
+    assert.equal(kv._store.size, 0);
+  }
 });
 
 test('malformed appId → 400 before any chain call', async () => {

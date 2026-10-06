@@ -7,7 +7,7 @@ Requests get validated on:
 1. **Ownership proof.** The caller signs a timestamped challenge with the address's key (EIP-191 `personal_sign`). The worker recovers the signer and requires it to equal the claimed address.
 2. **Access check.** One `eth_call` to `access(address)` on the SubscriptionRegistry returns `(registered, paidAt)`. The contract cross-calls `DataRegistry.isRegistered` internally, so a single read answers both "is this
    a publisher?" and "when did they last pay?".
-3. **App membership** *(only when the caller sends an `appId`)*. `AppRegistry.isRegisteredForApp(appId, caller)`. The same per-app check `DataRegistry.commitStateRoot` enforces then `SubscriptionRegistry.isAppSubscribed(appId)` for the app's owner. Budgets are then billed to that app's **owner**, not the caller.
+3. **App membership.** `AppRegistry.isRegisteredForApp(appId, caller)`, the same per-app check `DataRegistry.commitStateRoot` enforces: false for a suspended app, a suspended publisher, or stale accepted terms. Runs on every request, against the SDK's default app when the caller sends no `appId`. When they do send one, `AppRegistry.getAppOwner(appId)` names the app's owner and budgets are billed to that **owner**, not the caller.
 4. **Budgets.** The declared upload size is checked against the billed wallet's lifetime free tier (past it, an active subscription is required) and its daily byte budget.
 5. **Mint.** `POST /v3/files/sign` at Pinata, scoped to that size, to `PINATA_ALLOW_MIME_TYPES`, and to the wallet's own Pinata group.
 
@@ -30,7 +30,7 @@ Query parameters (`GET`) or a JSON body (`POST`).
 | `signature` | 65-byte `personal_sign` signature of `message`. |
 | `size` | Declared upload size in bytes. The minted URL is scoped to `size + 4096` (multipart headroom). This is what gets debited to the account's storage limit. Omitted → `DEFAULT_UPLOAD_SIZE`. |
 | `uploadId` | Idempotency key. A retry reusing it re-mints a fresh single-use URL but is charged once. |
-| `appId` | Optional 32-byte hex app id. Publishes under an app: the caller must also be an active publisher in it, and the bytes are billed to the **app owner's** subscription. See *App-level subscriptions*. |
+| `appId` | Optional 32-byte hex app id: the app being published to. The caller must be an active publisher in it, and the bytes are billed to the **app owner's** subscription. Omitted → membership is checked against the SDK's default app and the caller pays. See *App-level subscriptions*. |
 
 ### Minting: responses
 
@@ -40,7 +40,7 @@ Query parameters (`GET`) or a JSON body (`POST`).
 | `400` | invalid/missing address, a non-positive-integer `size`, or a malformed `appId` |
 | `401` | `{ ok: false, address, error, challenge }`. No signature or it failed to verify. Sign `challenge` and retry. |
 | `402` | past the free tier with no active subscription. The caller's, or the app owner's for an app-scoped upload (points at `SUBSCRIBE_URL`) |
-| `403` | ownership proven, but the address is not a registered publisher, not an active publisher in `appId`, or the app is unclaimed (points at `REGISTER_URL`) |
+| `403` | ownership proven, but publishing is refused. `error` says which: the address is not registered or is suspended network-wide, the app is unclaimed or suspended, or the address never joined the app, is suspended from it, or has not accepted its current terms (points at `REGISTER_URL` where there is something to do there) |
 | `405` | method other than `GET`/`POST`/`OPTIONS` |
 | `413` | declared `size` exceeds `MAX_UPLOAD_SIZE` |
 | `429` | daily byte budget exhausted (resets 00:00 UTC) |
@@ -100,14 +100,16 @@ The caller still proves address ownership and still has to be registered in the 
 
 | Check | Contract | Failure |
 | --- | --- | --- |
-| `isRegisteredForApp(appId, caller)` | AppRegistry (from the SDK) | `403`. false for a suspended app, a suspended publisher, or stale accepted terms |
-| `isAppSubscribed(appId) → (subscribed, owner)` | SubscriptionRegistry | `403` when `owner` is `0x0` (unclaimed app) |
+| `isRegisteredForApp(appId, caller)` | AppRegistry | `403`. false for a suspended app, a suspended publisher, or stale accepted terms |
+| `getAppOwner(appId) → owner` | AppRegistry | `403` when `owner` is `0x0` (unclaimed app) |
 
-Everything downstream then uses `owner` instead of the caller: the free-tier counter (`total:{owner}`), the daily cap, the `uploadId` idempotency marker, and the subscription window. `isAppSubscribed` only reports whether the owner has *ever* paid, so when the free tier is crossed the worker also reads `access(owner)` for `paidAt` and applies `SUBSCRIPTION_WINDOW_DAYS` exactly as it does for a solo publisher. Pins are grouped `<prefix>:<appId>:<caller>` and billed to the app owner and attributable to the publisher.
+The membership check is not specific to app-scoped uploads. Without an `appId` it runs against the SDK's default app, and the caller keeps paying. On a `403` the worker makes three more AppRegistry reads (`getAppOwner`, `isAppSuspended`, `statusForApp`) to say which cause it was. A granted upload makes none of them.
+
+The rest of the flow uses `owner` instead of the caller including the free-tier counter (`total:{owner}`), the daily cap, the `uploadId` idempotency marker, and the subscription window. The worker reads `access(owner)` for the owner's `paidAt` and applies `SUBSCRIPTION_WINDOW_DAYS` like it does for a solo publisher. Pins are grouped `<prefix>:<appId>:<caller>` and billed to the app owner and attributable to the publisher.
 
 `GET /usage` is unchanged: query the **owner's** address to see an app's usage.
 
-Both contract addresses come from `@fangorn-network/sdk` with no env override — `isAppSubscribed` resolves the AppRegistry through the DataRegistry itself, so an override here could only disagree with the contract.
+The AppRegistry address comes from `@fangorn-network/sdk` with no env override.
 
 ## Byte budgets
 

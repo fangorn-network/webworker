@@ -48,12 +48,12 @@ command = "node -e \"const {FangornConfig:c}=await import('@fangorn-network/sdk/
 # method as camelCase `access(address)`; override only if yours differs.
 ACCESS_FUNCTION = "access(address)"
 
-# App-scoped uploads (the caller passes an `appId`) add two reads, both on SDK
-# addresses and neither configurable here: AppRegistry.isRegisteredForApp(appId, caller)
-# — the same per-app membership DataRegistry.commitStateRoot enforces — and
-# SubscriptionRegistry.isAppSubscribed(appId), which resolves the app's owner and
-# whether they have ever paid. Quota and the window below are then the OWNER's, so one
-# app subscription covers every publisher in that app.
+# Every request also reads AppRegistry.isRegisteredForApp(appId, caller) — the same
+# per-app membership DataRegistry.commitStateRoot enforces, false for a suspended app
+# or publisher — against the caller's `appId`, or the SDK's default app when they send
+# none. An explicit `appId` adds AppRegistry.getAppOwner(appId): quota and the window
+# below are then the OWNER's, so one app subscription covers every publisher in that
+# app. The AppRegistry address is the SDK's and is not configurable here.
 
 # Once a wallet exhausts its free tier (FREE_BYTE_LIMIT below), each upload must
 # have an active subscription: the wallet paid the subscription fee within
