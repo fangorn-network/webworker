@@ -37,7 +37,7 @@ node examples/simulated-caller.mjs https://pinata-url-provider.fangorn-0be.worke
 | --- | --- | --- |
 | `WORKER_URL` | `http://localhost:8787` | Worker base URL (or pass as the first CLI arg). |
 | `PRIVATE_KEY` | built-in demo key | 0x-prefixed 32-byte secp256k1 key to sign with. |
-| `APP_ID` | unset | 32-byte hex app id to publish under (billed to the app owner). Unset → the default app, on the caller's own budget. |
+| `APP_ID` | unset | 32-byte hex app id to publish under. The upload is billed to that app, and the caller must be one of its publishers. Unset → the default app. |
 
 > The built-in demo key is a throwaway for demonstration only — **never fund its
 > address or reuse the key**. Set `PRIVATE_KEY` to sign as a real address.

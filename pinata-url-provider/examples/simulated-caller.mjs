@@ -15,8 +15,9 @@
  *   WORKER_URL    Worker base URL (default http://localhost:8787).
  *   PRIVATE_KEY   0x-prefixed 32-byte secp256k1 key. Omit to use the demo key
  *                 below — NEVER use that key for anything real.
- *   APP_ID        Optional 32-byte hex app id to publish under (billed to the app
- *                 owner). Omit to publish to the default app on your own budget.
+ *   APP_ID        Optional 32-byte hex app id to publish under. The upload is
+ *                 billed to that app, and the caller must be one of its
+ *                 publishers. Omit to publish to the default app.
  */
 
 import { privateKeyToAccount } from 'viem/accounts';

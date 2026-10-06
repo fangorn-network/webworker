@@ -7,8 +7,8 @@ A pnpm workspace containing the Cloudflare Workers behind Fangorn's content gati
 | Package | Path | Description |
 |---------|------|-------------|
 | [`fangorn-access-worker`](./fangorn-access-worker) | `fangorn-access-worker/` | Gates R2 content behind on-chain settlement verification. One worker per R2 bucket. |
-| [`pinata-url-provider`](./pinata-url-provider) | `pinata-url-provider/` | Mints Pinata presigned upload URLs for callers who prove address ownership and pass the SubscriptionRegistry's `access()` check (registration + storage subscription). |
-| [`quickbeam-registry`](./quickbeam-registry) | `quickbeam-registry/` | Control plane for Quickbeam views: KV of watched sources, the instance's `/watchlist`, and the per-view search/CDN proxy. Gated on the same storage subscription. |
+| [`pinata-url-provider`](./pinata-url-provider) | `pinata-url-provider/` | Mints Pinata presigned upload URLs for callers who prove address ownership, are registered, and publish under an app with an active subscription (the AppRegistry's `access()` check). Every upload is billed to its app. |
+| [`quickbeam-registry`](./quickbeam-registry) | `quickbeam-registry/` | Control plane for Quickbeam views: KV of watched sources, the instance's `/watchlist`, and the per-view search/CDN proxy. Gated on the same app subscription. |
 
 See each package's own `README.md` for details.
 
@@ -66,16 +66,17 @@ pnpm --filter ./pinata-url-provider dev
 ## Contract addresses
 
 All three workers take their registry addresses and RPC endpoint from
-`@fangorn-network/sdk` (`FangornConfig`) — the storage and Quickbeam workers gate on
-`access()` at the SubscriptionRegistry, the access worker checks the
-SettlementRegistry. Nothing is pinned in a `wrangler.toml`: the SDK is the only thing
-that knows which contracts belong together, and a worker left on a retired one fails
-closed and silently — every wallet reads as unregistered, every buyer as unsettled.
+`@fangorn-network/sdk` (`FangornConfig`) — the storage and Quickbeam workers read the
+DataRegistry (network standing) and the AppRegistry's `access()` (app membership and
+the app's subscription), the access worker checks the SettlementRegistry. Nothing is
+pinned in a `wrangler.toml`: the SDK is the only thing that knows which contracts
+belong together, and a worker left on a retired one fails closed and silently — every
+wallet reads as unregistered, every buyer as unsettled.
 
 **Move deployments by bumping `@fangorn-network/sdk`, then redeploying the workers.**
-Each keeps an env override (`SUBSCRIPTION_CONTRACT_ADDRESS`,
-`SETTLEMENT_REGISTRY_ADDRESS`) as an escape hatch for repointing ahead of an SDK
-publish; taking one logs a warning naming what it replaced.
+The storage and Quickbeam workers have no address override. The access worker keeps
+`SETTLEMENT_REGISTRY_ADDRESS` as an escape hatch for repointing ahead of an SDK publish;
+taking it logs a warning naming what it replaced.
 
 Only `@fangorn-network/sdk/lib/config.js` is imported — it pulls in nothing but viem,
 while the package root reaches node `fs`/`path` and the graph engine, which a workerd

@@ -6,7 +6,7 @@ set -euo pipefail
 # Deploys the Fangorn Cloudflare Workers — any one, any combination, or all.
 #
 #   storage    pinata-url-provider     presigned Pinata upload URLs, gated on
-#                                      access() at the SubscriptionRegistry
+#                                      access() at the AppRegistry
 #   quickbeam  quickbeam-registry      Quickbeam view control plane, same gate
 #   access     fangorn-access-worker   R2 reads gated on the SettlementRegistry
 #
@@ -164,13 +164,13 @@ for w in "${deploy_list[@]}"; do
         const require = createRequire(process.cwd() + "/");
         const { version } = require("@fangorn-network/sdk/package.json");
         const { FangornConfig: c } = await import("@fangorn-network/sdk/lib/config.js");
-        console.log(version, c.dataRegistryContractAddress, c.subscriptionRegistryContractAddress, c.settlementRegistryContractAddress);
+        console.log(version, c.dataRegistryContractAddress, c.appRegistryContractAddress, c.settlementRegistryContractAddress);
     ') || { echo "  $w: cannot read the SDK — run pnpm install" >&2; exit 1; }
-    read -r version data subscription settlement <<<"$info"
+    read -r version data apps settlement <<<"$info"
     versions+=("$version")
     case "$w" in
         access) gate="settlement $settlement" ;;
-        *)      gate="subscription $subscription (data $data)" ;;
+        *)      gate="apps $apps (data $data)" ;;
     esac
     printf '  %-10s sdk %-16s %s\n' "$w" "$version" "$gate" >&2
 done
