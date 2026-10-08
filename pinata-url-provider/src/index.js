@@ -5,14 +5,19 @@
  *   1. The caller proves control of an address by signing a one-time challenge
  *      (EIP-191 `personal_sign`). If the signature doesn't verify, the request is
  *      rejected with "Verification failed…" — see `verifyCallerOwnsAddress()`.
- *   2. The worker calls `isRegistered(address)` on the Fangorn registry contract
- *      (a Stylus contract on Arbitrum Sepolia; address + RPC are configurable) to
- *      check whether that public key is registered. If not, the caller is told to
- *      register at fangorn.network. This can be stubbed for local dev with
+ *   2. The worker reads the caller's network-wide standing from the DataRegistry
+ *      (`getPublisherStatus`) and, in the same round, `access(appId, address)` from
+ *      the AppRegistry — both Stylus contracts on Arbitrum Sepolia, addresses from
+ *      the Fangorn SDK. This can be stubbed for local dev with
  *      STUB_REGISTRATION_CHECK="true".
- *   3. If registered, the worker mints a short-lived Pinata *presigned upload URL*
- *      and returns it, so the caller can pin one file to IPFS without ever seeing
- *      your Pinata JWT.
+ *   2b. Nobody publishes outside an app, and an app IS a storage subscription. The
+ *      caller must be an active publisher of the app they publish to (the `appId`
+ *      they pass, else the SDK's default app): added by its owner, on its current
+ *      terms, not suspended. And the app must have paid within
+ *      SUBSCRIPTION_WINDOW_DAYS. Every byte is billed to the app.
+ *   3. If all of that holds, the worker mints a short-lived Pinata *presigned upload
+ *      URL* and returns it, so the caller can pin one file to IPFS without ever
+ *      seeing your Pinata JWT.
  *
  * Dependencies are `viem` (signature recovery + selector encoding) and the Fangorn
  * SDK, which supplies the deployment addresses. Everything else is driven by
@@ -23,7 +28,7 @@ import { recoverMessageAddress, toFunctionSelector } from 'viem';
 // Deep import on purpose: `lib/config.js` pulls in nothing but viem, while the SDK's
 // package root reaches the harness (node `fs`/`path`) and the graph engine — none of
 // which a workerd bundle can or should carry.
-import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
+import { DEFAULT_APP, FangornConfig, toAppId } from '@fangorn-network/sdk/lib/config.js';
 
 export default {
   async fetch(request, env) {
@@ -36,26 +41,22 @@ export default {
       return json(405, { error: 'Method not allowed. Use GET or POST.' }, cors);
     }
 
-    // GET /usage?address=0x… — a wallet's byte counters (lifetime total + today's
-    // daily) and the configured limits, so the dashboard can show usage. Read-only
-    // and unauthenticated: byte counts aren't sensitive (and are roughly inferable
-    // on-chain), while the sensitive action — minting an upload URL — still requires
-    // the signed ownership proof below.
+    // GET /usage?appId=0x… — an app's byte counter for today and the configured
+    // limit, so the dashboard can show usage. Read-only and unauthenticated: byte
+    // counts aren't sensitive (and are roughly inferable on-chain), while the
+    // sensitive action — minting an upload URL — still requires the signed
+    // ownership proof below.
     const url = new URL(request.url);
     if (url.pathname === '/usage') {
-      const address = (url.searchParams.get('address') || '').toLowerCase();
-      if (!isAddress(address)) {
-        return json(400, { error: 'Provide a valid EVM address via ?address=0x….' }, cors);
+      const usageApp = (url.searchParams.get('appId') || DEFAULT_APP_ID).toLowerCase();
+      if (!isBytes32(usageApp)) {
+        return json(400, { error: 'Provide a valid app id via ?appId=0x… (0x + 64 hex chars).' }, cors);
       }
-      const kvOn = !!env.RATE_KV;
-      const free = freeTierConfig(env);
       const cap = byteCapConfig(env);
       return json(200, {
         ok: true,
-        address,
-        total: kvOn ? await currentTotal(env, address) : 0,
-        freeLimit: free.active ? free.limit : 0,
-        daily: kvOn ? await currentUsage(env, address) : 0,
+        appId: usageApp,
+        daily: env.RATE_KV ? await currentUsage(env, usageApp) : 0,
         dailyLimit: cap.active ? cap.limit : 0,
         day: new Date().toISOString().slice(0, 10),
       }, cors);
@@ -64,11 +65,17 @@ export default {
     // Read the request once (the POST body can only be consumed a single time):
     // address plus the optional ownership proof (message + signature).
     const input = await readInput(request);
-    // TODO: make address an env var
-    // const address = process.env.STORAGE_SUBSCRIPTION_ADDR;
     const address = (input.address || '').toLowerCase();
     if (!isAddress(address)) {
       return json(400, { error: 'Provide a valid EVM address via ?address=0x… or JSON body { "address": "0x…" }.' }, cors);
+    }
+
+    // The app this upload lands in — and is billed to. Every publish lands in an
+    // app, so a caller who names none means the SDK's default one, the same
+    // fallback the SDK applies to the commit that follows.
+    const appId = (input.appId || DEFAULT_APP_ID).toLowerCase();
+    if (!isBytes32(appId)) {
+      return json(400, { error: 'appId must be a 32-byte hex string (0x + 64 hex chars).' }, cors);
     }
 
     // Prove the caller controls `address` via a signed challenge (always required).
@@ -83,25 +90,54 @@ export default {
       }, cors);
     }
 
-    // 1) On-chain access gate — ONE call to the SubscriptionRegistry's access()
-    // view returns both registration status (it cross-calls DataRegistry internally)
-    // and the subscription timestamp. STUB_REGISTRATION_CHECK skips the chain
-    // entirely (a valid signature alone suffices — dev/testing without an RPC).
-    // TODO: is this needed?
+    // 1) On-chain gate — two reads, one round: the caller's network-wide standing,
+    // and the AppRegistry's `access` view for (app, caller). STUB_REGISTRATION_CHECK
+    // skips the chain entirely (a valid signature alone suffices — dev/testing
+    // without an RPC), and the subscription then reads as active.
     const stubbed = (env.STUB_REGISTRATION_CHECK ?? 'false') === 'true';
-    let access = null;
     if (!stubbed) {
+      const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
+      let access;
       try {
-        access = await readAccess(env, address);
+        const [status, appAccess] = await Promise.all([
+          readPublisherStatus(env, address),
+          readAccess(env, appId, address),
+        ]);
+        if (status !== STATUS_ACTIVE) {
+          return json(403, {
+            ok: false,
+            address,
+            // A suspended wallet reads as "not registered" to a boolean check,
+            // and telling them to register is the wrong advice.
+            error: status === STATUS_SUSPENDED
+              ? 'This public key has been suspended from publishing on Fangorn.'
+              : `This public key is not registered. Please login on ${registerUrl} to register.`,
+          }, cors);
+        }
+        access = appAccess;
+        if (access.owner === ZERO_ADDRESS) {
+          // Unclaimed app: there is no subscription to bill and nobody to be a
+          // publisher of it.
+          return json(403, { ok: false, address, error: `App ${appId} has no owner on-chain.` }, cors);
+        }
+        // Membership is what DataRegistry.commitStateRoot enforces too, so a URL is
+        // never minted for a push that would revert.
+        if (!access.registered) {
+          return json(403, { ok: false, address, error: await appDenialReason(env, appId, address) }, cors);
+        }
       } catch (err) {
         return json(502, { error: 'On-chain access check failed.', detail: String(err?.message || err) }, cors);
       }
-      if (!access.registered) {
-        const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
-        return json(403, {
+
+      // The app's subscription must be active: paid within the window. There is
+      // no free tier — claiming an app is paying for it, so every app has paid at
+      // least once and a lapsed one stops here until its owner renews.
+      if (!isWithinWindow(env, access.paidAt)) {
+        const subscribeUrl = env.SUBSCRIBE_URL || 'https://fangorn.network/subscribe';
+        return json(402, {
           ok: false,
           address,
-          error: `This public key is not registered. Please login on ${registerUrl} to register.`,
+          error: `The storage subscription for app ${appId} is inactive. Its owner (${access.owner}) must renew it at ${subscribeUrl}`,
         }, cors);
       }
     }
@@ -110,7 +146,6 @@ export default {
     // length). Absent → a back-compat default. Bounded per-request so nobody can
     // mint a URL for an absurd file.
     const maxUpload = Number(env.MAX_UPLOAD_SIZE || DEFAULT_MAX_UPLOAD);
-    // TODO: this seems gratuitious
     let size;
     if (input.size == null || input.size === '') {
       size = Number(env.DEFAULT_UPLOAD_SIZE || DEFAULT_UPLOAD_SIZE);
@@ -128,68 +163,41 @@ export default {
       }, cors);
     }
 
-    // Per-wallet daily *byte budget* — bounds the Pinata bill now that callers
-    // declare their size. Checked after auth so an over-budget wallet never
-    // mints; usage is recorded only on a successful grant (a failed mint costs
-    // no quota). Debits the declared size, which the SDK sets to the exact bytes.
+    // Per-app daily *byte budget* — bounds the Pinata bill. One budget covers all
+    // of an app's publishers, since the app is what pays. Checked after auth so
+    // an over-budget app never mints; usage is recorded only on a successful
+    // grant (a failed mint costs no quota). Debits the declared size, which the
+    // SDK sets to the exact bytes.
     //
     // Retries reuse the caller's uploadId: a transient upload failure re-mints a
     // fresh (single-use) URL, but must NOT re-charge. A size already paid under
     // this uploadId skips both the budget check and the debit.
     const cap = byteCapConfig(env);
-    const free = freeTierConfig(env);
     let used = 0;
-    let total = 0;
-    let charge = cap.active || free.active;
+    let charge = cap.active;
     if (charge && input.uploadId) {
-      const paid = await paidSize(env, address, input.uploadId);
+      const paid = await paidSize(env, appId, input.uploadId);
       if (paid !== null && size <= paid) charge = false; // already granted on a prior attempt
     }
     if (charge) {
-      // Free tier: the first FREE_BYTE_LIMIT lifetime bytes are free. Beyond that,
-      // the wallet must have an active on-chain subscription (fee paid within the
-      // window). The upload that first crosses the limit already needs one.
-      if (free.active) {
-        total = await currentTotal(env, address);
-        if (total + size > free.limit) {
-          // Past the free tier: require an active subscription (fee paid within the
-          // window). We already have paidAt from the access() read above. Stub mode
-          // has no chain data → treat as active for dev.
-          const active = stubbed || isWithinWindow(env, access.paidAt);
-          if (!active) {
-            const subscribeUrl = env.SUBSCRIBE_URL || 'https://fangorn.network/subscribe';
-            return json(402, {
-              ok: false,
-              address,
-              error: `To continue using Fangorn's storage, please sign up for a subscription at ${subscribeUrl}`,
-            }, cors);
-          }
-        }
-      }
-      // Daily ceiling still applies to everyone (free and subscribed) as an abuse guard.
-      if (cap.active) {
-        used = await currentUsage(env, address);
-        if (used + size > cap.limit) {
-          return json(429, {
-            ok: false,
-            address,
-            error: `Daily storage budget reached (${cap.limit} bytes/wallet, ${used} used). Resets at 00:00 UTC.`,
-          }, cors);
-        }
+      used = await currentUsage(env, appId);
+      if (used + size > cap.limit) {
+        return json(429, {
+          ok: false,
+          address,
+          error: `Daily storage budget reached for app ${appId} (${cap.limit} bytes/app, ${used} used). Resets at 00:00 UTC.`,
+        }, cors);
       }
     }
 
-    // 2) Registered (or stubbed) — issue a Pinata presigned upload URL scoped to
+    // 2) Granted (or stubbed) — issue a Pinata presigned upload URL scoped to
     // the requested size (plus a little multipart/form-data headroom).
     try {
       const maxFileSize = size + UPLOAD_HEADROOM;
-      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address);
+      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, appId);
       if (charge) {
-        // Keep the lifetime counter climbing (even past the free limit) so a
-        // wallet can't dip back under it after crossing and get free uploads again.
-        if (free.active) await recordTotal(env, address, total, size);
-        if (cap.active) await recordUsage(env, address, used, size);
-        if (input.uploadId) await markPaid(env, address, input.uploadId, size);
+        await recordUsage(env, appId, used, size);
+        if (input.uploadId) await markPaid(env, appId, input.uploadId, size);
       }
       return json(200, {
         ok: true,
@@ -209,75 +217,49 @@ export default {
 /* ───────────────────────── on-chain access gate ────────────────────────── */
 
 // The deployment comes from the SDK, which is the only thing that knows which
-// contracts belong together. A SubscriptionRegistry is usable only if its
-// `dataRegistry()` equals the registry the SDK publishes to — cross-calling
-// `isRegistered` on a stale one makes `access()` return `registered: false` for every
-// wallet, so uploads 403 network-wide with nothing in the logs to say why. Pinning
-// the address here separately from the SDK is exactly how that pair drifts apart, so
-// the version bump is the repoint: both move together or neither does.
+// contracts belong together: the AppRegistry gated on here must be the one the
+// SDK's DataRegistry consults on `commitStateRoot`, or the gate and the commit
+// disagree about who may publish. So neither address is configurable — the SDK
+// version bump is the repoint.
 const DEFAULT_RPC_URL = FangornConfig.rpcUrl;
-const SDK_SUBSCRIPTION_ADDRESS = FangornConfig.subscriptionRegistryContractAddress;
+const SDK_APP_REGISTRY_ADDRESS = FangornConfig.appRegistryContractAddress;
+const SDK_DATA_REGISTRY_ADDRESS = FangornConfig.dataRegistryContractAddress;
 
-// The SubscriptionRegistry view `access(address) -> (bool registered, uint64 paidAt)`.
-// It cross-calls DataRegistry.isRegistered internally, so this single read gives the
-// worker both the registration gate and the subscription timestamp. Stylus exposes
-// the Rust method as camelCase.
-const DEFAULT_ACCESS_FUNCTION = 'access(address)';
+// The AppRegistry view `access(bytes32 appId, address) -> (bool registered,
+// address owner, uint64 paidAt)`: one read for membership, who owns the app, and
+// when its subscription was last paid. `registered` is `isRegisteredForApp` (false
+// for a suspended app, a suspended or merely-invited publisher, or stale accepted
+// terms). Stylus exposes the Rust method as camelCase.
+const ACCESS_FUNCTION = 'access(bytes32,address)';
+// Read only to explain a denial — see appDenialReason().
+const APP_SUSPENDED_FUNCTION = 'isAppSuspended(bytes32)';
+const APP_STATUS_FUNCTION = 'statusForApp(bytes32,address)';
+// DataRegistry's network-wide lifecycle status.
+const PUBLISHER_STATUS_FUNCTION = 'getPublisherStatus(address)';
+// Lifecycle codes shared by both registries (0 = unregistered). INVITED exists only
+// per app: added by the owner, terms not yet accepted.
+const STATUS_ACTIVE = 1n;
+const STATUS_SUSPENDED = 2n;
+const STATUS_INVITED = 3n;
+const ZERO_ADDRESS = '0x' + '0'.repeat(40);
+// The app a publish lands in when the caller names none — the same fallback the SDK
+// applies to its registry clients, so the check here matches the commit that follows.
+const DEFAULT_APP_ID = toAppId(DEFAULT_APP);
 
-/**
- * Which SubscriptionRegistry to gate on. The SDK's, unless the deployment explicitly
- * overrides it.
- *
- * The override exists so a redeployed contract can be pointed at without waiting on an
- * SDK publish — the worker is the upload gate, and "all uploads 403" should not need a
- * package release to fix. It is loud on purpose: an override that silently disagreed
- * with the SDK is the failure this whole change is undoing, so taking one logs what it
- * replaced. Whoever sets it owns checking that the contract's `dataRegistry()` equals
- * the SDK's `dataRegistryContractAddress`:
- *
- *   cast call <override> "dataRegistry()(address)" --rpc-url <rpc>
- *
- * Still throws rather than falling back if neither is a usable address — gating on the
- * wrong contract silently is worse than failing.
- */
-function subscriptionAddress(env) {
-  const override = env.SUBSCRIPTION_CONTRACT_ADDRESS;
-  if (override && override.toLowerCase() !== SDK_SUBSCRIPTION_ADDRESS.toLowerCase()) {
-    console.warn(
-      `SUBSCRIPTION_CONTRACT_ADDRESS override in use: gating on ${override}, `
-      + `not the SDK's ${SDK_SUBSCRIPTION_ADDRESS}. Verify its dataRegistry() matches `
-      + `${FangornConfig.dataRegistryContractAddress} or every wallet reads as unregistered.`);
-  }
-  const contract = override || SDK_SUBSCRIPTION_ADDRESS;
-  if (!isAddress(contract)) {
+/** A registry address from the SDK, or a loud failure — never a silent fallback. */
+function sdkAddress(address, name) {
+  if (!isAddress(address || '')) {
     throw new Error(
-      'No usable SubscriptionRegistry address: the Fangorn SDK supplied '
-      + `"${SDK_SUBSCRIPTION_ADDRESS}" and SUBSCRIPTION_CONTRACT_ADDRESS is `
-      + `"${override ?? 'unset'}". Upgrade @fangorn-network/sdk or set a valid override.`);
+      `The Fangorn SDK supplied no valid ${name} ("${address}"); `
+      + 'upgrade @fangorn-network/sdk to one that carries it.');
   }
-  return contract;
+  return address;
 }
 
-/**
- * One `eth_call` to the SubscriptionRegistry's `access(address)` view, returning
- * `{ registered, paidAt }`. `registered` is the contract's cross-call to
- * DataRegistry.isRegistered; `paidAt` is the wallet's last subscription timestamp
- * (Unix seconds bigint, 0 if never). The worker applies the free-tier + active-
- * window policy itself.
- *
- * Env:
- *   RPC_URL                        EVM JSON-RPC endpoint (optional; defaults to the
- *                                  SDK's, currently the public Arbitrum Sepolia RPC).
- *   SUBSCRIPTION_CONTRACT_ADDRESS  Optional override of the SDK's address. An escape
- *                                  hatch for repointing ahead of an SDK publish, not
- *                                  routine config — see subscriptionAddress().
- *   ACCESS_FUNCTION                ABI signature (optional; default "access(address)").
- */
-async function readAccess(env, address) {
+/** One `eth_call`: ABI signature + already-encoded 32-byte argument words → raw hex. */
+async function ethCall(env, to, signature, words) {
   const rpcUrl = env.RPC_URL || DEFAULT_RPC_URL;
-  const contract = subscriptionAddress(env);
-
-  const data = toFunctionSelector(env.ACCESS_FUNCTION || DEFAULT_ACCESS_FUNCTION) + encodeAddress(address);
+  const data = toFunctionSelector(signature) + words.join('');
 
   const res = await fetch(rpcUrl, {
     method: 'POST',
@@ -286,16 +268,74 @@ async function readAccess(env, address) {
       jsonrpc: '2.0',
       id: 1,
       method: 'eth_call',
-      params: [{ to: contract, data }, 'latest'],
+      params: [{ to, data }, 'latest'],
     }),
   });
   if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
 
   const body = await res.json();
   if (body.error) throw new Error(`RPC error: ${body.error.message || JSON.stringify(body.error)}`);
+  return body.result;
+}
 
-  // access() returns two 32-byte words: [0] bool registered, [1] uint64 paidAt.
-  return { registered: wordAt(body.result, 0) !== 0n, paidAt: wordAt(body.result, 1) };
+/**
+ * `getPublisherStatus(address)` on the DataRegistry: the caller's network-wide
+ * standing (0 unregistered, 1 active, 2 suspended). App membership alone is not
+ * enough to publish — the DataRegistry rejects a commit from a wallet that never
+ * registered, or that the protocol admin suspended.
+ */
+async function readPublisherStatus(env, address) {
+  const result = await ethCall(
+    env, sdkAddress(SDK_DATA_REGISTRY_ADDRESS, 'dataRegistryContractAddress'),
+    PUBLISHER_STATUS_FUNCTION, [encodeAddress(address)]);
+  return wordAt(result, 0);
+}
+
+/**
+ * One `eth_call` to the AppRegistry's `access(appId, address)` view, returning
+ * `{ registered, owner, paidAt }`. `owner` is the zero address for an unclaimed
+ * app; `paidAt` is the app's last subscription payment (Unix seconds bigint). The
+ * worker applies the active-window policy itself.
+ *
+ * Env:
+ *   RPC_URL   EVM JSON-RPC endpoint (optional; defaults to the SDK's, currently the
+ *             public Arbitrum Sepolia RPC).
+ */
+async function readAccess(env, appId, address) {
+  const result = await ethCall(
+    env, sdkAddress(SDK_APP_REGISTRY_ADDRESS, 'appRegistryContractAddress'),
+    ACCESS_FUNCTION, [encodeBytes32(appId), encodeAddress(address)]);
+  // Three 32-byte words: [0] bool registered, [1] address owner, [2] uint64 paidAt.
+  return { registered: wordAt(result, 0) !== 0n, owner: addressAt(result, 1), paidAt: wordAt(result, 2) };
+}
+
+/**
+ * Why `access` said the caller is not registered. That bool folds several causes
+ * into one, and the right advice differs for each, so ask the AppRegistry which it
+ * was. Failure path only — a granted upload makes neither of these reads.
+ */
+async function appDenialReason(env, appId, address) {
+  const apps = sdkAddress(SDK_APP_REGISTRY_ADDRESS, 'appRegistryContractAddress');
+  const id = encodeBytes32(appId);
+  const [suspended, status] = await Promise.all([
+    ethCall(env, apps, APP_SUSPENDED_FUNCTION, [id]),
+    ethCall(env, apps, APP_STATUS_FUNCTION, [id, encodeAddress(address)]),
+  ]);
+  const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
+  if (wordAt(suspended, 0) !== 0n) return `App ${appId} is suspended.`;
+  switch (wordAt(status, 0)) {
+    case STATUS_SUSPENDED:
+      return `This public key is suspended from app ${appId}.`;
+    case STATUS_ACTIVE:
+      // Still a member, but on a terms hash the app has since moved off (or the
+      // app has none set).
+      return `This public key has not accepted the current terms of app ${appId}. Please accept them on ${registerUrl}.`;
+    case STATUS_INVITED:
+      return `This public key was added to app ${appId} but has not accepted its terms yet. Please join the app on ${registerUrl}.`;
+    default:
+      // Membership is by invitation — there is nothing the caller can do alone.
+      return `This public key is not a publisher of app ${appId}. Ask the app's owner to add it.`;
+  }
 }
 
 /**
@@ -309,80 +349,59 @@ function isWithinWindow(env, paidAt) {
   return BigInt(Math.floor(Date.now() / 1000)) < paidAt + windowSecs;
 }
 
-/* ─────────────────────────── per-wallet rate cap ───────────────────────── */
+/* ──────────────────────────── per-app rate cap ─────────────────────────── */
 
 // Upload sizing defaults (all overridable via env; bytes).
 const DEFAULT_UPLOAD_SIZE = 10 * 1024 * 1024;   // used when a caller omits `size` (older SDKs)
 const DEFAULT_MAX_UPLOAD = 500 * 1024 * 1024;   // per-request ceiling when MAX_UPLOAD_SIZE unset
 const UPLOAD_HEADROOM = 4096;                    // multipart/form-data overhead slack on max_file_size
 
-// Per-wallet daily *byte budget*, backed by Workers KV. The SDK declares each
-// upload's size, so we meter the bytes we grant per wallet per UTC day — a
-// direct bound on the Pinata bill. Inactive unless DAILY_BYTE_LIMIT > 0 and the
-// RATE_KV namespace is bound, so existing deployments/tests are unaffected until
-// opted in.
-// ponytail: KV is eventually consistent, so a concurrent burst across edge
-// locations can overshoot the budget by a little. Fine for a cost guard; swap to
-// a Durable Object if you ever need exact enforcement.
+// Per-app daily *byte budget*, backed by Workers KV. The SDK declares each
+// upload's size, so we meter the bytes we grant per app per UTC day — a direct
+// bound on the Pinata bill. Inactive unless DAILY_BYTE_LIMIT > 0 and the RATE_KV
+// namespace is bound, so existing deployments/tests are unaffected until opted in.
+// ponytail: KV is eventually consistent and allows one write per second per key,
+// so a concurrent burst from an app's publishers can overshoot the budget a
+// little or drop a debit. Fine for a cost guard; swap to a Durable Object if you
+// ever need exact enforcement.
 function byteCapConfig(env) {
   const limit = Number(env.DAILY_BYTE_LIMIT || 0);
   return { active: limit > 0 && !!env.RATE_KV, limit };
 }
 
-// Lifetime free tier: a cumulative per-wallet byte allowance. Beyond it, each
-// upload requires an active on-chain subscription. Opt-in like the daily cap:
-// inactive unless FREE_BYTE_LIMIT > 0 and RATE_KV is bound.
-function freeTierConfig(env) {
-  const limit = Number(env.FREE_BYTE_LIMIT || 0);
-  return { active: limit > 0 && !!env.RATE_KV, limit };
+// One byte counter per app per UTC day.
+function usageKey(appId) {
+  return `bytes:${appId}:${new Date().toISOString().slice(0, 10)}`;
 }
 
-// One lifetime byte counter per wallet (no date segment, never expires).
-function totalKey(address) {
-  return `total:${address}`;
+async function currentUsage(env, appId) {
+  return Number(await env.RATE_KV.get(usageKey(appId))) || 0;
 }
 
-async function currentTotal(env, address) {
-  return Number(await env.RATE_KV.get(totalKey(address))) || 0;
-}
-
-async function recordTotal(env, address, total, size) {
-  await env.RATE_KV.put(totalKey(address), String(total + size));
-}
-
-// One byte counter per wallet per UTC day.
-function usageKey(address) {
-  return `bytes:${address}:${new Date().toISOString().slice(0, 10)}`;
-}
-
-async function currentUsage(env, address) {
-  return Number(await env.RATE_KV.get(usageKey(address))) || 0;
-}
-
-async function recordUsage(env, address, used, size) {
+async function recordUsage(env, appId, used, size) {
   // TTL only needs to outlive the UTC day the key belongs to; 2 days is plenty.
-  await env.RATE_KV.put(usageKey(address), String(used + size), { expirationTtl: 172800 });
+  await env.RATE_KV.put(usageKey(appId), String(used + size), { expirationTtl: 172800 });
 }
 
 // Idempotency marker so retries of one logical upload (same uploadId) are
 // charged once. Stores the paid size; a re-mint at the same-or-smaller size is
 // free (the legit retry case), a larger size is charged normally.
 // ponytail: a modified client could reuse an uploadId for other same-size files
-// within the TTL to under-pay — acceptable for a soft budget already bypassable
-// via multiple wallets. Make uploadId a content hash to close it (that also
-// dedupes identical content, which Pinata pins once anyway).
-function paidKey(address, uploadId) {
-  return `paid:${address}:${uploadId}`;
+// within the TTL to under-count — acceptable for a soft budget. Make uploadId a
+// content hash to close it (that also dedupes identical content, which Pinata
+// pins once anyway).
+function paidKey(appId, uploadId) {
+  return `paid:${appId}:${uploadId}`;
 }
 
-async function paidSize(env, address, uploadId) {
-  const raw = await env.RATE_KV.get(paidKey(address, uploadId));
+async function paidSize(env, appId, uploadId) {
+  const raw = await env.RATE_KV.get(paidKey(appId, uploadId));
   return raw === null ? null : Number(raw) || 0;
 }
 
-async function markPaid(env, address, uploadId, size) {
+async function markPaid(env, appId, uploadId, size) {
   // Only needs to outlive the retry window (~2 min at 6 attempts); keep it short.
-  await env.RATE_KV.put(paidKey(address, uploadId), String(size), { expirationTtl: 3600 });
+  await env.RATE_KV.put(paidKey(appId, uploadId), String(size), { expirationTtl: 3600 });
 }
 
 /* ───────────────────────────── pinata ──────────────────────────────────── */
@@ -395,10 +414,11 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
  * job lists groups by name prefix and unpins their files, without needing any
  * record of what was uploaded.
  *
- * Name is `${PINATA_GROUP_PREFIX}:${address}` — per wallet, namespaced by
- * deployment. The prefix is REQUIRED: a pin filed under no group (or under an
- * unlabelled one) is a pin no cleanup job can find, which defeats the point, so
- * an unset prefix fails the request rather than minting.
+ * Name is `${PINATA_GROUP_PREFIX}:${appId}:${address}` — per wallet, namespaced by
+ * deployment and by app, so an app's pins sweep as a unit and stay attributable to
+ * the publisher. The prefix is REQUIRED: a pin filed under no
+ * group (or under an unlabelled one) is a pin no cleanup job can find, which
+ * defeats the point, so an unset prefix fails the request rather than minting.
  *
  * Resolution order: KV cache → look up by name → create. The by-name lookup is
  * what stops a lost KV entry from forking one wallet's pins across two groups.
@@ -408,10 +428,10 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
  * both get caught — and self-heals once one wins the cache. A Durable Object
  * would serialize it, same trade-off as the KV byte counters above.
  */
-async function walletGroupId(env, address) {
+async function walletGroupId(env, address, appId) {
   const prefix = (env.PINATA_GROUP_PREFIX || '').trim();
   if (!prefix) throw new Error('PINATA_GROUP_PREFIX is not set (every upload must be filed under a group).');
-  const name = `${prefix}:${address}`;
+  const name = `${prefix}:${appId}:${address}`;
   const key = `group:${name}`;
 
   // Lifetime cache (no TTL) — a wallet's group never changes.
@@ -461,7 +481,7 @@ async function pinataJson(url, init) {
  *
  * Docs: https://docs.pinata.cloud/files/presigned-urls
  */
-async function createPinataUploadUrl(env, maxFileSize, address) {
+async function createPinataUploadUrl(env, maxFileSize, address, appId) {
   if (!env.PINATA_JWT) throw new Error('PINATA_JWT is not set.');
 
   const payload = {
@@ -469,7 +489,7 @@ async function createPinataUploadUrl(env, maxFileSize, address) {
     expires: Number(env.PINATA_URL_EXPIRES || 300),
     date: Math.floor(Date.now() / 1000),
     max_file_size: maxFileSize,
-    group_id: await walletGroupId(env, address),
+    group_id: await walletGroupId(env, address, appId),
   };
   if (env.PINATA_ALLOW_MIME_TYPES) {
     payload.allow_mime_types = env.PINATA_ALLOW_MIME_TYPES.split(',').map((s) => s.trim()).filter(Boolean);
@@ -599,6 +619,7 @@ async function readInput(request) {
     signature: q.get('signature')?.trim() || undefined,
     size: q.get('size')?.trim() || undefined,        // declared upload size, bytes
     uploadId: q.get('uploadId')?.trim() || undefined, // idempotency key across retries
+    appId: q.get('appId')?.trim() || undefined,      // the app this upload is billed to
   };
   if (request.method === 'POST') {
     const body = await request.json().catch(() => null);
@@ -610,6 +631,7 @@ async function readInput(request) {
         out.size = String(body.size);
       }
       if (!out.uploadId && typeof body.uploadId === 'string') out.uploadId = body.uploadId.trim();
+      if (!out.appId && typeof body.appId === 'string') out.appId = body.appId.trim();
     }
   }
   return out;
@@ -619,9 +641,23 @@ function isAddress(a) {
   return /^0x[0-9a-fA-F]{40}$/.test(a);
 }
 
+function isBytes32(v) {
+  return /^0x[0-9a-fA-F]{64}$/.test(v);
+}
+
+/** A 32-byte hex value as a bare ABI word (hex, no 0x prefix). */
+function encodeBytes32(value) {
+  return value.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+}
+
 /** Left-pads a 20-byte address to a 32-byte ABI word (hex, no 0x prefix). */
 function encodeAddress(address) {
   return address.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+}
+
+/** Reads the i-th 32-byte word of an eth_call result as a lowercase address. */
+function addressAt(result, i) {
+  return '0x' + wordAt(result, i).toString(16).padStart(40, '0');
 }
 
 /** Reads the i-th 32-byte word (0-indexed) of an eth_call result as a bigint. */

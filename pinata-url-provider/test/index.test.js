@@ -3,8 +3,8 @@
  *
  * The worker is a plain `(request, env) => Response` over standard Web APIs, so
  * we call it directly (no miniflare) and stub the three outbound `fetch`es it
- * makes: the SubscriptionRegistry `access()` eth_call (RPC), the Pinata groups
- * API, and the Pinata `sign` endpoint. Ownership signatures are real EIP-191
+ * makes: the registry eth_calls (RPC — the DataRegistry status and the AppRegistry
+ * `access()` view), the Pinata groups API, and the Pinata `sign` endpoint. Ownership signatures are real EIP-191
  * personal_signs via viem, the same lib the worker uses to recover them.
  *
  * Run:  node --test   (from pinata-url-provider/)
@@ -13,9 +13,10 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { privateKeyToAccount } from 'viem/accounts';
+import { toFunctionSelector } from 'viem';
 
 import worker from '../src/index.js';
-import { FangornConfig } from '@fangorn-network/sdk/lib/config.js';
+import { DEFAULT_APP, FangornConfig, toAppId } from '@fangorn-network/sdk/lib/config.js';
 
 /* ── outbound fetch stub ─────────────────────────────────────────────────── */
 // Routes by URL: the Pinata sign endpoint → `pinataResponse`, the Pinata groups
@@ -28,7 +29,7 @@ let pinataResponse = null;
 let groupsResponse = null;
 let lastPinataInit = null; // request init captured from the Pinata sign call
 let groupCalls = [];       // { url, init } per Pinata groups API call
-let lastRpcCall = null;    // parsed JSON-RPC body of the last eth_call
+let rpcCalls = [];         // parsed JSON-RPC body of each eth_call, in order
 
 before(() => {
   globalThis.fetch = async (url, init) => {
@@ -44,7 +45,7 @@ before(() => {
       return groupsResponse(u, init);
     }
     if (!rpcResponse) throw new Error('unexpected RPC fetch');
-    lastRpcCall = JSON.parse(init.body);
+    rpcCalls.push(JSON.parse(init.body));
     return rpcResponse(u, init);
   };
 });
@@ -53,7 +54,7 @@ beforeEach(() => {
   rpcResponse = null;
   pinataResponse = null;
   lastPinataInit = null;
-  lastRpcCall = null;
+  rpcCalls = [];
   groupCalls = [];
   // Default: no existing group → the worker creates one.
   groupsResponse = (u, init) =>
@@ -69,28 +70,66 @@ const wordHex = (n) => BigInt(n).toString(16).padStart(64, '0');
 const pinataOk = () => jsonResponse(200, { data: 'https://uploads.pinata.cloud/signed/xyz' });
 const GROUP_ID = 'ad4bc3bf-8794-49e7-94ff-fea1ce745779';
 
-// The SubscriptionRegistry `access(address)` view returns two 32-byte words:
-// [0] bool registered, [1] uint64 paidAt (Unix seconds). One eth_call per request.
-const accessRpc = ({ registered = true, paidAt = 0 } = {}) =>
-  () => jsonResponse(200, { result: '0x' + wordHex(registered ? 1 : 0) + wordHex(paidAt) });
-const registeredRpc = accessRpc({ registered: true });
-const notRegisteredRpc = accessRpc({ registered: false });
-
 /* ── request/proof helpers ───────────────────────────────────────────────── */
 const BASE_URL = 'https://worker.test/';
 const nowSec = () => Math.floor(Date.now() / 1000);
 
-// Two throwaway deterministic keys (never use anywhere real).
+// Three throwaway deterministic keys (never use anywhere real). OWNER stands in
+// for the app owner whose app pays for the upload.
 const ACCOUNT = privateKeyToAccount('0x' + '11'.repeat(32));
 const OTHER = privateKeyToAccount('0x' + '22'.repeat(32));
+const OWNER = privateKeyToAccount('0x' + '33'.repeat(32));
+
+/* ── eth_call stub ───────────────────────────────────────────────────────── */
+// Routes eth_calls by selector: the caller's DataRegistry status, the AppRegistry
+// `access(appId, address)` view — three 32-byte words, (bool registered, address
+// owner, uint64 paidAt) — and the two reads that explain a denial. The defaults
+// describe a publisher in good standing, in an app whose subscription was paid
+// just now.
+const APP_ID = '0x' + 'ab'.repeat(32);
+const DEFAULT_APP_ID = toAppId(DEFAULT_APP);
+const SELECTOR = {
+  access: toFunctionSelector('access(bytes32,address)'),
+  appSuspended: toFunctionSelector('isAppSuspended(bytes32)'),
+  status: toFunctionSelector('statusForApp(bytes32,address)'),
+  publisherStatus: toFunctionSelector('getPublisherStatus(address)'),
+};
+const callsTo = (selector) => rpcCalls.filter((c) => c.params[0].data.startsWith(selector));
+
+function appRpc({
+  publisherStatus = 1,      // DataRegistry: 0 unregistered, 1 active, 2 suspended
+  member = true,            // access().registered
+  appSuspended = false,
+  status = member ? 1 : 0,  // AppRegistry, per app: the same codes, plus 3 invited
+  owner = OWNER.address,
+  paidAt = nowSec(),
+} = {}) {
+  return (_url, init) => {
+    const data = JSON.parse(init.body).params[0].data;
+    switch (data.slice(0, 10)) {
+      case SELECTOR.access:
+        return jsonResponse(200, {
+          result: '0x' + wordHex(member ? 1 : 0) + wordHex(BigInt(owner)) + wordHex(paidAt),
+        });
+      case SELECTOR.appSuspended:
+        return jsonResponse(200, { result: '0x' + wordHex(appSuspended ? 1 : 0) });
+      case SELECTOR.status:
+        return jsonResponse(200, { result: '0x' + wordHex(status) });
+      case SELECTOR.publisherStatus:
+        return jsonResponse(200, { result: '0x' + wordHex(publisherStatus) });
+      default:
+        throw new Error(`unexpected eth_call selector ${data.slice(0, 10)}`);
+    }
+  };
+}
+const registeredRpc = appRpc();
 
 function baseEnv(overrides = {}) {
   return {
     PINATA_JWT: 'test-jwt',
     PINATA_GROUP_PREFIX: 'testnet',
     STUB_REGISTRATION_CHECK: 'false',
-    // No SUBSCRIPTION_CONTRACT_ADDRESS: the gate contract comes from the SDK now.
-    // Tests that care about the override set it explicitly.
+    // No contract addresses: the gate contracts come from the SDK.
     ...overrides,
   };
 }
@@ -141,8 +180,9 @@ function mockKV(initial = {}) {
 }
 
 const utcDay = () => new Date().toISOString().slice(0, 10);
-const usageKey = (account) => `bytes:${account.address.toLowerCase()}:${utcDay()}`;
-const totalKey = (account) => `total:${account.address.toLowerCase()}`;
+// Byte counters are per app: the app is what pays.
+const usageKey = (appId) => `bytes:${appId}:${utcDay()}`;
+const groupName = (appId, account = ACCOUNT) => `testnet:${appId}:${account.address.toLowerCase()}`;
 
 /* ── success modes ───────────────────────────────────────────────────────── */
 
@@ -169,6 +209,9 @@ test('registered on-chain + valid signature → 200 with uploadUrl', async () =>
   assert.equal(res.json.ok, true);
   assert.equal(res.json.uploadUrl, 'https://uploads.pinata.cloud/signed/xyz');
   assert.equal(res.json.stubbed, undefined);
+  // The whole grant costs two chain reads: who the caller is, and where they stand
+  // in the app.
+  assert.equal(rpcCalls.length, 2);
 });
 
 test('PINATA_ALLOW_MIME_TYPES → forwarded to Pinata as a trimmed allow_mime_types', async () => {
@@ -182,16 +225,16 @@ test('PINATA_ALLOW_MIME_TYPES → forwarded to Pinata as a trimmed allow_mime_ty
   assert.deepEqual(payload.allow_mime_types, ['application/octet-stream', 'text/plain']);
 });
 
-/* ── per-wallet Pinata group ─────────────────────────────────────────────── */
+/* ── per-app, per-wallet Pinata group ────────────────────────────────────── */
 
-test('mint files the upload under a per-wallet group named <prefix>:<wallet>', async () => {
+test('mint files the upload under a group named <prefix>:<appId>:<wallet>', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = pinataOk;
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 200);
   // Signed into the upload URL, so the uploader can't file the pin elsewhere.
   assert.equal(JSON.parse(lastPinataInit.body).group_id, GROUP_ID);
-  const name = `testnet:${ACCOUNT.address.toLowerCase()}`;
+  const name = groupName(DEFAULT_APP_ID);
   assert.equal(JSON.parse(groupCalls.at(-1).init.body).name, name);
   assert.match(groupCalls[0].url, new RegExp(`name=${encodeURIComponent(name)}`));
 });
@@ -199,7 +242,7 @@ test('mint files the upload under a per-wallet group named <prefix>:<wallet>', a
 test('an existing group is adopted by name, not duplicated', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = pinataOk;
-  const name = `testnet:${ACCOUNT.address.toLowerCase()}`;
+  const name = groupName(DEFAULT_APP_ID);
   // Substring match — the worker must pick the exact name, not groups[0].
   groupsResponse = () => jsonResponse(200, { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] });
   const res = await call(baseEnv(), { body: await proof() });
@@ -217,7 +260,7 @@ test('the wallet→group id is cached in KV across mints', async () => {
   await call(env, { body: p });
   const afterFirst = groupCalls.length;
   await call(env, { body: p });
-  assert.equal(kv._store.get(`group:testnet:${ACCOUNT.address.toLowerCase()}`), GROUP_ID);
+  assert.equal(kv._store.get(`group:${groupName(DEFAULT_APP_ID)}`), GROUP_ID);
   assert.equal(groupCalls.length, afterFirst); // second mint hit the cache
 });
 
@@ -244,35 +287,18 @@ test('unsupported method → 405', async () => {
   assert.equal(res.status, 405);
 });
 
-test('gate contract comes from the SDK, with no address configured', async () => {
+test('gate contracts come from the SDK, with no address configured', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = pinataOk;
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 200);
-  // The `to` of the access() eth_call IS the deployment gated on. Asserting it
-  // against the SDK is what would have caught the worker sitting on a stale
-  // SubscriptionRegistry while the SDK had moved on.
-  assert.equal(
-    lastRpcCall.params[0].to.toLowerCase(),
-    FangornConfig.subscriptionRegistryContractAddress.toLowerCase(),
-  );
-});
-
-test('SUBSCRIPTION_CONTRACT_ADDRESS overrides the SDK when set', async () => {
-  rpcResponse = registeredRpc;
-  pinataResponse = pinataOk;
-  const override = '0x9a3811b365a4aeea1626eaad185b273424ae5e48';
-  const res = await call(baseEnv({ SUBSCRIPTION_CONTRACT_ADDRESS: override }), { body: await proof() });
-  assert.equal(res.status, 200);
-  assert.equal(lastRpcCall.params[0].to.toLowerCase(), override);
-});
-
-test('non-stubbed + unusable address → 502 (no silent fallback)', async () => {
-  // The SDK always carries one, so the only way to reach the throw is an override
-  // that is set but malformed. It must fail rather than quietly using the SDK's —
-  // an operator who typo'd an emergency repoint has to hear about it.
-  const res = await call(baseEnv({ SUBSCRIPTION_CONTRACT_ADDRESS: '0xnope' }), { body: await proof() });
-  assert.equal(res.status, 502);
+  // The `to` of each eth_call IS the deployment gated on. Asserting it against the
+  // SDK is what catches the worker sitting on a stale registry while the SDK has
+  // moved on.
+  const [status] = callsTo(SELECTOR.publisherStatus);
+  assert.equal(status.params[0].to.toLowerCase(), FangornConfig.dataRegistryContractAddress.toLowerCase());
+  const [access] = callsTo(SELECTOR.access);
+  assert.equal(access.params[0].to.toLowerCase(), FangornConfig.appRegistryContractAddress.toLowerCase());
 });
 
 test('invalid address → 400', async () => {
@@ -317,10 +343,18 @@ test('stale challenge (Issued-At too old) → 401', async () => {
 });
 
 test('address not registered → 403', async () => {
-  rpcResponse = notRegisteredRpc;
+  rpcResponse = appRpc({ publisherStatus: 0 });
   const res = await call(baseEnv({ REGISTER_URL: 'https://fangorn.network' }), { body: await proof() });
   assert.equal(res.status, 403);
   assert.match(res.json.error, /not registered/);
+});
+
+test('publisher suspended network-wide → 403 that says so, not "register"', async () => {
+  rpcResponse = appRpc({ publisherStatus: 2 }); // pinataResponse null: a mint would throw
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /suspended from publishing/i);
+  assert.doesNotMatch(res.json.error, /register/i);
 });
 
 test('RPC failure → 502', async () => {
@@ -347,18 +381,18 @@ test('missing PINATA_JWT → 502', async () => {
   assert.match(res.json.error, /Failed to create Pinata upload URL/);
 });
 
-/* ── per-wallet byte budget ──────────────────────────────────────────────── */
+/* ── per-app byte budget ─────────────────────────────────────────────────── */
 
 test('declared size under budget → 200, URL scoped to size, debits bytes', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = pinataOk;
-  const kv = mockKV({ [usageKey(ACCOUNT)]: 1000 });
+  const kv = mockKV({ [usageKey(DEFAULT_APP_ID)]: 1000 });
   const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const res = await call(env, { body: { ...(await proof()), size: 4000 } });
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
   assert.equal(res.json.maxFileSize, 4000 + 4096);              // requested + headroom
-  assert.equal(kv._store.get(usageKey(ACCOUNT)), '5000');       // 1000 + declared 4000
+  assert.equal(kv._store.get(usageKey(DEFAULT_APP_ID)), '5000');       // 1000 + declared 4000
 });
 
 test('requested size over the per-upload ceiling → 413 (no mint)', async () => {
@@ -371,129 +405,213 @@ test('requested size over the per-upload ceiling → 413 (no mint)', async () =>
 
 test('declared size over remaining budget → 429 and never mints', async () => {
   rpcResponse = registeredRpc; // pinataResponse null: a mint would throw
-  const kv = mockKV({ [usageKey(ACCOUNT)]: 9000 });
+  const kv = mockKV({ [usageKey(DEFAULT_APP_ID)]: 9000 });
   const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const res = await call(env, { body: { ...(await proof()), size: 2000 } });
   assert.equal(res.status, 429);
   assert.match(res.json.error, /budget reached/i);
-  assert.equal(kv._store.get(usageKey(ACCOUNT)), '9000'); // unchanged — no grant
+  assert.equal(kv._store.get(usageKey(DEFAULT_APP_ID)), '9000'); // unchanged — no grant
 });
 
 test('failed mint does not consume budget', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = () => jsonResponse(500, { error: 'nope' });
-  const kv = mockKV({ [usageKey(ACCOUNT)]: 100 });
+  const kv = mockKV({ [usageKey(DEFAULT_APP_ID)]: 100 });
   const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const res = await call(env, { body: { ...(await proof()), size: 2000 } });
   assert.equal(res.status, 502);
-  assert.equal(kv._store.get(usageKey(ACCOUNT)), '100'); // no grant, no charge
+  assert.equal(kv._store.get(usageKey(DEFAULT_APP_ID)), '100'); // no grant, no charge
 });
 
 test('retry with same uploadId re-mints but is charged once', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = pinataOk;
-  const kv = mockKV({ [usageKey(ACCOUNT)]: 1000 });
+  const kv = mockKV({ [usageKey(DEFAULT_APP_ID)]: 1000 });
   const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const body = { ...(await proof()), size: 3000, uploadId: 'up-1' };
   const first = await call(env, { body });
   const second = await call(env, { body }); // same uploadId = a retry
   assert.equal(first.status, 200);
   assert.equal(second.status, 200);       // re-mints a fresh URL
-  assert.equal(kv._store.get(usageKey(ACCOUNT)), '4000'); // 1000 + 3000 once, not twice
+  assert.equal(kv._store.get(usageKey(DEFAULT_APP_ID)), '4000'); // 1000 + 3000 once, not twice
 });
 
 test('reusing an uploadId for a larger size is charged the larger size', async () => {
   rpcResponse = registeredRpc;
   pinataResponse = pinataOk;
-  const kv = mockKV({ [usageKey(ACCOUNT)]: 0 });
+  const kv = mockKV({ [usageKey(DEFAULT_APP_ID)]: 0 });
   const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const p = await proof();
   await call(env, { body: { ...p, size: 2000, uploadId: 'up-2' } }); // pays 2000
   await call(env, { body: { ...p, size: 5000, uploadId: 'up-2' } }); // larger → charged
-  assert.equal(kv._store.get(usageKey(ACCOUNT)), '7000'); // 2000 + 5000
+  assert.equal(kv._store.get(usageKey(DEFAULT_APP_ID)), '7000'); // 2000 + 5000
 });
 
-/* ── free tier + on-chain subscription ───────────────────────────────────── */
+/* ── the app's subscription ──────────────────────────────────────────────── */
 
-test('under the free tier → 200, debits the lifetime counter, no window check', async () => {
-  // access() returns registered=true, paidAt=0. Under the free tier the window
-  // check is skipped, so paidAt=0 doesn't matter and the upload mints.
-  rpcResponse = registeredRpc;
+test('lapsed or never-paid app → 402 on the first byte, naming the owner (never mints)', async () => {
+  // paidAt 0 cannot happen for a claimed app (claiming pays), but pins the guard.
+  for (const paidAt of [nowSec() - 40 * 86400, 0]) {
+    rpcResponse = appRpc({ paidAt }); // pinataResponse null: a mint would throw
+    const kv = mockKV();
+    const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', RATE_KV: kv });
+    const res = await call(env, { body: { ...(await proof()), size: 1, appId: APP_ID } });
+    assert.equal(res.status, 402);
+    assert.match(res.json.error, new RegExp(`app ${APP_ID} is inactive`));
+    assert.match(res.json.error, new RegExp(OWNER.address, 'i'));
+    assert.match(res.json.error, /fangorn\.network\/subscribe/); // default SUBSCRIBE_URL
+    assert.equal(kv._store.size, 0); // no grant, no charge
+    assert.equal(groupCalls.length, 0);
+  }
+});
+
+test('SUBSCRIPTION_WINDOW_DAYS sets how long a payment lasts', async () => {
+  rpcResponse = appRpc({ paidAt: nowSec() - 40 * 86400 });
+  pinataResponse = pinataOk;
+  const res = await call(baseEnv({ SUBSCRIPTION_WINDOW_DAYS: '60' }), { body: await proof() });
+  assert.equal(res.status, 200);
+});
+
+/* ── app membership (every request) ──────────────────────────────────────── */
+
+test('no appId → the default app is checked, and billed', async () => {
+  rpcResponse = appRpc();
   pinataResponse = pinataOk;
   const kv = mockKV();
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
   const res = await call(env, { body: { ...(await proof()), size: 4000 } });
   assert.equal(res.status, 200);
-  assert.equal(kv._store.get(totalKey(ACCOUNT)), '4000');
+  // access(defaultApp, caller): selector, then the two argument words.
+  const [access] = callsTo(SELECTOR.access);
+  assert.equal(
+    access.params[0].data,
+    SELECTOR.access + DEFAULT_APP_ID.slice(2) + ACCOUNT.address.slice(2).toLowerCase().padStart(64, '0'),
+  );
+  assert.equal(kv._store.get(usageKey(DEFAULT_APP_ID)), '4000');
 });
 
-test('past the free tier with an active subscription → 200', async () => {
-  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() });
+test('never added by the app owner → 403 saying to ask them (never mints)', async () => {
+  // Globally registered, but not a publisher of the app — default or named.
+  for (const [body, appId] of [[{}, DEFAULT_APP_ID], [{ appId: APP_ID }, APP_ID]]) {
+    rpcResponse = appRpc({ member: false }); // pinataResponse null: a mint would throw
+    const res = await call(baseEnv(), { body: { ...(await proof()), ...body } });
+    assert.equal(res.status, 403);
+    assert.match(res.json.error, new RegExp(`not a publisher of app ${appId}`));
+    assert.match(res.json.error, /owner to add/);
+    assert.equal(groupCalls.length, 0);
+  }
+});
+
+test('added but terms not accepted yet → 403 asking them to join', async () => {
+  rpcResponse = appRpc({ member: false, status: 3 });
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /has not accepted its terms yet/);
+  assert.equal(groupCalls.length, 0);
+});
+
+test('suspended app → 403 that names the suspension (never mints)', async () => {
+  // Memberships survive an app takedown, so the caller is still ACTIVE underneath.
+  rpcResponse = appRpc({ member: false, appSuspended: true, status: 1 });
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, new RegExp(`App ${APP_ID} is suspended`));
+  assert.equal(groupCalls.length, 0);
+});
+
+test('publisher suspended from the app → 403 that names the suspension (never mints)', async () => {
+  rpcResponse = appRpc({ member: false, status: 2 });
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, new RegExp(`suspended from app ${APP_ID}`));
+  assert.equal(groupCalls.length, 0);
+});
+
+test('member on stale terms → 403 asking them to re-accept', async () => {
+  rpcResponse = appRpc({ member: false, status: 1 });
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: APP_ID } });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /has not accepted the current terms/);
+});
+
+test('RPC failure on the app read → 502 (never mints)', async () => {
+  const ok = appRpc();
+  rpcResponse = (url, init) =>
+    JSON.parse(init.body).params[0].data.startsWith(SELECTOR.access)
+      ? jsonResponse(500, { error: 'rpc down' })
+      : ok(url, init);
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 502);
+  assert.match(res.json.error, /access check failed/i);
+});
+
+/* ── app-scoped uploads ──────────────────────────────────────────────────── */
+
+test('appId → group is <prefix>:<appId>:<wallet>, and bytes bill that app', async () => {
+  rpcResponse = appRpc();
   pinataResponse = pinataOk;
-  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
-  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
+  const kv = mockKV();
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const res = await call(env, { body: { ...(await proof()), size: 4000, appId: APP_ID } });
   assert.equal(res.status, 200);
-  assert.equal(kv._store.get(totalKey(ACCOUNT)), '11000'); // keeps climbing past the limit
+  assert.equal(JSON.parse(groupCalls.at(-1).init.body).name, groupName(APP_ID));
+  // The named app's counter moved; the default app's did not.
+  assert.equal(kv._store.get(usageKey(APP_ID)), '4000');
+  assert.equal(kv._store.get(usageKey(DEFAULT_APP_ID)), undefined);
 });
 
-test('past the free tier with no subscription → 402 (never mints)', async () => {
-  rpcResponse = accessRpc({ registered: true, paidAt: 0 }); // never subscribed
-  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
-  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
-  assert.equal(res.status, 402);
-  assert.match(res.json.error, /sign up for a subscription/i);
-  assert.match(res.json.error, /fangorn\.network\/subscribe/); // default SUBSCRIBE_URL
-  assert.equal(kv._store.get(totalKey(ACCOUNT)), '9000'); // unchanged — no grant
-});
-
-test('past the free tier with a stale (>30d) subscription → 402', async () => {
-  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() - 40 * 86400 });
-  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
-  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
-  assert.equal(res.status, 402);
-});
-
-test('a subscriber past the free tier is still bound by the daily cap → 429', async () => {
-  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() }); // active sub
-  const kv = mockKV({ [totalKey(ACCOUNT)]: 20000, [usageKey(ACCOUNT)]: 4000 });
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', DAILY_BYTE_LIMIT: '5000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
-  const res = await call(env, { body: { ...(await proof()), size: 2000 } });
-  assert.equal(res.status, 429);
-  assert.match(res.json.error, /budget reached/i);
-});
-
-test('retry past the free tier (same uploadId) is charged once', async () => {
-  rpcResponse = accessRpc({ registered: true, paidAt: nowSec() });
+test('one daily budget covers every publisher of an app', async () => {
+  rpcResponse = appRpc();
   pinataResponse = pinataOk;
-  const kv = mockKV({ [totalKey(ACCOUNT)]: 9000 });
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
-  const body = { ...(await proof()), size: 2000, uploadId: 'sub-1' };
-  const first = await call(env, { body });
-  const second = await call(env, { body }); // same uploadId = a retry
+  const kv = mockKV();
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '5000', MAX_UPLOAD_SIZE: '10000', RATE_KV: kv });
+  const first = await call(env, { body: { ...(await proof(ACCOUNT)), size: 3000, appId: APP_ID } });
+  const second = await call(env, { body: { ...(await proof(OTHER)), size: 3000, appId: APP_ID } });
   assert.equal(first.status, 200);
-  assert.equal(second.status, 200);
-  assert.equal(kv._store.get(totalKey(ACCOUNT)), '11000'); // 9000 + 2000 once, not twice
+  assert.equal(second.status, 429); // a different wallet, the same app's budget
+  assert.equal(kv._store.get(usageKey(APP_ID)), '3000');
+});
+
+test('unclaimed app (owner 0x0) → 403, never billed', async () => {
+  // member: false is what the chain reports (nobody can join an app nobody owns);
+  // member: true cannot happen on-chain and pins the guard behind it.
+  for (const member of [false, true]) {
+    rpcResponse = appRpc({ member, owner: '0x' + '0'.repeat(40) });
+    const kv = mockKV();
+    const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', RATE_KV: kv });
+    const res = await call(env, { body: { ...(await proof()), appId: APP_ID } });
+    assert.equal(res.status, 403);
+    assert.match(res.json.error, /no owner on-chain/i);
+    assert.equal(kv._store.size, 0);
+  }
+});
+
+test('malformed appId → 400 before any chain call', async () => {
+  const res = await call(baseEnv(), { body: { ...(await proof()), appId: '0xdeadbeef' } });
+  assert.equal(res.status, 400);
+  assert.match(res.json.error, /32-byte hex/);
 });
 
 /* ── usage endpoint ──────────────────────────────────────────────────────── */
 
-test('GET /usage → byte counters + limits (no proof, no RPC)', async () => {
+test('GET /usage → an app\'s byte counter + limit (no proof, no RPC)', async () => {
   // rpcResponse/pinataResponse stay null: /usage must hit neither.
-  const kv = mockKV({ [totalKey(ACCOUNT)]: 500, [usageKey(ACCOUNT)]: 200 });
-  const env = baseEnv({ FREE_BYTE_LIMIT: '10000', DAILY_BYTE_LIMIT: '5000', RATE_KV: kv });
-  const res = await worker.fetch(new Request(`https://worker.test/usage?address=${ACCOUNT.address}`), env);
+  const kv = mockKV({ [usageKey(APP_ID)]: 200, [usageKey(DEFAULT_APP_ID)]: 7 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '5000', RATE_KV: kv });
+  const res = await worker.fetch(new Request(`https://worker.test/usage?appId=${APP_ID}`), env);
   assert.equal(res.status, 200);
   const body = await res.json();
-  assert.equal(body.total, 500);
-  assert.equal(body.freeLimit, 10000);
+  assert.equal(body.appId, APP_ID);
   assert.equal(body.daily, 200);
   assert.equal(body.dailyLimit, 5000);
+
+  // No appId → the default app, the same fallback a mint applies.
+  const fallback = await (await worker.fetch(new Request('https://worker.test/usage'), env)).json();
+  assert.equal(fallback.appId, DEFAULT_APP_ID);
+  assert.equal(fallback.daily, 7);
 });
 
-test('GET /usage with a bad address → 400', async () => {
-  const res = await worker.fetch(new Request('https://worker.test/usage?address=nope'), baseEnv());
+test('GET /usage with a bad appId → 400', async () => {
+  const res = await worker.fetch(new Request('https://worker.test/usage?appId=nope'), baseEnv());
   assert.equal(res.status, 400);
 });
