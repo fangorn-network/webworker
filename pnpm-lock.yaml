@@ -34,8 +34,8 @@ importers:
   fangorn-access-worker:
     dependencies:
       '@fangorn-network/sdk':
-        specifier: 2026.9.22-dev
-        version: 2026.9.22-dev(encoding@0.1.13)(graphql@16.14.2)(react-native@0.87.1(@babel/core@7.29.7)(react@19.3.0))(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)
+        specifier: 2026.8.18-dev
+        version: 2026.8.18-dev(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)
       viem:
         specifier: ^2.0.0
         version: 2.54.6(typescript@5.9.3)(zod@4.4.3)
@@ -72,8 +72,8 @@ importers:
   quickbeam-registry:
     dependencies:
       '@fangorn-network/sdk':
-        specifier: 2026.9.22-dev
-        version: 2026.9.22-dev(encoding@0.1.13)(graphql@16.14.2)(react-native@0.87.1(@babel/core@7.29.7)(react@19.3.0))(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)
+        specifier: 2026.8.18-dev
+        version: 2026.8.18-dev(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)
       viem:
         specifier: ^2.54.6
         version: 2.54.6(typescript@5.9.3)(zod@4.4.3)
@@ -445,6 +445,11 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@fangorn-network/sdk@2026.8.18-dev':
+    resolution: {integrity: sha512-PgySxlwJ4VLtBkMsT72OA4j2hPt81G1lMw0EytIkG8qN4Z7GixFYEueXrRInxULNTOUgMwNc3BCRY8qNOuHHDw==}
+    engines: {node: '>=20.19.0'}
+    hasBin: true
 
   '@fangorn-network/sdk@2026.9.22-dev':
     resolution: {integrity: sha512-sdWHVzy7YsBaWiXLvdds4yX29zUYW5gSvtDUDbFSxwvlXjBSZ3TFXGV6msFRnZTGJUzRMzCQA0nO9V1NhEvLcQ==}
@@ -3568,6 +3573,30 @@ snapshots:
 
   '@esbuild/win32-x64@0.28.1':
     optional: true
+
+  '@fangorn-network/sdk@2026.8.18-dev(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)':
+    dependencies:
+      '@clack/prompts': 1.7.0
+      '@ipld/car': 5.4.7
+      '@ipld/dag-cbor': 10.0.2
+      '@ipld/unixfs': 3.0.0
+      '@noble/ciphers': 1.3.0
+      '@noble/curves': 1.9.7
+      '@noble/hashes': 2.4.0
+      commander: 14.0.3
+      dotenv: 17.4.2
+      multiformats: 14.0.5
+      pinata: 2.5.6(react@19.3.0)
+      solc: 0.8.36
+      viem: 2.54.6(typescript@5.9.3)(zod@4.4.3)
+    transitivePeerDependencies:
+      - bufferutil
+      - debug
+      - react
+      - react-dom
+      - typescript
+      - utf-8-validate
+      - zod
 
   '@fangorn-network/sdk@2026.9.22-dev(encoding@0.1.13)(graphql@16.14.2)(react-native@0.87.1(@babel/core@7.29.7)(react@19.3.0))(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)':
     dependencies:
