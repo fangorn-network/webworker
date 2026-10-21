@@ -2,22 +2,20 @@
  * pinata-url-provider — a self-contained Cloudflare Worker.
  *
  * Flow:
- *   1. The caller proves control of an address by signing a one-time challenge
- *      (EIP-191 `personal_sign`). If the signature doesn't verify, the request is
- *      rejected with "Verification failed…" — see `verifyCallerOwnsAddress()`.
- *   2. The worker reads the caller's network-wide standing from the DataRegistry
- *      (`getPublisherStatus`) and, in the same round, `access(appId, address)` from
- *      the AppRegistry — both Stylus contracts on Arbitrum Sepolia, addresses from
- *      the Fangorn SDK. This can be stubbed for local dev with
- *      STUB_REGISTRATION_CHECK="true".
- *   2b. Nobody publishes outside an app, and an app IS a storage subscription. The
- *      caller must be an active publisher of the app they publish to (the `appId`
- *      they pass, else the SDK's default app): added by its owner, on its current
- *      terms, not suspended. And the app must have paid within
- *      SUBSCRIPTION_WINDOW_DAYS. Every byte is billed to the app.
- *   3. If all of that holds, the worker mints a short-lived Pinata *presigned upload
- *      URL* and returns it, so the caller can pin one file to IPFS without ever
- *      seeing your Pinata JWT.
+ *   1. The caller names the app the upload is for (`appId`, required: an app is
+ *      sponsored storage, and every byte is billed to one).
+ *   2. The caller proves control of an address by signing a one-time challenge
+ *      (EIP-191 `personal_sign`) that names the address AND the app, so a signature
+ *      is good for that app only. If it doesn't verify, the request is rejected with
+ *      "Verification failed…" — see `verifyCallerOwnsAddress()`.
+ *   3. One read decides: `access(appId, address)` on the AppRegistry on Base Sepolia
+ *      (address from the Fangorn SDK's BaseSepoliaConfig). Its `canPublish` holds
+ *      while the app is claimed, not taken down and paid up, the wallet is not
+ *      banned network-wide, and the app's owner has accepted the wallet and not
+ *      suspended it. A refusal is explained with a few more reads, on that path only.
+ *   4. If it holds, the worker mints a short-lived Pinata *presigned upload URL* and
+ *      returns it, so the caller can pin one file to IPFS without ever seeing your
+ *      Pinata JWT.
  *
  * Dependencies are `viem` (signature recovery + selector encoding) and the Fangorn
  * SDK, which supplies the deployment addresses. Everything else is driven by
@@ -28,7 +26,7 @@ import { recoverMessageAddress, toFunctionSelector } from 'viem';
 // Deep import on purpose: `lib/config.js` pulls in nothing but viem, while the SDK's
 // package root reaches the harness (node `fs`/`path`) and the graph engine — none of
 // which a workerd bundle can or should carry.
-import { DEFAULT_APP, FangornConfig, toAppId } from '@fangorn-network/sdk/lib/config.js';
+import { BaseSepoliaConfig } from '@fangorn-network/sdk/lib/config.js';
 
 export default {
   async fetch(request, env) {
@@ -48,7 +46,7 @@ export default {
     // ownership proof below.
     const url = new URL(request.url);
     if (url.pathname === '/usage') {
-      const usageApp = (url.searchParams.get('appId') || DEFAULT_APP_ID).toLowerCase();
+      const usageApp = (url.searchParams.get('appId') || '').toLowerCase();
       if (!isBytes32(usageApp)) {
         return json(400, { error: 'Provide a valid app id via ?appId=0x… (0x + 64 hex chars).' }, cors);
       }
@@ -70,16 +68,18 @@ export default {
       return json(400, { error: 'Provide a valid EVM address via ?address=0x… or JSON body { "address": "0x…" }.' }, cors);
     }
 
-    // The app this upload lands in — and is billed to. Every publish lands in an
-    // app, so a caller who names none means the SDK's default one, the same
-    // fallback the SDK applies to the commit that follows.
-    const appId = (input.appId || DEFAULT_APP_ID).toLowerCase();
+    // The app this upload is billed to. Required: there is no default app, and no
+    // storage outside an app.
+    if (!input.appId) {
+      return json(400, { error: 'Provide the app this upload is for via appId (0x + 64 hex chars).' }, cors);
+    }
+    const appId = input.appId.toLowerCase();
     if (!isBytes32(appId)) {
       return json(400, { error: 'appId must be a 32-byte hex string (0x + 64 hex chars).' }, cors);
     }
 
     // Prove the caller controls `address` via a signed challenge (always required).
-    const ownership = await verifyCallerOwnsAddress(input, address, env);
+    const ownership = await verifyCallerOwnsAddress(input, address, appId, env);
     if (!ownership.ok) {
       return json(401, {
         ok: false,
@@ -90,56 +90,17 @@ export default {
       }, cors);
     }
 
-    // 1) On-chain gate — two reads, one round: the caller's network-wide standing,
-    // and the AppRegistry's `access` view for (app, caller). STUB_REGISTRATION_CHECK
-    // skips the chain entirely (a valid signature alone suffices — dev/testing
-    // without an RPC), and the subscription then reads as active.
-    const stubbed = (env.STUB_REGISTRATION_CHECK ?? 'false') === 'true';
-    if (!stubbed) {
-      const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
-      let access;
-      try {
-        const [status, appAccess] = await Promise.all([
-          readPublisherStatus(env, address),
-          readAccess(env, appId, address),
-        ]);
-        if (status !== STATUS_ACTIVE) {
-          return json(403, {
-            ok: false,
-            address,
-            // A suspended wallet reads as "not registered" to a boolean check,
-            // and telling them to register is the wrong advice.
-            error: status === STATUS_SUSPENDED
-              ? 'This public key has been suspended from publishing on Fangorn.'
-              : `This public key is not registered. Please login on ${registerUrl} to register.`,
-          }, cors);
-        }
-        access = appAccess;
-        if (access.owner === ZERO_ADDRESS) {
-          // Unclaimed app: there is no subscription to bill and nobody to be a
-          // publisher of it.
-          return json(403, { ok: false, address, error: `App ${appId} has no owner on-chain.` }, cors);
-        }
-        // Membership is what DataRegistry.commitStateRoot enforces too, so a URL is
-        // never minted for a push that would revert.
-        if (!access.registered) {
-          return json(403, { ok: false, address, error: await appDenialReason(env, appId, address) }, cors);
-        }
-      } catch (err) {
-        return json(502, { error: 'On-chain access check failed.', detail: String(err?.message || err) }, cors);
+    // 1) On-chain gate — one read when it passes: `access(appId, caller)`. Its
+    // `canPublish` is the AppRegistry's single rule for who an app provides
+    // storage to, so the worker adds no rules of its own.
+    try {
+      const access = await readAccess(env, appId, address);
+      if (!access.canPublish) {
+        const denial = await denialReason(env, appId, address, access);
+        return json(denial.status, { ok: false, address, error: denial.error }, cors);
       }
-
-      // The app's subscription must be active: paid within the window. There is
-      // no free tier — claiming an app is paying for it, so every app has paid at
-      // least once and a lapsed one stops here until its owner renews.
-      if (!isWithinWindow(env, access.paidAt)) {
-        const subscribeUrl = env.SUBSCRIBE_URL || 'https://fangorn.network/subscribe';
-        return json(402, {
-          ok: false,
-          address,
-          error: `The storage subscription for app ${appId} is inactive. Its owner (${access.owner}) must renew it at ${subscribeUrl}`,
-        }, cors);
-      }
+    } catch (err) {
+      return json(502, { error: 'On-chain access check failed.', detail: String(err?.message || err) }, cors);
     }
 
     // Resolve the upload size the caller declared (the SDK sends its exact byte
@@ -190,8 +151,8 @@ export default {
       }
     }
 
-    // 2) Granted (or stubbed) — issue a Pinata presigned upload URL scoped to
-    // the requested size (plus a little multipart/form-data headroom).
+    // 2) Granted — issue a Pinata presigned upload URL scoped to the requested
+    // size (plus a little multipart/form-data headroom).
     try {
       const maxFileSize = size + UPLOAD_HEADROOM;
       const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, appId);
@@ -206,7 +167,6 @@ export default {
         network: env.PINATA_NETWORK || 'public',
         maxFileSize,
         expiresIn: Number(env.PINATA_URL_EXPIRES || 300),
-        ...(stubbed ? { stubbed: true } : {}),
       }, cors);
     } catch (err) {
       return json(502, { error: 'Failed to create Pinata upload URL.', detail: String(err?.message || err) }, cors);
@@ -216,35 +176,24 @@ export default {
 
 /* ───────────────────────── on-chain access gate ────────────────────────── */
 
-// The deployment comes from the SDK, which is the only thing that knows which
-// contracts belong together: the AppRegistry gated on here must be the one the
-// SDK's DataRegistry consults on `commitStateRoot`, or the gate and the commit
-// disagree about who may publish. So neither address is configurable — the SDK
+// The deployment is Base Sepolia's, from the SDK, which is the only thing that
+// knows which contracts belong together. The address is not configurable: an SDK
 // version bump is the repoint.
-const DEFAULT_RPC_URL = FangornConfig.rpcUrl;
-const SDK_APP_REGISTRY_ADDRESS = FangornConfig.appRegistryContractAddress;
-const SDK_DATA_REGISTRY_ADDRESS = FangornConfig.dataRegistryContractAddress;
+const DEFAULT_RPC_URL = BaseSepoliaConfig.rpcUrl;
+const SDK_APP_REGISTRY_ADDRESS = BaseSepoliaConfig.appRegistryContractAddress;
 
-// The AppRegistry view `access(bytes32 appId, address) -> (bool registered,
-// address owner, uint64 paidAt)`: one read for membership, who owns the app, and
-// when its subscription was last paid. `registered` is `isRegisteredForApp` (false
-// for a suspended app, a suspended or merely-invited publisher, or stale accepted
-// terms). Stylus exposes the Rust method as camelCase.
+// The AppRegistry view `access(bytes32 appId, address) -> (bool canPublish,
+// address owner, uint64 expiresAt)`: whether the app provides this wallet storage
+// now, who owns the app, and when its subscription expires (0 once cancelled).
 const ACCESS_FUNCTION = 'access(bytes32,address)';
-// Read only to explain a denial — see appDenialReason().
+// Read only to explain a denial — see denialReason().
 const APP_SUSPENDED_FUNCTION = 'isAppSuspended(bytes32)';
+const GLOBAL_SUSPENSION_FUNCTION = 'globalSuspensions(address)';
 const APP_STATUS_FUNCTION = 'statusForApp(bytes32,address)';
-// DataRegistry's network-wide lifecycle status.
-const PUBLISHER_STATUS_FUNCTION = 'getPublisherStatus(address)';
-// Lifecycle codes shared by both registries (0 = unregistered). INVITED exists only
-// per app: added by the owner, terms not yet accepted.
-const STATUS_ACTIVE = 1n;
+// AppRegistry.Status: 0 None (never accepted), 1 Active, 2 Suspended, 3 Invited
+// (retired, from the old join flow; not a member).
 const STATUS_SUSPENDED = 2n;
-const STATUS_INVITED = 3n;
 const ZERO_ADDRESS = '0x' + '0'.repeat(40);
-// The app a publish lands in when the caller names none — the same fallback the SDK
-// applies to its registry clients, so the check here matches the commit that follows.
-const DEFAULT_APP_ID = toAppId(DEFAULT_APP);
 
 /** A registry address from the SDK, or a loud failure — never a silent fallback. */
 function sdkAddress(address, name) {
@@ -279,74 +228,64 @@ async function ethCall(env, to, signature, words) {
 }
 
 /**
- * `getPublisherStatus(address)` on the DataRegistry: the caller's network-wide
- * standing (0 unregistered, 1 active, 2 suspended). App membership alone is not
- * enough to publish — the DataRegistry rejects a commit from a wallet that never
- * registered, or that the protocol admin suspended.
- */
-async function readPublisherStatus(env, address) {
-  const result = await ethCall(
-    env, sdkAddress(SDK_DATA_REGISTRY_ADDRESS, 'dataRegistryContractAddress'),
-    PUBLISHER_STATUS_FUNCTION, [encodeAddress(address)]);
-  return wordAt(result, 0);
-}
-
-/**
  * One `eth_call` to the AppRegistry's `access(appId, address)` view, returning
- * `{ registered, owner, paidAt }`. `owner` is the zero address for an unclaimed
- * app; `paidAt` is the app's last subscription payment (Unix seconds bigint). The
- * worker applies the active-window policy itself.
+ * `{ canPublish, owner, expiresAt }`. `owner` is the zero address for an unclaimed
+ * app; `expiresAt` is when its subscription expires (Unix seconds bigint, 0 once
+ * cancelled). The contract applies the expiry itself, so `canPublish` already
+ * covers it.
  *
  * Env:
- *   RPC_URL   EVM JSON-RPC endpoint (optional; defaults to the SDK's, currently the
- *             public Arbitrum Sepolia RPC).
+ *   RPC_URL   EVM JSON-RPC endpoint (optional; defaults to the SDK's public Base
+ *             Sepolia RPC).
  */
 async function readAccess(env, appId, address) {
   const result = await ethCall(
     env, sdkAddress(SDK_APP_REGISTRY_ADDRESS, 'appRegistryContractAddress'),
     ACCESS_FUNCTION, [encodeBytes32(appId), encodeAddress(address)]);
-  // Three 32-byte words: [0] bool registered, [1] address owner, [2] uint64 paidAt.
-  return { registered: wordAt(result, 0) !== 0n, owner: addressAt(result, 1), paidAt: wordAt(result, 2) };
+  // Three 32-byte words: [0] bool canPublish, [1] address owner, [2] uint64 expiresAt.
+  return { canPublish: wordAt(result, 0) !== 0n, owner: addressAt(result, 1), expiresAt: wordAt(result, 2) };
 }
 
 /**
- * Why `access` said the caller is not registered. That bool folds several causes
- * into one, and the right advice differs for each, so ask the AppRegistry which it
- * was. Failure path only — a granted upload makes neither of these reads.
+ * Why `access` refused the caller, as `{ status, error }`. `canPublish` folds
+ * several causes into one, and the right advice differs for each: the first two
+ * come from `access` itself, the rest from three more reads. Failure path only —
+ * a granted upload makes none of them.
  */
-async function appDenialReason(env, appId, address) {
+async function denialReason(env, appId, address, access) {
+  if (access.owner === ZERO_ADDRESS) {
+    return { status: 403, error: `App ${appId} has not been claimed: it has no owner on-chain.` };
+  }
+  if (access.expiresAt <= BigInt(Math.floor(Date.now() / 1000))) {
+    const subscribeUrl = env.SUBSCRIBE_URL || 'https://fangorn.network';
+    return {
+      status: 402,
+      error: `The storage subscription for app ${appId} has expired. Its owner (${access.owner}) must renew it at ${subscribeUrl}`,
+    };
+  }
   const apps = sdkAddress(SDK_APP_REGISTRY_ADDRESS, 'appRegistryContractAddress');
   const id = encodeBytes32(appId);
-  const [suspended, status] = await Promise.all([
+  const wallet = encodeAddress(address);
+  const [appSuspended, banned, status] = await Promise.all([
     ethCall(env, apps, APP_SUSPENDED_FUNCTION, [id]),
-    ethCall(env, apps, APP_STATUS_FUNCTION, [id, encodeAddress(address)]),
+    ethCall(env, apps, GLOBAL_SUSPENSION_FUNCTION, [wallet]),
+    ethCall(env, apps, APP_STATUS_FUNCTION, [id, wallet]),
   ]);
-  const registerUrl = env.REGISTER_URL || 'https://fangorn.network';
-  if (wordAt(suspended, 0) !== 0n) return `App ${appId} is suspended.`;
-  switch (wordAt(status, 0)) {
-    case STATUS_SUSPENDED:
-      return `This public key is suspended from app ${appId}.`;
-    case STATUS_ACTIVE:
-      // Still a member, but on a terms hash the app has since moved off (or the
-      // app has none set).
-      return `This public key has not accepted the current terms of app ${appId}. Please accept them on ${registerUrl}.`;
-    case STATUS_INVITED:
-      return `This public key was added to app ${appId} but has not accepted its terms yet. Please join the app on ${registerUrl}.`;
-    default:
-      // Membership is by invitation — there is nothing the caller can do alone.
-      return `This public key is not a publisher of app ${appId}. Ask the app's owner to add it.`;
+  if (wordAt(appSuspended, 0) !== 0n) return { status: 403, error: `App ${appId} has been taken down.` };
+  if (wordAt(banned, 0) !== 0n) {
+    return { status: 403, error: 'This public key has been suspended from publishing on Fangorn.' };
   }
-}
-
-/**
- * Whether a subscription paid at `paidAt` (Unix seconds bigint, 0 = never) is still
- * active — within SUBSCRIPTION_WINDOW_DAYS (default 30) of now. The window lives
- * here, not on-chain, so it's tunable without a contract redeploy.
- */
-function isWithinWindow(env, paidAt) {
-  if (paidAt === 0n) return false;
-  const windowSecs = BigInt(Number(env.SUBSCRIPTION_WINDOW_DAYS || 30) * 86400);
-  return BigInt(Math.floor(Date.now() / 1000)) < paidAt + windowSecs;
+  if (wordAt(status, 0) === STATUS_SUSPENDED) {
+    return { status: 403, error: `This public key is suspended from app ${appId}.` };
+  }
+  if (wordAt(status, 0) !== 1n) {
+    // None, or Invited from the old join flow: either way the owner has not accepted it.
+    return { status: 403, error: `This public key has not been accepted by app ${appId}. Ask the app's owner to accept it.` };
+  }
+  // Every cause above reads clear, yet `access` refused: the chain's block time
+  // passed the expiry before this worker's clock did, or the state changed between
+  // the reads.
+  return { status: 403, error: `This public key may not publish to app ${appId} right now.` };
 }
 
 /* ──────────────────────────── per-app rate cap ─────────────────────────── */
@@ -514,11 +453,12 @@ async function createPinataUploadUrl(env, maxFileSize, address, appId) {
 /**
  * Prove the caller controls `address` by verifying a signed challenge.
  *
- * The caller signs the exact message from `buildChallengeMessage(address, now)`
- * with the private key behind `address` (EIP-191 `personal_sign`) and sends the
- * `message` + `signature` alongside it. We:
+ * The caller signs the exact message from `buildChallengeMessage(address, appId,
+ * now)` with the private key behind `address` (EIP-191 `personal_sign`) and sends
+ * the `message` + `signature` alongside it. We:
  *   1. parse the address + Issued-At back out of the message,
- *   2. require the message to be the canonical template verbatim (no tampering),
+ *   2. require the message to be the canonical template verbatim for this request's
+ *      app (no tampering, and no reuse of a signature made for another app),
  *   3. require Issued-At to be fresh (within SIGNATURE_MAX_AGE) to bound replay,
  *   4. recover the signer from the signature and require it to equal `address`.
  *
@@ -529,16 +469,15 @@ async function createPinataUploadUrl(env, maxFileSize, address, appId) {
  *   { ok: false, error, challenge } — a signature was supplied but did not
  *     verify (wrong key, tampering, or a stale challenge).
  *
- * This is always enforced: the whole point is to bind the registration check to
- * a caller who provably controls the address, so there is no unauthenticated
- * mode.
+ * This is always enforced: the whole point is to bind the on-chain check to a
+ * caller who provably controls the address, so there is no unauthenticated mode.
  *
  * Env:
  *   SIGNATURE_MAX_AGE   How many seconds old an Issued-At may be (default 300).
  */
-async function verifyCallerOwnsAddress(input, address, env) {
+async function verifyCallerOwnsAddress(input, address, appId, env) {
   const now = Math.floor(Date.now() / 1000);
-  const challenge = buildChallengeMessage(address, now);
+  const challenge = buildChallengeMessage(address, appId, now);
 
   const { message, signature } = input;
   // Handshake step 1 — nothing signed yet. Hand back the challenge to sign;
@@ -547,7 +486,7 @@ async function verifyCallerOwnsAddress(input, address, env) {
     return {
       ok: false,
       needsSignature: true,
-      error: 'Sign the `challenge` message below with your private key and resend it as { address, message, signature }.',
+      error: 'Sign the `challenge` message below with your private key and resend it as { address, appId, message, signature }.',
       challenge,
     };
   }
@@ -565,8 +504,8 @@ async function verifyCallerOwnsAddress(input, address, env) {
   if (!parsed) return fail();
   if (parsed.address.toLowerCase() !== address) return fail();
 
-  // Reject anything that is not the canonical template verbatim.
-  if (message !== buildChallengeMessage(parsed.address, parsed.issuedAt)) return fail();
+  // Reject anything that is not the canonical template verbatim, for this app.
+  if (message !== buildChallengeMessage(parsed.address, appId, parsed.issuedAt)) return fail();
 
   // Freshness: bound replay without server-side state. Allow small clock skew.
   const maxAge = Number(env.SIGNATURE_MAX_AGE || 300);
@@ -587,16 +526,18 @@ async function verifyCallerOwnsAddress(input, address, env) {
 
 /**
  * The exact human-readable message a caller must sign to prove address control.
+ * It names the app, so a signature only ever buys uploads for that app.
  * `issuedAt` is unix seconds; freshness is enforced against it above.
  */
-function buildChallengeMessage(address, issuedAt) {
+function buildChallengeMessage(address, appId, issuedAt) {
   return [
     'Fangorn onchain-gate access request',
     '',
     'I am proving that I control the wallet address below so the gate can issue',
-    'me a one-time upload URL. This signature authorizes nothing else.',
+    'me a one-time upload URL for the app below. This signature authorizes nothing else.',
     '',
     `Address: ${address}`,
+    `App: ${appId}`,
     `Issued-At: ${issuedAt}`,
   ].join('\n');
 }

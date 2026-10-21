@@ -2,19 +2,20 @@
 
 A single-file Cloudflare Worker (`src/index.js`) that mints **Pinata presigned upload URLs** for wallets that prove address ownership and pass an on-chain access check. This allows callers to pin to IPFS without ever seeing the Pinata JWT.
 
-Nobody publishes outside an app, and **an app is a storage subscription**: claiming one
-pays the fee, and every upload is billed to the app it lands in.
+**An app is sponsored storage**: its owner pays the subscription, accepts publishers, and
+every upload is billed to the app named in the request. There is no default app and no
+storage outside an app. The contracts are **Base Sepolia's** (`BaseSepoliaConfig` in the
+installed SDK).
 
 Requests get validated on:
 
-1. **Ownership proof.** The caller signs a timestamped challenge with the address's key (EIP-191 `personal_sign`). The worker recovers the signer and requires it to equal the claimed address.
-2. **Network standing.** `DataRegistry.getPublisherStatus(caller)` must be active: registered, and not suspended by the protocol admin.
-3. **App membership.** `AppRegistry.access(appId, caller)` returns `(registered, owner, paidAt)` in one `eth_call`. `registered` is the same per-app check `DataRegistry.commitStateRoot` enforces: true only if the app's owner **added** the wallet and it accepted the current terms, and false for a suspended app or publisher. `appId` is the caller's, or the SDK's default app when they send none.
-4. **Subscription.** `paidAt` — when the app was claimed or last renewed — must be within `SUBSCRIPTION_WINDOW_DAYS`. There is no free tier.
-5. **Daily budget.** The declared upload size is checked against the app's daily byte budget.
-6. **Mint.** `POST /v3/files/sign` at Pinata, scoped to that size, to `PINATA_ALLOW_MIME_TYPES`, and to the caller's Pinata group within the app.
+1. **App.** `appId` is required: the app the upload is for and billed to.
+2. **Ownership proof.** The caller signs a timestamped challenge naming the address and the app, with the address's key (EIP-191 `personal_sign`). The worker recovers the signer and requires it to equal the claimed address, and the challenge to name the requested app.
+3. **Access.** `AppRegistry.access(appId, caller)` returns `(canPublish, owner, expiresAt)` in one `eth_call`. `canPublish` is the contract's single rule for who an app provides storage to: the app is claimed, not taken down and not expired, the wallet is not banned network-wide, and the app's owner has accepted it and not suspended it. The owner is accepted when they claim the app.
+4. **Daily budget.** The declared upload size is checked against the app's daily byte budget.
+5. **Mint.** `POST /v3/files/sign` at Pinata, scoped to that size, to `PINATA_ALLOW_MIME_TYPES`, and to the caller's Pinata group within the app.
 
-Steps 2 and 3 are the only chain reads a granted upload makes, and they run together.
+Step 3 is the only chain read a granted upload makes.
 
 ## Endpoints
 
@@ -31,21 +32,21 @@ Query parameters (`GET`) or a JSON body (`POST`).
 | Field | Meaning |
 | --- | --- |
 | `address` | **Required.** The wallet requesting the URL. |
+| `appId` | **Required.** 32-byte hex app id: the app the upload is for. The caller must be able to publish to it (`canPublish`), and the bytes are billed to **that app**. See *Apps and subscriptions*. |
 | `message` | The challenge, signed verbatim (see *Ownership handshake*). |
 | `signature` | 65-byte `personal_sign` signature of `message`. |
 | `size` | Declared upload size in bytes. The minted URL is scoped to `size + 4096` (multipart headroom). This is what gets debited to the app's daily budget. Omitted → `DEFAULT_UPLOAD_SIZE`. |
 | `uploadId` | Idempotency key. A retry reusing it re-mints a fresh single-use URL but is charged once. |
-| `appId` | Optional 32-byte hex app id: the app being published to. The caller must be an active publisher in it, and the bytes are billed to **that app**. Omitted → the SDK's default app, under the same rules. See *Apps and subscriptions*. |
 
 ### Minting: responses
 
 | Status | Body |
 | --- | --- |
-| `200` | `{ ok, address, uploadUrl, network, maxFileSize, expiresIn }` (plus `stubbed: true` under `STUB_REGISTRATION_CHECK`) |
-| `400` | invalid/missing address, a non-positive-integer `size`, or a malformed `appId` |
-| `401` | `{ ok: false, address, error, challenge }`. No signature or it failed to verify. Sign `challenge` and retry. |
-| `402` | the app's subscription is inactive. `error` names the app and its owner, who must renew (points at `SUBSCRIBE_URL`) |
-| `403` | ownership proven, but publishing is refused. `error` says which: the address is not registered or is suspended network-wide; the app is unclaimed or suspended; or the address was never added by the app's owner, was added but has not accepted the terms, is suspended from the app, or is on stale terms (points at `REGISTER_URL` where there is something to do there) |
+| `200` | `{ ok, address, uploadUrl, network, maxFileSize, expiresIn }` |
+| `400` | invalid/missing address, a missing or malformed `appId`, or a non-positive-integer `size` |
+| `401` | `{ ok: false, address, error, challenge }`. No signature, or it failed to verify (wrong key, tampered, stale, or signed for another app). Sign `challenge` and retry. |
+| `402` | the app's subscription has expired or been cancelled. `error` names the app and its owner, who must renew (points at `SUBSCRIBE_URL`) |
+| `403` | ownership proven, but the app provides this wallet no storage. `error` says which: the app is unclaimed or taken down; the wallet is banned network-wide; or the app's owner has not accepted it, or has suspended it from the app |
 | `405` | method other than `GET`/`POST`/`OPTIONS` |
 | `413` | declared `size` exceeds `MAX_UPLOAD_SIZE` |
 | `429` | the app's daily byte budget is exhausted (resets 00:00 UTC) |
@@ -61,21 +62,21 @@ No URL is minted on any non-`200`, and the counters are debited **only** after a
   "day": "2026-08-31" }
 ```
 
-`appId` defaults to the SDK's default app. `dailyLimit` reports `0` when the budget is disabled, `daily` reports `0` when `RATE_KV` is unbound, and a bad `appId` gives `400`. There is no authentication for this call since byte counts aren't sensitive.
+`appId` is required (there is no default app); a missing or bad one gives `400`. `dailyLimit` reports `0` when the budget is disabled, and `daily` reports `0` when `RATE_KV` is unbound. There is no authentication for this call since byte counts aren't sensitive.
 
 ## Ownership handshake
 
 The chain reads alone prove *an address* may publish, not that the caller controls it. So every mint is a two-step handshake:
 
 ```
-POST / { "address": "0x…" }
-→ 401 { ok: false, error: "Sign the `challenge`…", challenge: "Fangorn onchain-gate…\nIssued-At: <unix>" }
+POST / { "address": "0x…", "appId": "0x…" }
+→ 401 { ok: false, error: "Sign the `challenge`…", challenge: "Fangorn onchain-gate…\nApp: 0x…\nIssued-At: <unix>" }
 
-POST / { "address": "0x…", "message": "<challenge verbatim>", "signature": "0x…", "size": 1024 }
+POST / { "address": "0x…", "appId": "0x…", "message": "<challenge verbatim>", "signature": "0x…", "size": 1024 }
 → 200 { ok: true, uploadUrl, … }
 ```
 
-The signed `message` must be the canonical template verbatim, its `Issued-At` within `SIGNATURE_MAX_AGE` (default 300s, 60s skew allowed. This bounds replay without server-side state), and the recovered signer must equal `address`. Any failure returns the same message ("Verification failed. Please be sure you have the correct private key.") with a fresh challenge.
+The challenge names the app (`App: 0x…`), so a signature only ever buys uploads for that app. The signed `message` must be the canonical template verbatim for the request's `appId`, its `Issued-At` within `SIGNATURE_MAX_AGE` (default 300s, 60s skew allowed. This bounds replay without server-side state), and the recovered signer must equal `address`. Any failure returns the same message ("Verification failed. Please be sure you have the correct private key.") with a fresh challenge.
 
 A runnable end-to-end caller lives in [`examples/`](examples/):
 
@@ -98,21 +99,24 @@ const pin = await fetch(uploadUrl, { method: 'POST', body: fd }).then((r) => r.j
 
 ## Apps and subscriptions
 
-Every upload names an app (or falls back to the SDK's default one) and is charged to the app's subscription. One subscription covers every publisher in that app, and a wallet with no app to publish under cannot upload at all.
+Every upload names an app and is charged to the app's subscription. One subscription covers every publisher the app accepted, and a wallet with no app to upload for cannot upload at all.
 
-The AppRegistry is both the membership list and the paywall:
+The AppRegistry is both the membership list and the paywall, and `access(appId, caller).canPublish` is the whole rule. When it is false, the worker explains why, in this order:
 
-| Read | Meaning | Failure |
+| Cause | Read | Response |
 | --- | --- | --- |
-| `access(appId, caller).owner` | who claimed the app | `403` when it is `0x0` (unclaimed) |
-| `access(appId, caller).registered` | an active publisher on the current terms | `403`, with the cause spelled out |
-| `access(appId, caller).paidAt` | when the app last paid | `402` outside the window |
+| the app is unclaimed | `access().owner` is `0x0` | `403` |
+| the subscription expired or was cancelled | `access().expiresAt` has passed | `402`, naming the owner |
+| the app was taken down by the protocol admin | `isAppSuspended(appId)` | `403` |
+| the wallet is banned network-wide | `globalSuspensions(caller)` | `403` |
+| the app's owner suspended the wallet | `statusForApp(appId, caller)` is Suspended | `403` |
+| the app's owner never accepted the wallet | `statusForApp(appId, caller)` is None (or the retired Invited) | `403`, saying to ask the owner |
 
-Membership is only by invitation. The app's owner adds a wallet (`addPublisher`), and that wallet then accepts the terms (`registerForApp`). The owner is their own first publisher. On a `403` the worker makes two more AppRegistry reads (`isAppSuspended`, `statusForApp`) to say which cause it was: never added, added but not yet joined, suspended, on stale terms, or the whole app taken down. A granted upload makes neither.
+Membership is the owner's call: they accept a wallet with `acceptPublisher`, and are accepted themselves when they claim the app. There are no invitations, terms or join fees. The explaining reads happen only on a denial; a granted upload makes none of them.
 
-The subscription window lives here, not on-chain (the contract only stores a timestamp), so pricing policy is tunable without a redeploy — keep `SUBSCRIPTION_WINDOW_DAYS` in sync with the website's display constant. The worker never learns *how* the fee was paid, only that `paidAt` advanced. An owner renews with `renewApp`.
+Expiry is enforced on-chain with no grace period, so the worker keeps no subscription policy of its own. An owner renews with ERC-5643 `renewSubscription`.
 
-Both contract addresses come from `@fangorn-network/sdk` with no env override.
+The AppRegistry address comes from `BaseSepoliaConfig` in `@fangorn-network/sdk`, with no env override.
 
 ## Daily byte budget
 
@@ -131,7 +135,7 @@ To retire testnet data:
 ```bash
 # 1. every group for this deployment (page with ?pageToken=<next_page_token>)
 curl -H "Authorization: Bearer $PINATA_JWT" \
-  "https://api.pinata.cloud/v3/groups/public?name=testnet:"
+  "https://api.pinata.cloud/v3/groups/public?name=testnet-base:"
 
 # 2. per group id, its files (page the same way)
 curl -H "Authorization: Bearer $PINATA_JWT" \
@@ -154,12 +158,12 @@ cd webworker && pnpm install
 cd pinata-url-provider
 cp .dev.vars.example .dev.vars     # add PINATA_JWT
 pnpm dev
-curl "http://localhost:8787/?address=0xYourAddress"   # → 401 + a challenge to sign
+curl "http://localhost:8787/?address=0xYourAddress&appId=0xYourAppId"   # → 401 + a challenge to sign
 ```
 
-Contract addresses come from the installed SDK, so there is nothing to point at first. Set `STUB_REGISTRATION_CHECK = "true"` in `.dev.vars` to work without an RPC endpoint: the signature is still verified, but the chain is not read, so any wallet passes and the subscription reads as active.
+Contract addresses come from the installed SDK, so there is nothing to point at first. Every mint reads Base Sepolia; there is no mode that skips the chain.
 
-`pnpm test` runs 43 cases (`node --test`, no framework) covering the handshake, the access gate, the subscription window, the byte budget, groups, and `/usage`.
+`pnpm test` runs 42 cases (`node --test`, no framework) covering the handshake, the access gate and each denial, the byte budget, groups, and `/usage`. The chain and Pinata are stubbed.
 
 ## Deploy
 
@@ -174,7 +178,7 @@ pnpm run deploy                             # `run` — bare `pnpm deploy` is a 
 
 The Pinata key is **scoped, not Admin**, with two permissions: Files → Write (implies Read) to mint upload URLs, and Groups → Write to file each wallet's uploads. End users never see this JWT.
 
-Without the `RATE_KV` binding the daily cap does nothing and `/usage` reports zeroes. `RPC_URL` is optional and defaults to the SDK's public Arbitrum Sepolia endpoint.
+Without the `RATE_KV` binding the daily cap does nothing and `/usage` reports zeroes. `RPC_URL` is optional and defaults to the SDK's public Base Sepolia endpoint.
 
 ## Configuration
 
@@ -183,25 +187,23 @@ Without the `RATE_KV` binding the daily cap does nothing and `/usage` reports ze
 | Var | Kind | Meaning |
 | --- | --- | --- |
 | `PINATA_JWT` | secret | Pinata key used to sign URLs and manage groups. Needs **Files: Write** + **Groups: Write**. |
-| `PINATA_GROUP_PREFIX` | var | **Required.** Namespaces this deployment's per-wallet groups. Currently `testnet`; production is a separate deploy with its own prefix. |
+| `PINATA_GROUP_PREFIX` | var | **Required.** Namespaces this deployment's per-wallet groups. Currently `testnet-base` (`testnet` held the Arbitrum-era pins); production is a separate deploy with its own prefix. |
 | `PINATA_NETWORK` | var | `public` or `private`. Also selects the groups namespace. |
 | `PINATA_URL_EXPIRES` | var | Seconds the upload URL stays valid (default `300`). |
 | `PINATA_ALLOW_MIME_TYPES` | var | Optional CSV of MIME types signed into the URL. |
-| `RPC_URL` | var | EVM JSON-RPC endpoint. Default: the SDK's `FangornConfig.rpcUrl`. |
-| `STUB_REGISTRATION_CHECK` | var | `"true"` skips the chain reads entirely: a valid signature alone mints, and the subscription reads as active. Dev only. |
-| `SUBSCRIPTION_WINDOW_DAYS` | var | How long a payment keeps an app's subscription active (default `30`). |
+| `RPC_URL` | var | Base Sepolia JSON-RPC endpoint. Default: the SDK's `BaseSepoliaConfig.rpcUrl`. |
 | `DAILY_BYTE_LIMIT` | var | Bytes per app per UTC day. `0`/unset disables the daily cap. |
 | `MAX_UPLOAD_SIZE` | var | Per-request ceiling in bytes. A larger declared `size` in a request gets `413`. Defaults to 500 MiB. |
 | `DEFAULT_UPLOAD_SIZE` | var | Size assumed when a caller omits `size`. Default 10 MiB. |
 | `SIGNATURE_MAX_AGE` | var | Max age in seconds of the challenge's `Issued-At` (default `300`). |
-| `REGISTER_URL` / `SUBSCRIBE_URL` | var | URLs shown in the `403` and `402` errors. |
+| `SUBSCRIBE_URL` | var | URL shown in the `402` error, where the owner renews. |
 | `ALLOWED_ORIGIN` | var | Browser CORS: `*` or a comma-separated allowlist. |
 | `RATE_KV` | binding | Workers KV holding the byte counters and the group-id cache. The daily cap is inert without it. |
 
 
-The DataRegistry and AppRegistry addresses are not configurable. They come from `FangornConfig` in the installed SDK, and the `[build]` guard in `wrangler.toml` refuses to deploy without them. To check what a deployment is wired to:
+The AppRegistry address is not configurable. It comes from `BaseSepoliaConfig` in the installed SDK, and the `[build]` guard in `wrangler.toml` refuses to deploy without it. To check what a deployment is wired to:
 
 ```bash
-cast call <DataRegistry> "appRegistry()(address)" --rpc-url <rpc>
-# must equal FangornConfig.appRegistryContractAddress
+cast call <DataRegistry> "appRegistry()(address)" --rpc-url https://base-sepolia-rpc.publicnode.com
+# must equal BaseSepoliaConfig.appRegistryContractAddress
 ```
