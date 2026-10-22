@@ -30,7 +30,7 @@ pnpm dev
 # terminal 2 — run the caller
 APP_ID=my-app node examples/simulated-caller.mjs
 # or point it elsewhere:
-APP_ID=my-app node examples/simulated-caller.mjs https://pinata-url-provider.fangorn-0be.workers.dev
+APP_ID=my-app node examples/simulated-caller.mjs https://pinata-url-provider-base.fangorn-0be.workers.dev
 ```
 
 ### Options

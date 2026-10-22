@@ -7,7 +7,7 @@ A pnpm workspace containing the Cloudflare Workers behind Fangorn's content gati
 | Package | Path | Description |
 |---------|------|-------------|
 | [`fangorn-access-worker`](./fangorn-access-worker) | `fangorn-access-worker/` | Gates R2 content behind on-chain settlement verification. One worker per R2 bucket. |
-| [`pinata-url-provider`](./pinata-url-provider) | `pinata-url-provider/` | Mints Pinata presigned upload URLs for callers who prove address ownership, are registered, and publish under an app with an active subscription (the AppRegistry's `access()` check). Every upload is billed to its app. |
+| [`pinata-url-provider`](./pinata-url-provider) | `pinata-url-provider/` | Mints Pinata presigned upload URLs for callers who prove address ownership, are registered, and publish under an app with an active subscription (Base Sepolia's AppRegistry `access()` check). Every upload is billed to its app. Deploys as `pinata-url-provider-base`; never redeploy the Arbitrum worker `pinata-url-provider`. |
 | [`quickbeam-registry`](./quickbeam-registry) | `quickbeam-registry/` | Control plane for Quickbeam views: KV of watched sources, the instance's `/watchlist`, and the per-view search/CDN proxy. Gated on the same app subscription. |
 
 See each package's own `README.md` for details.

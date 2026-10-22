@@ -7,6 +7,12 @@ every upload is billed to the app named in the request. There is no default app 
 storage outside an app. The contracts are **Base Sepolia's** (`BaseSepoliaConfig` in the
 installed SDK).
 
+It deploys as **`pinata-url-provider-base`**
+(`https://pinata-url-provider-base.fangorn-0be.workers.dev`). The older
+`pinata-url-provider` worker is the Arbitrum deployment's: apps there still use it, and its
+code predates this repo, so it is never redeployed. Base clients must pass this URL as
+`signedUrl.workerUrl` until the SDK defaults to it.
+
 Requests get validated on:
 
 1. **App.** `appId` is required: the app the upload is for and billed to.
@@ -177,6 +183,8 @@ pnpm run deploy                             # `run` — bare `pnpm deploy` is a 
 ```
 
 The Pinata key is **scoped, not Admin**, with two permissions: Files → Write (implies Read) to mint upload URLs, and Groups → Write to file each wallet's uploads. End users never see this JWT.
+
+Secrets and KV belong to the worker name, so `pinata-url-provider-base` needs its own `PINATA_JWT` and its own namespace. Do not reuse the Arbitrum worker's (`524161f0…`), or apps of the same name on both chains share one daily budget.
 
 Without the `RATE_KV` binding the daily cap does nothing and `/usage` reports zeroes. `RPC_URL` is optional and defaults to the SDK's public Base Sepolia endpoint.
 

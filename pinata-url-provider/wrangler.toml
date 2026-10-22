@@ -1,4 +1,8 @@
-name = "pinata-url-provider"
+# Base Sepolia's upload worker: https://pinata-url-provider-base.fangorn-0be.workers.dev
+# NEVER rename this back to "pinata-url-provider". That name is the live Arbitrum
+# worker, which apps on the Arbitrum deployments still use; its code predates this
+# repo, so overwriting it cannot be undone.
+name = "pinata-url-provider-base"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
@@ -91,6 +95,7 @@ DAILY_BYTE_LIMIT = "1073741824"   # 1 GiB / app / day
 #   wrangler kv namespace create RATE_KV
 [[kv_namespaces]]
 binding = "RATE_KV"
-# Created as "arb_sep_kv" and kept for Base: its keys are per app and day, and the
-# group-id cache is keyed by group name, which the new prefix changes.
-id = "524161f052814fe3a809d8d0f0a14c6a"
+# Its own namespace, not the Arbitrum worker's (524161f0…): app ids are hashed names,
+# so an app of the same name on both chains would otherwise share one daily budget.
+# Created 2026-10-22 for pinata-url-provider-base.
+id = "ba8e021b025e40a5a57194a79b756fad"

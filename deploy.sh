@@ -6,7 +6,8 @@ set -euo pipefail
 # Deploys the Fangorn Cloudflare Workers — any one, any combination, or all.
 #
 #   storage    pinata-url-provider     presigned Pinata upload URLs, gated on
-#                                      access() at the AppRegistry
+#                                      access() at Base Sepolia's AppRegistry;
+#                                      deploys as pinata-url-provider-base
 #   quickbeam  quickbeam-registry      Quickbeam view control plane, same gate
 #   access     fangorn-access-worker   R2 reads gated on the SettlementRegistry
 #
@@ -159,11 +160,16 @@ echo >&2
 echo "Deploying from @fangorn-network/sdk:" >&2
 versions=()
 for w in "${deploy_list[@]}"; do
-    info=$(cd "$SCRIPT_DIR/$(dir_for "$w")" && node --input-type=module -e '
+    # The storage worker is gated on Base Sepolia; the others still on the SDK default.
+    case "$w" in
+        storage) config=BaseSepoliaConfig ;;
+        *)       config=FangornConfig ;;
+    esac
+    info=$(cd "$SCRIPT_DIR/$(dir_for "$w")" && CONFIG=$config node --input-type=module -e '
         import { createRequire } from "node:module";
         const require = createRequire(process.cwd() + "/");
         const { version } = require("@fangorn-network/sdk/package.json");
-        const { FangornConfig: c } = await import("@fangorn-network/sdk/lib/config.js");
+        const c = (await import("@fangorn-network/sdk/lib/config.js"))[process.env.CONFIG];
         console.log(version, c.dataRegistryContractAddress, c.appRegistryContractAddress, c.settlementRegistryContractAddress);
     ') || { echo "  $w: cannot read the SDK — run pnpm install" >&2; exit 1; }
     read -r version data apps settlement <<<"$info"
@@ -172,7 +178,7 @@ for w in "${deploy_list[@]}"; do
         access) gate="settlement $settlement" ;;
         *)      gate="apps $apps (data $data)" ;;
     esac
-    printf '  %-10s sdk %-16s %s\n' "$w" "$version" "$gate" >&2
+    printf '  %-10s sdk %-16s %-18s %s\n' "$w" "$version" "$config" "$gate" >&2
 done
 
 # One shared SDK is the whole point: different versions mean different contracts,
