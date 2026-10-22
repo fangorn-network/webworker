@@ -376,7 +376,7 @@ test('RPC failure → 502', async () => {
   rpcResponse = () => jsonResponse(500, { error: 'rpc down' });
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 502);
-  assert.match(res.json.error, /access check failed/i);
+  assert.match(res.json.error, /checking onchain access/i);
 });
 
 test('Pinata sign failure → 502', async () => {
@@ -536,7 +536,7 @@ test('RPC failure while explaining a denial → 502 (never mints)', async () => 
       : denied(url, init);
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 502);
-  assert.match(res.json.error, /access check failed/i);
+  assert.match(res.json.error, /checking onchain access/i);
 });
 
 /* ── app-scoped uploads ──────────────────────────────────────────────────── */
