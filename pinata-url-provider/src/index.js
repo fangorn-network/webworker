@@ -100,7 +100,7 @@ export default {
         return json(denial.status, { ok: false, address, error: denial.error }, cors);
       }
     } catch (err) {
-      return json(502, { error: 'On-chain access check failed.', detail: String(err?.message || err) }, cors);
+      return json(502, { error: 'An error occurred when checking Onchain access conditions.', detail: String(err?.message || err) }, cors);
     }
 
     // Resolve the upload size the caller declared (the SDK sends its exact byte
