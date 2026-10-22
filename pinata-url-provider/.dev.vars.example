@@ -4,6 +4,6 @@
 # (every upload is filed under a per-wallet group, so Files-only 502s).
 PINATA_JWT="your-pinata-jwt"
 
-# Optional: override the public Arbitrum Sepolia RPC from wrangler.toml with your
-# own endpoint (e.g. Alchemy) for higher rate limits.
+# Optional: override the SDK's public Base Sepolia RPC with your own endpoint
+# (e.g. Alchemy) for higher rate limits.
 # RPC_URL="https://your-evm-rpc.example/v2/YOUR_KEY"

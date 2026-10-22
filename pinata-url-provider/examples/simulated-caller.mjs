@@ -3,10 +3,12 @@
  *
  * Demonstrates the full ownership handshake against a running worker:
  *
- *   1. POST { address }                          → 401 + a `challenge` to sign
+ *   1. POST { address, appId }                     → 401 + a `challenge` to sign,
+ *      naming the address and the app
  *   2. sign the challenge with the address's key (EIP-191 personal_sign, via viem)
- *   3. POST { address, message, signature }      → ownership accepted; the worker
- *      then checks on-chain registration and (if registered) returns an upload URL.
+ *   3. POST { address, appId, message, signature } → ownership accepted; the worker
+ *      then reads access(appId, address) on Base Sepolia and, if the app provides
+ *      this wallet storage, returns an upload URL.
  *
  * Usage:
  *   node examples/simulated-caller.mjs [workerUrl]
@@ -15,15 +17,24 @@
  *   WORKER_URL    Worker base URL (default http://localhost:8787).
  *   PRIVATE_KEY   0x-prefixed 32-byte secp256k1 key. Omit to use the demo key
  *                 below — NEVER use that key for anything real.
+ *   APP_ID        Required. The app to upload for: a 32-byte hex app id, or an
+ *                 app name (hashed the way the SDK does). The upload is billed to
+ *                 that app, and its owner must have accepted the caller.
  */
 
 import { privateKeyToAccount } from 'viem/accounts';
+import { toAppId } from '@fangorn-network/sdk/lib/config.js';
 
 // A throwaway demo key. Deterministic so the example is reproducible.
 // DO NOT fund this address or reuse this key anywhere real.
 const DEMO_PRIVATE_KEY = '0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
 const WORKER_URL = process.argv[2] || process.env.WORKER_URL || 'http://localhost:8787';
+if (!process.env.APP_ID) {
+  console.error('Set APP_ID to the app to upload for (an app name or a 32-byte hex id).');
+  process.exit(1);
+}
+const appId = toAppId(process.env.APP_ID).toLowerCase();
 
 async function postJson(body) {
   const res = await fetch(WORKER_URL, {
@@ -43,11 +54,12 @@ async function main() {
 
   console.log(`Worker : ${WORKER_URL}`);
   console.log(`Address: ${address}`);
+  console.log(`App    : ${appId}`);
   if (!process.env.PRIVATE_KEY) console.log('(using the built-in demo key — set PRIVATE_KEY to override)');
 
   // 1) Ask the worker for a challenge (no signature yet → 401).
   console.log('\n[1] Requesting challenge (unsigned)…');
-  const first = await postJson({ address });
+  const first = await postJson({ address, appId });
   console.log(`    → HTTP ${first.status}`);
   const challenge = first.json.challenge;
   if (first.status !== 401 || !challenge) {
@@ -61,17 +73,17 @@ async function main() {
   console.log(`    signature: ${signature}`);
 
   // 3) Resend with the proof.
-  console.log('\n[3] Resending with { address, message, signature }…');
-  const second = await postJson({ address, message: challenge, signature });
+  console.log('\n[3] Resending with { address, appId, message, signature }…');
+  const second = await postJson({ address, message: challenge, signature, appId });
   console.log(`    → HTTP ${second.status}`);
   console.log('    ' + JSON.stringify(second.json, null, 2).split('\n').join('\n    '));
 
   console.log('\nResult:');
   if (second.status === 200) {
-    console.log('  ✔ Ownership proven AND address registered — got an upload URL.');
+    console.log('  ✔ Ownership proven AND the app provides this wallet storage — got an upload URL.');
     console.log(`uploadUrl: ${JSON.stringify(second.json.uploadUrl)}`)
-  } else if (second.status === 403) {
-    console.log('  ✔ Ownership proven (signature accepted). ✘ This address is not registered.');
+  } else if (second.status === 403 || second.status === 402) {
+    console.log('  ✔ Ownership proven (signature accepted). ✘ Publishing refused — see `error` above.');
   } else if (second.status === 401) {
     console.log('  ✘ Ownership check rejected the signature. See the error above.');
   } else {
