@@ -401,8 +401,9 @@ async function walletGroupId(env, address, appId) {
 }
 
 /**
- * A wallet's group name for an app. Pinata caps group names at 50 characters and answers a longer one with a
- * 400 "malformed request", so the app and wallet go in as their first 12 hex digits: `testnet-base:` + 12 + `:`
+ * A wallet's group name for an app. Pinata rejects group names over 50 characters with a 400 "malformed
+ * request" (measured 2026-10-23: 50 accepted, 51 refused; its API docs state no limit, so this may move), so
+ * the app and wallet go in as their first 12 hex digits: `testnet-base:` + 12 + `:`
  * + 12 is 38. 48 bits each: no two of a deployment's apps, or of an app's wallets, will share them in practice,
  * and an app's pins still sweep as a unit by the `${prefix}:${appId12}:` prefix. Both ids arrive validated and
  * lowercased.

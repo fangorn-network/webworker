@@ -63,7 +63,9 @@ MAX_UPLOAD_SIZE = "524288000"    # 500 MiB
 # Fangorn uploads opaque binary (CAR packfiles + raw commit blocks) as
 # octet-stream, and serialized payloads as text/plain — so allow exactly those.
 # Widen or unset to permit more MIME types.
-PINATA_ALLOW_MIME_TYPES = "application/octet-stream,text/plain"  # optional CSV
+# Optional CSV. Pinata checks the type it DETECTS from the bytes, not the one the uploader declares: the SDK
+# sends records and ERC-8004 registration files as "text/plain", but they are JSON, detected as application/json.
+PINATA_ALLOW_MIME_TYPES = "application/octet-stream,text/plain,application/json"
 # Every presigned URL is scoped to a Pinata group named "<prefix>:<appId>:<wallet>"
 # — one group per wallet per app, namespaced by deployment — so a whole deployment's
 # (or one app's) pins can be swept later (list groups by this prefix, unpin their

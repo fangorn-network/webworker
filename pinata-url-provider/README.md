@@ -198,7 +198,7 @@ Without the `RATE_KV` binding the daily cap does nothing and `/usage` reports ze
 | `PINATA_GROUP_PREFIX` | var | **Required.** Namespaces this deployment's per-wallet groups. Currently `testnet-base` (`testnet` held the Arbitrum-era pins); production is a separate deploy with its own prefix. |
 | `PINATA_NETWORK` | var | `public` or `private`. Also selects the groups namespace. |
 | `PINATA_URL_EXPIRES` | var | Seconds the upload URL stays valid (default `300`). |
-| `PINATA_ALLOW_MIME_TYPES` | var | Optional CSV of MIME types signed into the URL. |
+| `PINATA_ALLOW_MIME_TYPES` | var | Optional CSV of MIME types signed into the URL. Pinata matches the type it detects from the file's bytes, not the declared one, so JSON uploads (records, ERC-8004 registration files) need `application/json` even when sent as `text/plain`. |
 | `RPC_URL` | var | Base Sepolia JSON-RPC endpoint. Default: the SDK's `BaseSepoliaConfig.rpcUrl`. |
 | `DAILY_BYTE_LIMIT` | var | Bytes per app per UTC day. `0`/unset disables the daily cap. |
 | `MAX_UPLOAD_SIZE` | var | Per-request ceiling in bytes. A larger declared `size` in a request gets `413`. Defaults to 500 MiB. |
