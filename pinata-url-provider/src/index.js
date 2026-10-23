@@ -353,9 +353,9 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
  * job lists groups by name prefix and unpins their files, without needing any
  * record of what was uploaded.
  *
- * Name is `${PINATA_GROUP_PREFIX}:${appId}:${address}` — per wallet, namespaced by
- * deployment and by app, so an app's pins sweep as a unit and stay attributable to
- * the publisher. The prefix is REQUIRED: a pin filed under no
+ * Name is `${PINATA_GROUP_PREFIX}:${appId12}:${wallet12}` (see groupName) — per wallet,
+ * namespaced by deployment and by app, so an app's pins sweep as a unit and stay
+ * attributable to the publisher. The prefix is REQUIRED: a pin filed under no
  * group (or under an unlabelled one) is a pin no cleanup job can find, which
  * defeats the point, so an unset prefix fails the request rather than minting.
  *
@@ -370,7 +370,7 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
 async function walletGroupId(env, address, appId) {
   const prefix = (env.PINATA_GROUP_PREFIX || '').trim();
   if (!prefix) throw new Error('PINATA_GROUP_PREFIX is not set (every upload must be filed under a group).');
-  const name = `${prefix}:${appId}:${address}`;
+  const name = groupName(prefix, appId, address);
   const key = `group:${name}`;
 
   // Lifetime cache (no TTL) — a wallet's group never changes.
@@ -384,7 +384,7 @@ async function walletGroupId(env, address, appId) {
   const groups = `${PINATA_API}/groups/${env.PINATA_NETWORK || 'public'}`;
   // `name` filters by substring, so match exactly rather than taking groups[0].
   const found = await pinataJson(`${groups}?name=${encodeURIComponent(name)}`, { headers: auth });
-  let id = found?.groups?.find((g) => g.name === name)?.id;
+  let id = found?.data?.groups?.find((g) => g.name === name)?.id;
 
   if (!id) {
     const created = await pinataJson(groups, {
@@ -398,6 +398,23 @@ async function walletGroupId(env, address, appId) {
 
   if (env.RATE_KV) await env.RATE_KV.put(key, id);
   return id;
+}
+
+/**
+ * A wallet's group name for an app. Pinata caps group names at 50 characters and answers a longer one with a
+ * 400 "malformed request", so the app and wallet go in as their first 12 hex digits: `testnet-base:` + 12 + `:`
+ * + 12 is 38. 48 bits each: no two of a deployment's apps, or of an app's wallets, will share them in practice,
+ * and an app's pins still sweep as a unit by the `${prefix}:${appId12}:` prefix. Both ids arrive validated and
+ * lowercased.
+ */
+const GROUP_NAME_MAX = 50;
+export function groupName(prefix, appId, address) {
+  const short = (hex) => hex.replace(/^0x/, '').slice(0, 12);
+  const name = `${prefix}:${short(appId)}:${short(address)}`;
+  if (name.length > GROUP_NAME_MAX) {
+    throw new Error(`PINATA_GROUP_PREFIX "${prefix}" is too long: Pinata caps group names at ${GROUP_NAME_MAX} characters, and this one is ${name.length}.`);
+  }
+  return name;
 }
 
 /** fetch + JSON against the Pinata API, throwing with the body on a non-2xx. */

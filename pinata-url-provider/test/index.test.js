@@ -61,7 +61,7 @@ beforeEach(() => {
   groupsResponse = (u, init) =>
     init?.method === 'POST'
       ? jsonResponse(200, { data: { id: GROUP_ID } })
-      : jsonResponse(200, { groups: [] });
+      : jsonResponse(200, { data: { groups: [], next_page_token: null } }); // Pinata's real shape
 });
 
 const jsonResponse = (status, obj) =>
@@ -183,7 +183,7 @@ function mockKV(initial = {}) {
 const utcDay = () => new Date().toISOString().slice(0, 10);
 // Byte counters are per app: the app is what pays.
 const usageKey = (appId) => `bytes:${appId}:${utcDay()}`;
-const groupName = (appId, account = ACCOUNT) => `testnet:${appId}:${account.address.toLowerCase()}`;
+const groupName = (appId, account = ACCOUNT) => `testnet:${appId.slice(2, 14)}:${account.address.toLowerCase().slice(2, 14)}`;
 
 /* ── success modes ───────────────────────────────────────────────────────── */
 
@@ -229,7 +229,7 @@ test('PINATA_ALLOW_MIME_TYPES → forwarded to Pinata as a trimmed allow_mime_ty
 
 /* ── per-app, per-wallet Pinata group ────────────────────────────────────── */
 
-test('mint files the upload under a group named <prefix>:<appId>:<wallet>', async () => {
+test('mint files the upload under a group named <prefix>:<appId12>:<wallet12>', async () => {
   rpcResponse = acceptedRpc;
   pinataResponse = pinataOk;
   const res = await call(baseEnv(), { body: await proof() });
@@ -246,7 +246,7 @@ test('an existing group is adopted by name, not duplicated', async () => {
   pinataResponse = pinataOk;
   const name = groupName(APP_ID);
   // Substring match — the worker must pick the exact name, not groups[0].
-  groupsResponse = () => jsonResponse(200, { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] });
+  groupsResponse = () => jsonResponse(200, { data: { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] } });
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(lastPinataInit.body).group_id, GROUP_ID);
@@ -264,6 +264,25 @@ test('the wallet→group id is cached in KV across mints', async () => {
   await call(env, { body: p });
   assert.equal(kv._store.get(`group:${groupName(APP_ID)}`), GROUP_ID);
   assert.equal(groupCalls.length, afterFirst); // second mint hit the cache
+});
+
+test('group names fit Pinata\'s 50-character cap (a longer one is a 400)', async () => {
+  rpcResponse = acceptedRpc;
+  pinataResponse = pinataOk;
+  // The deployed prefix, with a full-length app id and wallet: the case that broke every first upload.
+  const res = await call(baseEnv({ PINATA_GROUP_PREFIX: 'testnet-base' }), { body: await proof() });
+  assert.equal(res.status, 200);
+  const name = JSON.parse(groupCalls.at(-1).init.body).name;
+  assert.ok(name.length <= 50, `${name} is ${name.length} characters`);
+  assert.equal(name, `testnet-base:${APP_ID.slice(2, 14)}:${ACCOUNT.address.toLowerCase().slice(2, 14)}`);
+});
+
+test('a PINATA_GROUP_PREFIX too long for the cap → 502 with the reason, never mints', async () => {
+  rpcResponse = acceptedRpc; // pinataResponse null: a mint would throw
+  const res = await call(baseEnv({ PINATA_GROUP_PREFIX: 'x'.repeat(30) }), { body: await proof() });
+  assert.equal(res.status, 502);
+  assert.match(res.json.detail, /too long/);
+  assert.equal(groupCalls.length, 0);
 });
 
 test('missing PINATA_GROUP_PREFIX → 502 and never mints', async () => {
