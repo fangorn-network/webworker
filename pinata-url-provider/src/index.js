@@ -152,7 +152,7 @@ export default {
     }
 
     // 2) Granted — issue a Pinata presigned upload URL scoped to the requested
-    // size (plus a little multipart/form-data headroom).
+    // size (plus UPLOAD_HEADROOM).
     try {
       const maxFileSize = size + UPLOAD_HEADROOM;
       const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, appId);
@@ -293,7 +293,10 @@ async function denialReason(env, appId, address, access) {
 // Upload sizing defaults (all overridable via env; bytes).
 const DEFAULT_UPLOAD_SIZE = 10 * 1024 * 1024;   // used when a caller omits `size` (older SDKs)
 const DEFAULT_MAX_UPLOAD = 500 * 1024 * 1024;   // per-request ceiling when MAX_UPLOAD_SIZE unset
-const UPLOAD_HEADROOM = 4096;                    // multipart/form-data overhead slack on max_file_size
+// Slack on max_file_size. Pinata checks it with some overshoot that is not just
+// multipart overhead: measured 2026-10-27, +4 KiB rejects exact-size uploads from
+// ~22 MB up, while +64 KiB passed at 25/30/60/150 MB. Never billed (the debit is `size`).
+const UPLOAD_HEADROOM = 64 * 1024;
 
 // Per-app daily *byte budget*, backed by Workers KV. The SDK declares each
 // upload's size, so we meter the bytes we grant per app per UTC day — a direct
