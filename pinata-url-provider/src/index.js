@@ -152,9 +152,9 @@ export default {
     }
 
     // 2) Granted — issue a Pinata presigned upload URL scoped to the requested
-    // size (plus UPLOAD_HEADROOM).
+    // size (plus Pinata's DAG overhead — see uploadCap).
     try {
-      const maxFileSize = size + UPLOAD_HEADROOM;
+      const maxFileSize = uploadCap(size);
       const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, appId);
       if (charge) {
         await recordUsage(env, appId, used, size);
@@ -293,10 +293,11 @@ async function denialReason(env, appId, address, access) {
 // Upload sizing defaults (all overridable via env; bytes).
 const DEFAULT_UPLOAD_SIZE = 10 * 1024 * 1024;   // used when a caller omits `size` (older SDKs)
 const DEFAULT_MAX_UPLOAD = 500 * 1024 * 1024;   // per-request ceiling when MAX_UPLOAD_SIZE unset
-// Slack on max_file_size. Pinata checks it with some overshoot that is not just
-// multipart overhead: measured 2026-10-27, +4 KiB rejects exact-size uploads from
-// ~22 MB up, while +64 KiB passed at 25/30/60/150 MB. Never billed (the debit is `size`).
-const UPLOAD_HEADROOM = 64 * 1024;
+// Pinata checks max_file_size against the IPFS DAG it builds (256 KiB chunks, ~50 B
+// of link per chunk; measured 2026-10-27), not the raw bytes. So the cap allows 64 B
+// per chunk plus 4 KiB. Never billed (the debit is `size`).
+const PINATA_CHUNK = 262144;
+const uploadCap = (size) => size + Math.ceil(size / PINATA_CHUNK) * 64 + 4096;
 
 // Per-app daily *byte budget*, backed by Workers KV. The SDK declares each
 // upload's size, so we meter the bytes we grant per app per UTC day — a direct

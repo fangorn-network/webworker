@@ -425,7 +425,7 @@ test('declared size under budget → 200, URL scoped to size, debits bytes', asy
   const res = await call(env, { body: { ...(await proof()), size: 4000 } });
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
-  assert.equal(res.json.maxFileSize, 4000 + 64 * 1024);              // requested + headroom
+  assert.equal(res.json.maxFileSize, 4000 + 64 + 4096);              // requested + one chunk's DAG overhead + slack
   assert.equal(kv._store.get(usageKey(APP_ID)), '5000');       // 1000 + declared 4000
 });
 

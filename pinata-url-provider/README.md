@@ -41,7 +41,7 @@ Query parameters (`GET`) or a JSON body (`POST`).
 | `appId` | **Required.** 32-byte hex app id: the app the upload is for. The caller must be able to publish to it (`canPublish`), and the bytes are billed to **that app**. See *Apps and subscriptions*. |
 | `message` | The challenge, signed verbatim (see *Ownership handshake*). |
 | `signature` | 65-byte `personal_sign` signature of `message`. |
-| `size` | Declared upload size in bytes. The minted URL is scoped to `size + 64 KiB` (headroom for Pinata's size check). This is what gets debited to the app's daily budget. Omitted → `DEFAULT_UPLOAD_SIZE`. |
+| `size` | Declared upload size in bytes. The minted URL is scoped to `size` plus Pinata's IPFS DAG overhead (64 B per 256 KiB chunk + 4 KiB). This is what gets debited to the app's daily budget. Omitted → `DEFAULT_UPLOAD_SIZE`. |
 | `uploadId` | Idempotency key. A retry reusing it re-mints a fresh single-use URL but is charged once. |
 
 ### Minting: responses
