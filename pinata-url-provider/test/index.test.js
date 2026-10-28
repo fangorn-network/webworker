@@ -17,7 +17,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { toFunctionSelector } from 'viem';
 
 import worker from '../src/index.js';
-import { BaseSepoliaConfig, FangornConfig } from '@fangorn-network/sdk/lib/config.js';
+import { ArbitrumSepoliaConfig, BaseSepoliaConfig, FangornConfig } from '@fangorn-network/sdk/lib/config.js';
 
 /* ── outbound fetch stub ─────────────────────────────────────────────────── */
 // Routes by URL: the Pinata sign endpoint → `pinataResponse`, the Pinata groups
@@ -301,7 +301,8 @@ test('the gate reads Base Sepolia\'s AppRegistry from the SDK, not Arbitrum\'s',
   for (const c of rpcCalls) {
     assert.equal(c.params[0].to.toLowerCase(), BaseSepoliaConfig.appRegistryContractAddress.toLowerCase());
   }
-  assert.notEqual(BaseSepoliaConfig.appRegistryContractAddress, FangornConfig.appRegistryContractAddress);
+  // TODO: we should probably just deprecate the arbitrum piece
+  assert.notEqual(BaseSepoliaConfig.appRegistryContractAddress, ArbitrumSepoliaConfig.appRegistryContractAddress);
 });
 
 test('the RPC defaults to the SDK\'s Base Sepolia endpoint, and RPC_URL overrides it', async () => {
