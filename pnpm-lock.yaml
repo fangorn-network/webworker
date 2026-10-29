@@ -59,8 +59,8 @@ importers:
   pinata-url-provider:
     dependencies:
       '@fangorn-network/sdk':
-        specifier: 2026.10.26-dev
-        version: 2026.10.26-dev(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)
+        specifier: 2026.10.28
+        version: 2026.10.28(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)
       viem:
         specifier: ^2.54.6
         version: 2.54.6(typescript@5.9.3)(zod@4.4.3)
@@ -342,8 +342,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@fangorn-network/sdk@2026.10.26-dev':
-    resolution: {integrity: sha512-o1+3SK8APsHgwzcU/o81B4XXLRlZK+Z+kQFJO7UTmzLnKRp0+xDi4Xy07uZirwUb3K2Jg8okpiZTimnKyy91Hw==}
+  '@fangorn-network/sdk@2026.10.28':
+    resolution: {integrity: sha512-lm1sX7oddNnAaHcv3ge17QGdwBwky3LCl+EgVWHZxs3fLOPWFKHhy+7uxc/9Iyg1BR3M3eUfkEGUDjX4tCl8cQ==}
     engines: {node: '>=20.19.0'}
     hasBin: true
 
@@ -1547,7 +1547,7 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@fangorn-network/sdk@2026.10.26-dev(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)':
+  '@fangorn-network/sdk@2026.10.28(react@19.3.0)(typescript@5.9.3)(zod@4.4.3)':
     dependencies:
       '@clack/prompts': 1.7.0
       '@ipld/car': 5.4.7

@@ -320,6 +320,7 @@ test('the gate reads Base Sepolia\'s AppRegistry from the SDK, not Arbitrum\'s',
   for (const c of rpcCalls) {
     assert.equal(c.params[0].to.toLowerCase(), BaseSepoliaConfig.appRegistryContractAddress.toLowerCase());
   }
+  // TODO: we should probably just deprecate the arbitrum piece
   assert.notEqual(BaseSepoliaConfig.appRegistryContractAddress, ArbitrumSepoliaConfig.appRegistryContractAddress);
 });
 
