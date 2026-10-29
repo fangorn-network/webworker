@@ -13,6 +13,8 @@
  *      while the app is claimed, not taken down and paid up, the wallet is not
  *      banned network-wide, and the app's owner has accepted the wallet and not
  *      suspended it. A refusal is explained with a few more reads, on that path only.
+ *      `appId` may be an alias of a renamed app; the worker resolves its canonical id
+ *      (`canonicalAppId`, read alongside) and bills and files the upload under that.
  *   4. If it holds, the worker mints a short-lived Pinata *presigned upload URL* and
  *      returns it, so the caller can pin one file to IPFS without ever seeing your
  *      Pinata JWT.
@@ -50,11 +52,18 @@ export default {
       if (!isBytes32(usageApp)) {
         return json(400, { error: 'Provide a valid app id via ?appId=0x… (0x + 64 hex chars).' }, cors);
       }
+      // The counter is kept under the canonical id, so an alias reads the same budget.
+      let canonical;
+      try {
+        canonical = await canonicalAppId(env, usageApp);
+      } catch (err) {
+        return json(502, { error: 'An error occurred when resolving the app id onchain.', detail: String(err?.message || err) }, cors);
+      }
       const cap = byteCapConfig(env);
       return json(200, {
         ok: true,
         appId: usageApp,
-        daily: env.RATE_KV ? await currentUsage(env, usageApp) : 0,
+        daily: env.RATE_KV ? await currentUsage(env, canonical) : 0,
         dailyLimit: cap.active ? cap.limit : 0,
         day: new Date().toISOString().slice(0, 10),
       }, cors);
@@ -90,15 +99,22 @@ export default {
       }, cors);
     }
 
-    // 1) On-chain gate — one read when it passes: `access(appId, caller)`. Its
+    // 1) On-chain gate — one deciding read: `access(appId, caller)`. Its
     // `canPublish` is the AppRegistry's single rule for who an app provides
-    // storage to, so the worker adds no rules of its own.
+    // storage to, so the worker adds no rules of its own. Alongside it, the app's
+    // canonical id: `appId` may be an alias, and everything billed or filed below is
+    // keyed by the id the app was claimed under.
+    let billedApp;
     try {
-      const access = await readAccess(env, appId, address);
+      const [access, canonical] = await Promise.all([
+        readAccess(env, appId, address),
+        canonicalAppId(env, appId),
+      ]);
       if (!access.canPublish) {
         const denial = await denialReason(env, appId, address, access);
         return json(denial.status, { ok: false, address, error: denial.error }, cors);
       }
+      billedApp = canonical;
     } catch (err) {
       return json(502, { error: 'An error occurred when checking Onchain access conditions.', detail: String(err?.message || err) }, cors);
     }
@@ -137,11 +153,11 @@ export default {
     let used = 0;
     let charge = cap.active;
     if (charge && input.uploadId) {
-      const paid = await paidSize(env, appId, input.uploadId);
+      const paid = await paidSize(env, billedApp, input.uploadId);
       if (paid !== null && size <= paid) charge = false; // already granted on a prior attempt
     }
     if (charge) {
-      used = await currentUsage(env, appId);
+      used = await currentUsage(env, billedApp);
       if (used + size > cap.limit) {
         return json(429, {
           ok: false,
@@ -155,10 +171,10 @@ export default {
     // size (plus Pinata's DAG overhead — see uploadCap).
     try {
       const maxFileSize = uploadCap(size);
-      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, appId);
+      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, billedApp);
       if (charge) {
-        await recordUsage(env, appId, used, size);
-        if (input.uploadId) await markPaid(env, appId, input.uploadId, size);
+        await recordUsage(env, billedApp, used, size);
+        if (input.uploadId) await markPaid(env, billedApp, input.uploadId, size);
       }
       return json(200, {
         ok: true,
@@ -190,8 +206,10 @@ const ACCESS_FUNCTION = 'access(bytes32,address)';
 const APP_SUSPENDED_FUNCTION = 'isAppSuspended(bytes32)';
 const GLOBAL_SUSPENSION_FUNCTION = 'globalSuspensions(address)';
 const APP_STATUS_FUNCTION = 'statusForApp(bytes32,address)';
-// AppRegistry.Status: 0 None (never accepted), 1 Active, 2 Suspended, 3 Invited
-// (retired, from the old join flow; not a member).
+// An app renamed (`renameApp`) answers to every id it has gone by; this maps any of
+// them to the one it was claimed under. See canonicalAppId().
+const CANONICAL_FUNCTION = 'canonicalAppId(bytes32)';
+// AppRegistry.Status: 0 None (never accepted), 1 Active, 2 Suspended.
 const STATUS_SUSPENDED = 2n;
 const ZERO_ADDRESS = '0x' + '0'.repeat(40);
 
@@ -247,6 +265,19 @@ async function readAccess(env, appId, address) {
 }
 
 /**
+ * The id `appId` was claimed under (lowercase hex); an id that is no alias comes
+ * back unchanged. The contract resolves aliases itself, but the worker's own state
+ * (the byte budget, paid markers, Pinata groups) must be keyed by this, or each
+ * alias would open a fresh daily budget and scatter the app's pins across groups.
+ */
+async function canonicalAppId(env, appId) {
+  const result = await ethCall(
+    env, sdkAddress(SDK_APP_REGISTRY_ADDRESS, 'appRegistryContractAddress'),
+    CANONICAL_FUNCTION, [encodeBytes32(appId)]);
+  return '0x' + wordAt(result, 0).toString(16).padStart(64, '0');
+}
+
+/**
  * Why `access` refused the caller, as `{ status, error }`. `canPublish` folds
  * several causes into one, and the right advice differs for each: the first two
  * come from `access` itself, the rest from three more reads. Failure path only —
@@ -279,7 +310,7 @@ async function denialReason(env, appId, address, access) {
     return { status: 403, error: `This public key is suspended from app ${appId}.` };
   }
   if (wordAt(status, 0) !== 1n) {
-    // None, or Invited from the old join flow: either way the owner has not accepted it.
+    // None: the owner has not accepted it.
     return { status: 403, error: `This public key has not been accepted by app ${appId}. Ask the app's owner to accept it.` };
   }
   // Every cause above reads clear, yet `access` refused: the chain's block time

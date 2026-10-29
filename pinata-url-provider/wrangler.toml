@@ -27,10 +27,14 @@ command = "node -e \"const {BaseSepoliaConfig:c}=await import('@fangorn-network/
 # with `wrangler secret put PINATA_JWT` (or .dev.vars locally).
 [vars]
 # ── Access check ─────────────────────────────────────────────────────────────
-# One read per granted request, against Base Sepolia's AppRegistry as named by
-# @fangorn-network/sdk (BaseSepoliaConfig) and NOT set here:
+# Two reads per granted request, made together, against Base Sepolia's AppRegistry as
+# named by @fangorn-network/sdk (BaseSepoliaConfig) and NOT set here:
 #
 #   AppRegistry.access(appId, caller)   → (canPublish, owner, expiresAt)
+#   AppRegistry.canonicalAppId(appId)   → the id the app was claimed under
+#
+# A renamed app answers to every id it went by; the byte budget and Pinata groups are
+# keyed by the canonical id, so an alias can't open a budget of its own.
 #
 # `appId` is required: every upload is billed to the app it names. `canPublish` is the
 # contract's single rule: the app is claimed, not taken down and not expired (expiry is
