@@ -13,6 +13,8 @@
  *      while the app is claimed, not taken down and paid up, the wallet is not
  *      banned network-wide, and the app's owner has accepted the wallet and not
  *      suspended it. A refusal is explained with a few more reads, on that path only.
+ *      `appId` may be an alias of a renamed app; the worker resolves its canonical id
+ *      (`canonicalAppId`, read alongside) and bills and files the upload under that.
  *   4. If it holds, the worker mints a short-lived Pinata *presigned upload URL* and
  *      returns it, so the caller can pin one file to IPFS without ever seeing your
  *      Pinata JWT.
@@ -50,11 +52,18 @@ export default {
       if (!isBytes32(usageApp)) {
         return json(400, { error: 'Provide a valid app id via ?appId=0x… (0x + 64 hex chars).' }, cors);
       }
+      // The counter is kept under the canonical id, so an alias reads the same budget.
+      let canonical;
+      try {
+        canonical = await canonicalAppId(env, usageApp);
+      } catch (err) {
+        return json(502, { error: 'An error occurred when resolving the app id onchain.', detail: String(err?.message || err) }, cors);
+      }
       const cap = byteCapConfig(env);
       return json(200, {
         ok: true,
         appId: usageApp,
-        daily: env.RATE_KV ? await currentUsage(env, usageApp) : 0,
+        daily: env.RATE_KV ? await currentUsage(env, canonical) : 0,
         dailyLimit: cap.active ? cap.limit : 0,
         day: new Date().toISOString().slice(0, 10),
       }, cors);
@@ -90,15 +99,22 @@ export default {
       }, cors);
     }
 
-    // 1) On-chain gate — one read when it passes: `access(appId, caller)`. Its
+    // 1) On-chain gate — one deciding read: `access(appId, caller)`. Its
     // `canPublish` is the AppRegistry's single rule for who an app provides
-    // storage to, so the worker adds no rules of its own.
+    // storage to, so the worker adds no rules of its own. Alongside it, the app's
+    // canonical id: `appId` may be an alias, and everything billed or filed below is
+    // keyed by the id the app was claimed under.
+    let billedApp;
     try {
-      const access = await readAccess(env, appId, address);
+      const [access, canonical] = await Promise.all([
+        readAccess(env, appId, address),
+        canonicalAppId(env, appId),
+      ]);
       if (!access.canPublish) {
         const denial = await denialReason(env, appId, address, access);
         return json(denial.status, { ok: false, address, error: denial.error }, cors);
       }
+      billedApp = canonical;
     } catch (err) {
       return json(502, { error: 'An error occurred when checking Onchain access conditions.', detail: String(err?.message || err) }, cors);
     }
@@ -137,11 +153,11 @@ export default {
     let used = 0;
     let charge = cap.active;
     if (charge && input.uploadId) {
-      const paid = await paidSize(env, appId, input.uploadId);
+      const paid = await paidSize(env, billedApp, input.uploadId);
       if (paid !== null && size <= paid) charge = false; // already granted on a prior attempt
     }
     if (charge) {
-      used = await currentUsage(env, appId);
+      used = await currentUsage(env, billedApp);
       if (used + size > cap.limit) {
         return json(429, {
           ok: false,
@@ -152,13 +168,13 @@ export default {
     }
 
     // 2) Granted — issue a Pinata presigned upload URL scoped to the requested
-    // size (plus a little multipart/form-data headroom).
+    // size (plus Pinata's DAG overhead — see uploadCap).
     try {
-      const maxFileSize = size + UPLOAD_HEADROOM;
-      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, appId);
+      const maxFileSize = uploadCap(size);
+      const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address, billedApp);
       if (charge) {
-        await recordUsage(env, appId, used, size);
-        if (input.uploadId) await markPaid(env, appId, input.uploadId, size);
+        await recordUsage(env, billedApp, used, size);
+        if (input.uploadId) await markPaid(env, billedApp, input.uploadId, size);
       }
       return json(200, {
         ok: true,
@@ -190,8 +206,10 @@ const ACCESS_FUNCTION = 'access(bytes32,address)';
 const APP_SUSPENDED_FUNCTION = 'isAppSuspended(bytes32)';
 const GLOBAL_SUSPENSION_FUNCTION = 'globalSuspensions(address)';
 const APP_STATUS_FUNCTION = 'statusForApp(bytes32,address)';
-// AppRegistry.Status: 0 None (never accepted), 1 Active, 2 Suspended, 3 Invited
-// (retired, from the old join flow; not a member).
+// An app renamed (`renameApp`) answers to every id it has gone by; this maps any of
+// them to the one it was claimed under. See canonicalAppId().
+const CANONICAL_FUNCTION = 'canonicalAppId(bytes32)';
+// AppRegistry.Status: 0 None (never accepted), 1 Active, 2 Suspended.
 const STATUS_SUSPENDED = 2n;
 const ZERO_ADDRESS = '0x' + '0'.repeat(40);
 
@@ -247,6 +265,19 @@ async function readAccess(env, appId, address) {
 }
 
 /**
+ * The id `appId` was claimed under (lowercase hex); an id that is no alias comes
+ * back unchanged. The contract resolves aliases itself, but the worker's own state
+ * (the byte budget, paid markers, Pinata groups) must be keyed by this, or each
+ * alias would open a fresh daily budget and scatter the app's pins across groups.
+ */
+async function canonicalAppId(env, appId) {
+  const result = await ethCall(
+    env, sdkAddress(SDK_APP_REGISTRY_ADDRESS, 'appRegistryContractAddress'),
+    CANONICAL_FUNCTION, [encodeBytes32(appId)]);
+  return '0x' + wordAt(result, 0).toString(16).padStart(64, '0');
+}
+
+/**
  * Why `access` refused the caller, as `{ status, error }`. `canPublish` folds
  * several causes into one, and the right advice differs for each: the first two
  * come from `access` itself, the rest from three more reads. Failure path only —
@@ -279,7 +310,7 @@ async function denialReason(env, appId, address, access) {
     return { status: 403, error: `This public key is suspended from app ${appId}.` };
   }
   if (wordAt(status, 0) !== 1n) {
-    // None, or Invited from the old join flow: either way the owner has not accepted it.
+    // None: the owner has not accepted it.
     return { status: 403, error: `This public key has not been accepted by app ${appId}. Ask the app's owner to accept it.` };
   }
   // Every cause above reads clear, yet `access` refused: the chain's block time
@@ -293,7 +324,11 @@ async function denialReason(env, appId, address, access) {
 // Upload sizing defaults (all overridable via env; bytes).
 const DEFAULT_UPLOAD_SIZE = 10 * 1024 * 1024;   // used when a caller omits `size` (older SDKs)
 const DEFAULT_MAX_UPLOAD = 500 * 1024 * 1024;   // per-request ceiling when MAX_UPLOAD_SIZE unset
-const UPLOAD_HEADROOM = 4096;                    // multipart/form-data overhead slack on max_file_size
+// Pinata checks max_file_size against the IPFS DAG it builds (256 KiB chunks, ~50 B
+// of link per chunk; measured 2026-10-27), not the raw bytes. So the cap allows 64 B
+// per chunk plus 4 KiB. Never billed (the debit is `size`).
+const PINATA_CHUNK = 262144;
+const uploadCap = (size) => size + Math.ceil(size / PINATA_CHUNK) * 64 + 4096;
 
 // Per-app daily *byte budget*, backed by Workers KV. The SDK declares each
 // upload's size, so we meter the bytes we grant per app per UTC day — a direct
@@ -353,9 +388,9 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
  * job lists groups by name prefix and unpins their files, without needing any
  * record of what was uploaded.
  *
- * Name is `${PINATA_GROUP_PREFIX}:${appId}:${address}` — per wallet, namespaced by
- * deployment and by app, so an app's pins sweep as a unit and stay attributable to
- * the publisher. The prefix is REQUIRED: a pin filed under no
+ * Name is `${PINATA_GROUP_PREFIX}:${appId12}:${wallet12}` (see groupName) — per wallet,
+ * namespaced by deployment and by app, so an app's pins sweep as a unit and stay
+ * attributable to the publisher. The prefix is REQUIRED: a pin filed under no
  * group (or under an unlabelled one) is a pin no cleanup job can find, which
  * defeats the point, so an unset prefix fails the request rather than minting.
  *
@@ -370,7 +405,7 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
 async function walletGroupId(env, address, appId) {
   const prefix = (env.PINATA_GROUP_PREFIX || '').trim();
   if (!prefix) throw new Error('PINATA_GROUP_PREFIX is not set (every upload must be filed under a group).');
-  const name = `${prefix}:${appId}:${address}`;
+  const name = groupName(prefix, appId, address);
   const key = `group:${name}`;
 
   // Lifetime cache (no TTL) — a wallet's group never changes.
@@ -384,7 +419,7 @@ async function walletGroupId(env, address, appId) {
   const groups = `${PINATA_API}/groups/${env.PINATA_NETWORK || 'public'}`;
   // `name` filters by substring, so match exactly rather than taking groups[0].
   const found = await pinataJson(`${groups}?name=${encodeURIComponent(name)}`, { headers: auth });
-  let id = found?.groups?.find((g) => g.name === name)?.id;
+  let id = found?.data?.groups?.find((g) => g.name === name)?.id;
 
   if (!id) {
     const created = await pinataJson(groups, {
@@ -398,6 +433,24 @@ async function walletGroupId(env, address, appId) {
 
   if (env.RATE_KV) await env.RATE_KV.put(key, id);
   return id;
+}
+
+/**
+ * A wallet's group name for an app. Pinata rejects group names over 50 characters with a 400 "malformed
+ * request" (measured 2026-10-23: 50 accepted, 51 refused; its API docs state no limit, so this may move), so
+ * the app and wallet go in as their first 12 hex digits: `testnet-base:` + 12 + `:`
+ * + 12 is 38. 48 bits each: no two of a deployment's apps, or of an app's wallets, will share them in practice,
+ * and an app's pins still sweep as a unit by the `${prefix}:${appId12}:` prefix. Both ids arrive validated and
+ * lowercased.
+ */
+const GROUP_NAME_MAX = 50;
+export function groupName(prefix, appId, address) {
+  const short = (hex) => hex.replace(/^0x/, '').slice(0, 12);
+  const name = `${prefix}:${short(appId)}:${short(address)}`;
+  if (name.length > GROUP_NAME_MAX) {
+    throw new Error(`PINATA_GROUP_PREFIX "${prefix}" is too long: Pinata caps group names at ${GROUP_NAME_MAX} characters, and this one is ${name.length}.`);
+  }
+  return name;
 }
 
 /** fetch + JSON against the Pinata API, throwing with the body on a non-2xx. */

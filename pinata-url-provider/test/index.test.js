@@ -17,7 +17,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { toFunctionSelector } from 'viem';
 
 import worker from '../src/index.js';
-import { ArbitrumSepoliaConfig, BaseSepoliaConfig, FangornConfig } from '@fangorn-network/sdk/lib/config.js';
+import { ArbitrumSepoliaConfig, BaseSepoliaConfig } from '@fangorn-network/sdk/lib/config.js';
 
 /* ── outbound fetch stub ─────────────────────────────────────────────────── */
 // Routes by URL: the Pinata sign endpoint → `pinataResponse`, the Pinata groups
@@ -61,7 +61,7 @@ beforeEach(() => {
   groupsResponse = (u, init) =>
     init?.method === 'POST'
       ? jsonResponse(200, { data: { id: GROUP_ID } })
-      : jsonResponse(200, { groups: [] });
+      : jsonResponse(200, { data: { groups: [], next_page_token: null } }); // Pinata's real shape
 });
 
 const jsonResponse = (status, obj) =>
@@ -93,6 +93,7 @@ const SELECTOR = {
   appSuspended: toFunctionSelector('isAppSuspended(bytes32)'),
   banned: toFunctionSelector('globalSuspensions(address)'),
   status: toFunctionSelector('statusForApp(bytes32,address)'),
+  canonical: toFunctionSelector('canonicalAppId(bytes32)'),
 };
 const callsTo = (selector) => rpcCalls.filter((c) => c.params[0].data.startsWith(selector));
 
@@ -100,9 +101,10 @@ function appRpc({
   canPublish = true,           // access().canPublish
   appSuspended = false,        // taken down by the protocol admin
   banned = false,              // banned network-wide by the protocol admin
-  status = canPublish ? 1 : 0, // 0 None, 1 Active, 2 Suspended, 3 Invited (retired)
+  status = canPublish ? 1 : 0, // 0 None, 1 Active, 2 Suspended
   owner = OWNER.address,
   expiresAt = nowSec() + 30 * 86400,
+  canonical = null,            // canonicalAppId(): null → the id asked about (no alias)
 } = {}) {
   return (_url, init) => {
     const data = JSON.parse(init.body).params[0].data;
@@ -117,6 +119,8 @@ function appRpc({
         return jsonResponse(200, { result: '0x' + wordHex(banned ? 1 : 0) });
       case SELECTOR.status:
         return jsonResponse(200, { result: '0x' + wordHex(status) });
+      case SELECTOR.canonical:
+        return jsonResponse(200, { result: canonical ?? '0x' + data.slice(10, 74) });
       default:
         throw new Error(`unexpected eth_call selector ${data.slice(0, 10)}`);
     }
@@ -183,7 +187,7 @@ function mockKV(initial = {}) {
 const utcDay = () => new Date().toISOString().slice(0, 10);
 // Byte counters are per app: the app is what pays.
 const usageKey = (appId) => `bytes:${appId}:${utcDay()}`;
-const groupName = (appId, account = ACCOUNT) => `testnet:${appId}:${account.address.toLowerCase()}`;
+const groupName = (appId, account = ACCOUNT) => `testnet:${appId.slice(2, 14)}:${account.address.toLowerCase().slice(2, 14)}`;
 
 /* ── success modes ───────────────────────────────────────────────────────── */
 
@@ -200,11 +204,13 @@ test('accepted by the app + valid signature → 200 with uploadUrl', async () =>
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
   assert.equal(res.json.uploadUrl, 'https://uploads.pinata.cloud/signed/xyz');
-  // The whole grant costs one chain read: access(app, caller).
-  assert.equal(rpcCalls.length, 1);
+  // The whole grant costs two chain reads, made together: access(app, caller) and
+  // canonicalAppId(app).
+  assert.equal(rpcCalls.length, 2);
+  assert.equal(callsTo(SELECTOR.canonical)[0].params[0].data, SELECTOR.canonical + APP_ID.slice(2));
   // access(appId, caller): selector, then the two argument words.
   assert.equal(
-    rpcCalls[0].params[0].data,
+    callsTo(SELECTOR.access)[0].params[0].data,
     SELECTOR.access + APP_ID.slice(2) + ACCOUNT.address.slice(2).toLowerCase().padStart(64, '0'),
   );
 });
@@ -229,7 +235,7 @@ test('PINATA_ALLOW_MIME_TYPES → forwarded to Pinata as a trimmed allow_mime_ty
 
 /* ── per-app, per-wallet Pinata group ────────────────────────────────────── */
 
-test('mint files the upload under a group named <prefix>:<appId>:<wallet>', async () => {
+test('mint files the upload under a group named <prefix>:<appId12>:<wallet12>', async () => {
   rpcResponse = acceptedRpc;
   pinataResponse = pinataOk;
   const res = await call(baseEnv(), { body: await proof() });
@@ -246,7 +252,7 @@ test('an existing group is adopted by name, not duplicated', async () => {
   pinataResponse = pinataOk;
   const name = groupName(APP_ID);
   // Substring match — the worker must pick the exact name, not groups[0].
-  groupsResponse = () => jsonResponse(200, { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] });
+  groupsResponse = () => jsonResponse(200, { data: { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] } });
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(lastPinataInit.body).group_id, GROUP_ID);
@@ -264,6 +270,25 @@ test('the wallet→group id is cached in KV across mints', async () => {
   await call(env, { body: p });
   assert.equal(kv._store.get(`group:${groupName(APP_ID)}`), GROUP_ID);
   assert.equal(groupCalls.length, afterFirst); // second mint hit the cache
+});
+
+test('group names fit Pinata\'s 50-character cap (a longer one is a 400)', async () => {
+  rpcResponse = acceptedRpc;
+  pinataResponse = pinataOk;
+  // The deployed prefix, with a full-length app id and wallet: the case that broke every first upload.
+  const res = await call(baseEnv({ PINATA_GROUP_PREFIX: 'testnet-base' }), { body: await proof() });
+  assert.equal(res.status, 200);
+  const name = JSON.parse(groupCalls.at(-1).init.body).name;
+  assert.ok(name.length <= 50, `${name} is ${name.length} characters`);
+  assert.equal(name, `testnet-base:${APP_ID.slice(2, 14)}:${ACCOUNT.address.toLowerCase().slice(2, 14)}`);
+});
+
+test('a PINATA_GROUP_PREFIX too long for the cap → 502 with the reason, never mints', async () => {
+  rpcResponse = acceptedRpc; // pinataResponse null: a mint would throw
+  const res = await call(baseEnv({ PINATA_GROUP_PREFIX: 'x'.repeat(30) }), { body: await proof() });
+  assert.equal(res.status, 502);
+  assert.match(res.json.detail, /too long/);
+  assert.equal(groupCalls.length, 0);
 });
 
 test('missing PINATA_GROUP_PREFIX → 502 and never mints', async () => {
@@ -297,7 +322,7 @@ test('the gate reads Base Sepolia\'s AppRegistry from the SDK, not Arbitrum\'s',
   // The `to` of each eth_call IS the deployment gated on. Asserting it against the
   // SDK is what catches the worker sitting on a stale registry while the SDK has
   // moved on.
-  assert.equal(rpcCalls.length, 4);
+  assert.equal(rpcCalls.length, 5);
   for (const c of rpcCalls) {
     assert.equal(c.params[0].to.toLowerCase(), BaseSepoliaConfig.appRegistryContractAddress.toLowerCase());
   }
@@ -311,7 +336,7 @@ test('the RPC defaults to the SDK\'s Base Sepolia endpoint, and RPC_URL override
   pinataResponse = pinataOk;
   await call(baseEnv(), { body: await proof() });
   await call(baseEnv({ RPC_URL: 'https://rpc.example/' }), { body: await proof() });
-  assert.deepEqual(urls, [BaseSepoliaConfig.rpcUrl, 'https://rpc.example/']);
+  assert.deepEqual(urls, [BaseSepoliaConfig.rpcUrl, BaseSepoliaConfig.rpcUrl, 'https://rpc.example/', 'https://rpc.example/']);
 });
 
 test('invalid address → 400', async () => {
@@ -407,7 +432,7 @@ test('declared size under budget → 200, URL scoped to size, debits bytes', asy
   const res = await call(env, { body: { ...(await proof()), size: 4000 } });
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
-  assert.equal(res.json.maxFileSize, 4000 + 4096);              // requested + headroom
+  assert.equal(res.json.maxFileSize, 4000 + 64 + 4096);              // requested + one chunk's DAG overhead + slack
   assert.equal(kv._store.get(usageKey(APP_ID)), '5000');       // 1000 + declared 4000
 });
 
@@ -492,15 +517,12 @@ test('no appId → 400 before any chain call (there is no default app)', async (
 });
 
 test('never accepted by the app → 403 saying to ask its owner (never mints)', async () => {
-  // 3 is Invited, from the retired join flow: not a member either.
-  for (const status of [0, 3]) {
-    rpcResponse = appRpc({ canPublish: false, status }); // pinataResponse null: a mint would throw
-    const res = await call(baseEnv(), { body: await proof() });
-    assert.equal(res.status, 403);
-    assert.match(res.json.error, new RegExp(`not been accepted by app ${APP_ID}`));
-    assert.match(res.json.error, /owner to accept/);
-    assert.equal(groupCalls.length, 0);
-  }
+  rpcResponse = appRpc({ canPublish: false, status: 0 }); // pinataResponse null: a mint would throw
+  const res = await call(baseEnv(), { body: await proof() });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, new RegExp(`not been accepted by app ${APP_ID}`));
+  assert.match(res.json.error, /owner to accept/);
+  assert.equal(groupCalls.length, 0);
 });
 
 test('app taken down → 403 that names the takedown (never mints)', async () => {
@@ -566,6 +588,23 @@ test('one daily budget covers every publisher of an app', async () => {
   assert.equal(kv._store.get(usageKey(APP_ID)), '3000');
 });
 
+test('an alias (renamed app) bills and files under the canonical id', async () => {
+  // OTHER_APP_ID is an alias of APP_ID: the contract gates on either, and the worker
+  // must not give the alias a budget or Pinata groups of its own.
+  rpcResponse = appRpc({ canonical: APP_ID });
+  pinataResponse = pinataOk;
+  const kv = mockKV({ [usageKey(APP_ID)]: 9000 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '10000', RATE_KV: kv });
+  const ok = await call(env, { body: { ...(await proof(ACCOUNT, { appId: OTHER_APP_ID })), size: 500, uploadId: 'u1' } });
+  assert.equal(ok.status, 200);
+  assert.equal(kv._store.get(usageKey(APP_ID)), '9500');
+  assert.equal(kv._store.has(usageKey(OTHER_APP_ID)), false);
+  assert.equal(JSON.parse(groupCalls.at(-1).init.body).name, groupName(APP_ID));
+  // The alias shares the canonical app's budget, so it can't mint past it.
+  const over = await call(env, { body: { ...(await proof(ACCOUNT, { appId: OTHER_APP_ID })), size: 600 } });
+  assert.equal(over.status, 429);
+});
+
 test('unclaimed app (owner 0x0) → 403, never billed', async () => {
   rpcResponse = appRpc({ canPublish: false, owner: '0x' + '0'.repeat(40), expiresAt: 0 });
   const kv = mockKV();
@@ -574,7 +613,7 @@ test('unclaimed app (owner 0x0) → 403, never billed', async () => {
   assert.equal(res.status, 403);
   assert.match(res.json.error, /has not been claimed/i);
   assert.equal(kv._store.size, 0);
-  assert.equal(rpcCalls.length, 1); // explained by access() alone
+  assert.equal(rpcCalls.length, 2); // explained by access() alone (canonicalAppId() rides along)
 });
 
 test('malformed appId → 400 before any chain call', async () => {
@@ -585,8 +624,8 @@ test('malformed appId → 400 before any chain call', async () => {
 
 /* ── usage endpoint ──────────────────────────────────────────────────────── */
 
-test('GET /usage → an app\'s byte counter + limit (no proof, no RPC)', async () => {
-  // rpcResponse/pinataResponse stay null: /usage must hit neither.
+test('GET /usage → an app\'s byte counter + limit (no proof, one RPC)', async () => {
+  rpcResponse = acceptedRpc; // canonicalAppId() only; pinataResponse stays null
   const kv = mockKV({ [usageKey(APP_ID)]: 200, [usageKey(OTHER_APP_ID)]: 7 });
   const env = baseEnv({ DAILY_BYTE_LIMIT: '5000', RATE_KV: kv });
   const res = await worker.fetch(new Request(`https://worker.test/usage?appId=${APP_ID}`), env);
@@ -595,6 +634,16 @@ test('GET /usage → an app\'s byte counter + limit (no proof, no RPC)', async (
   assert.equal(body.appId, APP_ID);
   assert.equal(body.daily, 200);
   assert.equal(body.dailyLimit, 5000);
+});
+
+test('GET /usage for an alias reads the canonical app\'s counter', async () => {
+  rpcResponse = appRpc({ canonical: APP_ID });
+  const kv = mockKV({ [usageKey(APP_ID)]: 200 });
+  const env = baseEnv({ DAILY_BYTE_LIMIT: '5000', RATE_KV: kv });
+  const res = await worker.fetch(new Request(`https://worker.test/usage?appId=${OTHER_APP_ID}`), env);
+  const body = await res.json();
+  assert.equal(body.appId, OTHER_APP_ID);
+  assert.equal(body.daily, 200);
 });
 
 test('GET /usage with a bad or missing appId → 400 (there is no default app)', async () => {

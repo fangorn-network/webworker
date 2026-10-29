@@ -21,7 +21,7 @@ Requests get validated on:
 4. **Daily budget.** The declared upload size is checked against the app's daily byte budget.
 5. **Mint.** `POST /v3/files/sign` at Pinata, scoped to that size, to `PINATA_ALLOW_MIME_TYPES`, and to the caller's Pinata group within the app.
 
-Step 3 is the only chain read a granted upload makes.
+Step 3 makes the only chain reads a granted upload needs: `access`, plus `canonicalAppId(appId)` in parallel. A renamed app (`renameApp`) answers to every id it has gone by, so `appId` may be an alias; the budget, paid markers and Pinata group are keyed by the canonical id, so an alias shares the app's budget and groups instead of opening its own.
 
 ## Endpoints
 
@@ -41,7 +41,7 @@ Query parameters (`GET`) or a JSON body (`POST`).
 | `appId` | **Required.** 32-byte hex app id: the app the upload is for. The caller must be able to publish to it (`canPublish`), and the bytes are billed to **that app**. See *Apps and subscriptions*. |
 | `message` | The challenge, signed verbatim (see *Ownership handshake*). |
 | `signature` | 65-byte `personal_sign` signature of `message`. |
-| `size` | Declared upload size in bytes. The minted URL is scoped to `size + 4096` (multipart headroom). This is what gets debited to the app's daily budget. Omitted → `DEFAULT_UPLOAD_SIZE`. |
+| `size` | Declared upload size in bytes. The minted URL is scoped to `size` plus Pinata's IPFS DAG overhead (64 B per 256 KiB chunk + 4 KiB). This is what gets debited to the app's daily budget. Omitted → `DEFAULT_UPLOAD_SIZE`. |
 | `uploadId` | Idempotency key. A retry reusing it re-mints a fresh single-use URL but is charged once. |
 
 ### Minting: responses
@@ -68,7 +68,7 @@ No URL is minted on any non-`200`, and the counters are debited **only** after a
   "day": "2026-08-31" }
 ```
 
-`appId` is required (there is no default app); a missing or bad one gives `400`. `dailyLimit` reports `0` when the budget is disabled, and `daily` reports `0` when `RATE_KV` is unbound. There is no authentication for this call since byte counts aren't sensitive.
+`appId` is required (there is no default app); a missing or bad one gives `400`. An alias reports its app's counter (one `canonicalAppId` read; `502` if the RPC fails). `dailyLimit` reports `0` when the budget is disabled, and `daily` reports `0` when `RATE_KV` is unbound. There is no authentication for this call since byte counts aren't sensitive.
 
 ## Ownership handshake
 
@@ -116,7 +116,7 @@ The AppRegistry is both the membership list and the paywall, and `access(appId, 
 | the app was taken down by the protocol admin | `isAppSuspended(appId)` | `403` |
 | the wallet is banned network-wide | `globalSuspensions(caller)` | `403` |
 | the app's owner suspended the wallet | `statusForApp(appId, caller)` is Suspended | `403` |
-| the app's owner never accepted the wallet | `statusForApp(appId, caller)` is None (or the retired Invited) | `403`, saying to ask the owner |
+| the app's owner never accepted the wallet | `statusForApp(appId, caller)` is None | `403`, saying to ask the owner |
 
 Membership is the owner's call: they accept a wallet with `acceptPublisher`, and are accepted themselves when they claim the app. There are no invitations, terms or join fees. The explaining reads happen only on a denial; a granted upload makes none of them.
 
@@ -126,7 +126,7 @@ The AppRegistry address comes from `BaseSepoliaConfig` in `@fangorn-network/sdk`
 
 ## Daily byte budget
 
-`DAILY_BYTE_LIMIT`, KV key `bytes:{appId}:{UTC-day}`, 2-day TTL. An abuse guard that bounds the Pinata bill: one budget per app, shared by all of its publishers. Exceeding it returns `429` until 00:00 UTC. It is **opt-in** — inactive unless the limit is `> 0` *and* `RATE_KV` is bound.
+`DAILY_BYTE_LIMIT`, KV key `bytes:{canonicalAppId}:{UTC-day}`, 2-day TTL. An abuse guard that bounds the Pinata bill: one budget per app, shared by all of its publishers. Exceeding it returns `429` until 00:00 UTC. It is **opt-in** — inactive unless the limit is `> 0` *and* `RATE_KV` is bound.
 
 **Retries** reuse the caller's `uploadId` (marker `paid:{appId}:{uploadId}`, 1-hour TTL), so one logical upload is charged once; a re-mint at the same or smaller size is free, a larger one is charged normally.
 
@@ -134,7 +134,7 @@ KV is eventually consistent and allows one write per second per key, so a concur
 
 ## Upload groups
 
-Every presigned URL is scoped to a Pinata **group** named `<PINATA_GROUP_PREFIX>:<appId>:<wallet>`: billed to the app, attributable to the publisher. Resolved KV cache → lookup by name → create on first use. `group_id` is signed into the URL, so the uploader cannot file the pin anywhere else. If the group can't be resolved the request `502`s and **no URL is minted**.
+Every presigned URL is scoped to a Pinata **group** named `<PINATA_GROUP_PREFIX>:<canonicalAppId>:<wallet>`: billed to the app, attributable to the publisher. Resolved KV cache → lookup by name → create on first use. `group_id` is signed into the URL, so the uploader cannot file the pin anywhere else. If the group can't be resolved the request `502`s and **no URL is minted**.
 
 To retire testnet data:
 
@@ -169,7 +169,7 @@ curl "http://localhost:8787/?address=0xYourAddress&appId=0xYourAppId"   # → 40
 
 Contract addresses come from the installed SDK, so there is nothing to point at first. Every mint reads Base Sepolia; there is no mode that skips the chain.
 
-`pnpm test` runs 42 cases (`node --test`, no framework) covering the handshake, the access gate and each denial, the byte budget, groups, and `/usage`. The chain and Pinata are stubbed.
+`pnpm test` runs 46 cases (`node --test`, no framework) covering the handshake, the access gate and each denial, the byte budget, groups, and `/usage`. The chain and Pinata are stubbed.
 
 ## Deploy
 
@@ -198,7 +198,7 @@ Without the `RATE_KV` binding the daily cap does nothing and `/usage` reports ze
 | `PINATA_GROUP_PREFIX` | var | **Required.** Namespaces this deployment's per-wallet groups. Currently `testnet-base` (`testnet` held the Arbitrum-era pins); production is a separate deploy with its own prefix. |
 | `PINATA_NETWORK` | var | `public` or `private`. Also selects the groups namespace. |
 | `PINATA_URL_EXPIRES` | var | Seconds the upload URL stays valid (default `300`). |
-| `PINATA_ALLOW_MIME_TYPES` | var | Optional CSV of MIME types signed into the URL. |
+| `PINATA_ALLOW_MIME_TYPES` | var | Optional CSV of MIME types signed into the URL. Pinata matches the type it detects from the file's bytes, not the declared one, so JSON uploads (records, ERC-8004 registration files) need `application/json` even when sent as `text/plain`. |
 | `RPC_URL` | var | Base Sepolia JSON-RPC endpoint. Default: the SDK's `BaseSepoliaConfig.rpcUrl`. |
 | `DAILY_BYTE_LIMIT` | var | Bytes per app per UTC day. `0`/unset disables the daily cap. |
 | `MAX_UPLOAD_SIZE` | var | Per-request ceiling in bytes. A larger declared `size` in a request gets `413`. Defaults to 500 MiB. |
