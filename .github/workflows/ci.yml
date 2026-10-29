@@ -16,13 +16,13 @@ jobs:
       - run: pnpm -r typecheck
       - run: pnpm -r test
 
-  # A merge to main is a push to main: ship the storage worker once tests pass.
+  # A merge to main is a push to main: ship pinata-url-provider once tests pass.
   # It deploys as pinata-url-provider-base (wrangler.toml), never the Arbitrum worker.
-  deploy-storage:
+  deploy-pinata-url-provider:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    concurrency: deploy-storage
+    concurrency: deploy-pinata-url-provider
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
