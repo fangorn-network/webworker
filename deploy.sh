@@ -5,10 +5,8 @@ set -euo pipefail
 # ==============================================================================
 # Deploys the Fangorn Cloudflare Workers — any one, any combination, or all.
 #
-#   storage    pinata-url-provider     presigned Pinata upload URLs, gated on
-#                                      access() at Base Sepolia's AppRegistry;
+#   storage    pinata-url-provider     presigned Pinata upload URLs under daily quotas;
 #                                      deploys as pinata-url-provider-base
-#   quickbeam  quickbeam-registry      Quickbeam view control plane, same gate
 #   access     fangorn-access-worker   the key server: releases a paid field's key once
 #                                      the SettlementRegistry says the reader paid
 #   barliman   barliman                the relay and x402 facilitator: sends signed commits,
@@ -20,10 +18,6 @@ set -euo pipefail
 #   ./deploy.sh access barliman        # any subset, any order
 #   ./deploy.sh --dry-run all          # bundle + config check, deploy nothing
 #   TARGETS="storage access" ./deploy.sh   # non-interactive preset (CI)
-#
-# Deploying `quickbeam` asks whether to clear its KV store (every view, and the
-# per-view DNS rows) once the deploy lands. Default is no; CLEAR_KV=true|false
-# answers it non-interactively.
 #
 # Package directory names work as arguments too, so tab-completion is enough.
 #
@@ -40,13 +34,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-WORKERS=(storage quickbeam access barliman)
+WORKERS=(storage access barliman)
 
 # Short name or package directory → short name. The only place names are spelled.
 canonical() {
     case "$1" in
         storage|pinata-url-provider)    echo storage ;;
-        quickbeam|quickbeam-registry)   echo quickbeam ;;
         access|fangorn-access-worker)   echo access ;;
         barliman|relay)                 echo barliman ;;
         *) return 1 ;;
@@ -56,7 +49,6 @@ canonical() {
 dir_for() {
     case "$1" in
         storage)   echo pinata-url-provider ;;
-        quickbeam) echo quickbeam-registry ;;
         access)    echo fangorn-access-worker ;;
         barliman)  echo barliman ;;
     esac
@@ -64,45 +56,6 @@ dir_for() {
 
 DRY_RUN=false
 selected=()
-
-# Wipe every key in the Quickbeam worker's KV: the `view:` rows and their `dns:`
-# reverse-map entries, which is everything it stores. Asked, never assumed.
-#
-# ponytail: a raw KV wipe, so a view's hosted Cloud Run MCP outlives its row — the
-# worker's own /admin/remove deletes that service first, this cannot. Remove hosted
-# views with examples/manage-views.mjs --remove before clearing, or delete the
-# services by hand afterwards.
-clear_quickbeam_kv() {
-    local dir="$SCRIPT_DIR/$(dir_for quickbeam)"
-    local keys count file
-    keys=$(cd "$dir" && pnpm exec wrangler kv key list --binding QUICKBEAM_KV --remote 2>/dev/null) \
-        || { echo "  ✘ could not list the KV namespace — nothing cleared" >&2; return 1; }
-    count=$(grep -c '"name"' <<<"$keys" || true)
-
-    if [[ "$count" -eq 0 ]]; then
-        echo "  KV is already empty." >&2
-        return 0
-    fi
-
-    if [[ -n "${CLEAR_KV:-}" ]]; then
-        [[ "$CLEAR_KV" == true ]] || { echo "  KV left alone (CLEAR_KV=$CLEAR_KV): $count key(s)." >&2; return 0; }
-    elif [[ ! -t 0 ]]; then
-        echo "  KV left alone ($count key(s)) — no TTY to ask; set CLEAR_KV=true to wipe." >&2
-        return 0
-    else
-        echo >&2
-        echo "  The Quickbeam KV holds $count key(s) — every view and its DNS row." >&2
-        echo "  Hosted Cloud Run MCP services are NOT deleted by this wipe." >&2
-        read -rp "  Clear the KV store? [y/N] " reply
-        [[ "$reply" =~ ^[Yy] ]] || { echo "  Left alone." >&2; return 0; }
-    fi
-
-    # wrangler kv bulk delete wants a JSON array of key names.
-    file=$(mktemp); trap 'rm -f "$file"' RETURN
-    grep -oE '"name": "[^"]+"' <<<"$keys" | sed 's/"name": //' | paste -sd, - | sed 's/^/[/; s/$/]/' > "$file"
-    (cd "$dir" && pnpm exec wrangler kv bulk delete "$file" --binding QUICKBEAM_KV --remote --force)
-    echo "  🗑  cleared $count key(s)." >&2
-}
 
 for arg in "$@"; do
     case "$arg" in
@@ -232,11 +185,8 @@ for w in "${deploy_list[@]}"; do
         # `--` through to wrangler, which ignores it and deploys for real.)
         (cd "$SCRIPT_DIR/$dir" \
             && pnpm exec $(node -p "require('./package.json').scripts.deploy") --dry-run)
-        [[ "$w" == quickbeam ]] && echo "  (would ask whether to clear the KV store)" >&2
     else
         (cd "$SCRIPT_DIR/$dir" && pnpm run deploy)
-        # After the deploy, not before: a failed deploy should not cost you the store.
-        [[ "$w" == quickbeam ]] && clear_quickbeam_kv
     fi
 done
 

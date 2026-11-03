@@ -9,8 +9,6 @@ deploys on its own, and calls none of the others.
 | Key server | [`fangorn-access-worker`](./fangorn-access-worker) | Releases a paid field's key once the SettlementRegistry says the reader paid. Stores nothing | `WORKER_X25519_SECRET` |
 | Barliman | [`barliman`](./barliman) | The relay and x402 facilitator: sends signed commits, `register` and `settle`, paying gas from the treasury | `TREASURY_KEY` |
 
-`quickbeam-registry` is also in the workspace; it predates the current design and isn't covered here.
-
 None of these is part of the protocol. The chain and IPFS are the source of truth, and each worker
 can be replaced: a publisher can run their own key server (and name it in their deposit), anyone
 with ETH can call `register` and `settle` themselves, and any IPFS pinning service stores records.
@@ -58,7 +56,7 @@ npx westmarch-ship app.json --devnet   # a whole app locally; with "paid", the k
 
 ```sh
 ./deploy.sh                        # interactive: y/N per worker
-./deploy.sh access barliman        # names: storage, quickbeam, access, barliman
+./deploy.sh access barliman        # names: storage, access, barliman
 ./deploy.sh --dry-run all          # bundle and check, deploy nothing
 TARGETS="access barliman" ./deploy.sh
 ```
