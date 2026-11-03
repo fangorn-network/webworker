@@ -222,7 +222,10 @@ const PINATA_API = 'https://api.pinata.cloud/v3';
 async function walletGroupId(env, address) {
   const prefix = (env.PINATA_GROUP_PREFIX || '').trim();
   if (!prefix) throw new Error('PINATA_GROUP_PREFIX is not set (every upload must be filed under a group).');
-  const name = `${prefix}:${address}`;
+  // Pinata refuses group names over 50 characters. Without its 0x the address is 40 hex;
+  // a longer prefix keeps fewer of them, still more than enough to tell wallets apart.
+  const name = `${prefix}:${address.slice(2)}`.slice(0, 50);
+  if (name.length - prefix.length - 1 < 24) throw new Error('PINATA_GROUP_PREFIX is too long: a group name keeps under 24 hex of the wallet.');
   const key = `group:${name}`;
 
   // Lifetime cache (no TTL) — a wallet's group never changes.
@@ -236,7 +239,7 @@ async function walletGroupId(env, address) {
   const groups = `${PINATA_API}/groups/${env.PINATA_NETWORK || 'public'}`;
   // `name` filters by substring, so match exactly rather than taking groups[0].
   const found = await pinataJson(`${groups}?name=${encodeURIComponent(name)}`, { headers: auth });
-  let id = found?.groups?.find((g) => g.name === name)?.id;
+  let id = found?.data?.groups?.find((g) => g.name === name)?.id;
 
   if (!id) {
     const created = await pinataJson(groups, {

@@ -49,7 +49,7 @@ beforeEach(() => {
   groupsResponse = (u, init) =>
     init?.method === 'POST'
       ? jsonResponse(200, { data: { id: GROUP_ID } })
-      : jsonResponse(200, { groups: [] });
+      : jsonResponse(200, { data: { groups: [] } });
 });
 
 const jsonResponse = (status, obj) =>
@@ -121,7 +121,7 @@ function mockKV(initial = {}) {
 
 const utcDay = () => new Date().toISOString().slice(0, 10);
 const usageKey = (who = ACCOUNT.address.toLowerCase()) => `bytes:${who}:${utcDay()}`;
-const groupName = (account = ACCOUNT) => `testnet:${account.address.toLowerCase()}`;
+const groupName = (account = ACCOUNT, prefix = 'testnet') => `${prefix}:${account.address.toLowerCase().slice(2)}`.slice(0, 50);
 
 /* ── success modes ───────────────────────────────────────────────────────── */
 
@@ -162,11 +162,20 @@ test('mint files the upload under a group named <prefix>:<wallet>', async () => 
   assert.match(groupCalls[0].url, new RegExp(`name=${encodeURIComponent(name)}`));
 });
 
+test('a group name stays within Pinata\'s 50 characters', async () => {
+  pinataResponse = pinataOk;
+  const res = await call(baseEnv({ PINATA_GROUP_PREFIX: 'testnet-base' }), { body: await proof() });
+  assert.equal(res.status, 200);
+  const name = JSON.parse(groupCalls.at(-1).init.body).name;
+  assert.equal(name, groupName(ACCOUNT, 'testnet-base'));
+  assert.ok(name.length <= 50);
+});
+
 test('an existing group is adopted by name, not duplicated', async () => {
   pinataResponse = pinataOk;
   const name = groupName();
   // Substring match — the worker must pick the exact name, not groups[0].
-  groupsResponse = () => jsonResponse(200, { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] });
+  groupsResponse = () => jsonResponse(200, { data: { groups: [{ id: 'other', name: `${name}-old` }, { id: GROUP_ID, name }] } });
   const res = await call(baseEnv(), { body: await proof() });
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(lastPinataInit.body).group_id, GROUP_ID);

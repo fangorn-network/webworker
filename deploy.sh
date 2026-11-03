@@ -26,7 +26,7 @@ set -euo pipefail
 # versions disagree — that mismatch is invisible at runtime and would gate each
 # worker on a different deployment. It also checks each worker's own wiring:
 # Barliman's TREASURY var and TREASURY_KEY secret, the key server's
-# WORKER_X25519_SECRET, and prints the key server URL the SDK deposits with.
+# WORKER_X25519_SECRET.
 #
 # `wrangler login` once first. The storage worker also needs its Pinata secret
 # (`wrangler secret put PINATA_JWT`), set separately and unaffected by deploys.
@@ -130,9 +130,9 @@ for w in "${deploy_list[@]}"; do
         const require = createRequire(process.cwd() + "/");
         const { version } = require("@fangorn-network/sdk/package.json");
         const c = (await import("@fangorn-network/sdk/lib/config.js"))[process.env.CONFIG];
-        console.log(version, c.dataRegistryContractAddress, c.settlementRegistryContractAddress, c.keyServer ?? "unset");
+        console.log(version, c.dataRegistryContractAddress, c.settlementRegistryContractAddress);
     ') || { echo "  $w: cannot read the SDK — run pnpm install" >&2; exit 1; }
-    read -r version data settlement keyserver <<<"$info"
+    read -r version data settlement <<<"$info"
     versions+=("$version")
     case "$w" in
         access)   gate="settlement $settlement" ;;
@@ -141,8 +141,6 @@ for w in "${deploy_list[@]}"; do
     esac
     printf '  %-10s sdk %-16s %-18s %s\n' "$w" "$version" "$config" "$gate" >&2
 done
-
-echo "  the SDK deposits paid repos with key server: $keyserver" >&2
 
 # ── Preflight: each worker's own wiring ──────────────────────────────────────
 # A worker missing a secret deploys fine and then fails every request it exists for.
