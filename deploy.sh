@@ -9,12 +9,15 @@ set -euo pipefail
 #                                      access() at Base Sepolia's AppRegistry;
 #                                      deploys as pinata-url-provider-base
 #   quickbeam  quickbeam-registry      Quickbeam view control plane, same gate
-#   access     fangorn-access-worker   R2 reads gated on the SettlementRegistry
+#   access     fangorn-access-worker   the key server: releases a paid field's key once
+#                                      the SettlementRegistry says the reader paid
+#   barliman   barliman                the relay and x402 facilitator: sends signed commits,
+#                                      register and settle, paying gas from the treasury
 #
 # Usage:
 #   ./deploy.sh                        # interactive: y/N per worker
 #   ./deploy.sh all                    # every worker
-#   ./deploy.sh storage quickbeam      # any subset, any order
+#   ./deploy.sh access barliman        # any subset, any order
 #   ./deploy.sh --dry-run all          # bundle + config check, deploy nothing
 #   TARGETS="storage access" ./deploy.sh   # non-interactive preset (CI)
 #
@@ -24,10 +27,12 @@ set -euo pipefail
 #
 # Package directory names work as arguments too, so tab-completion is enough.
 #
-# All three workers read their contract addresses from @fangorn-network/sdk, so
-# the preflight prints what each package resolves and refuses to deploy a set
-# whose SDK versions disagree — that mismatch is invisible at runtime and would
-# gate each worker on a different deployment.
+# Every worker reads its contract addresses from @fangorn-network/sdk, so the
+# preflight prints what each package resolves and refuses to deploy a set whose SDK
+# versions disagree — that mismatch is invisible at runtime and would gate each
+# worker on a different deployment. It also checks each worker's own wiring:
+# Barliman's TREASURY var and TREASURY_KEY secret, the key server's
+# WORKER_X25519_SECRET, and prints the key server URL the SDK deposits with.
 #
 # `wrangler login` once first. The storage worker also needs its Pinata secret
 # (`wrangler secret put PINATA_JWT`), set separately and unaffected by deploys.
@@ -35,7 +40,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-WORKERS=(storage quickbeam access)
+WORKERS=(storage quickbeam access barliman)
 
 # Short name or package directory → short name. The only place names are spelled.
 canonical() {
@@ -43,6 +48,7 @@ canonical() {
         storage|pinata-url-provider)    echo storage ;;
         quickbeam|quickbeam-registry)   echo quickbeam ;;
         access|fangorn-access-worker)   echo access ;;
+        barliman|relay)                 echo barliman ;;
         *) return 1 ;;
     esac
 }
@@ -52,6 +58,7 @@ dir_for() {
         storage)   echo pinata-url-provider ;;
         quickbeam) echo quickbeam-registry ;;
         access)    echo fangorn-access-worker ;;
+        barliman)  echo barliman ;;
     esac
 }
 
@@ -170,15 +177,38 @@ for w in "${deploy_list[@]}"; do
         const require = createRequire(process.cwd() + "/");
         const { version } = require("@fangorn-network/sdk/package.json");
         const c = (await import("@fangorn-network/sdk/lib/config.js"))[process.env.CONFIG];
-        console.log(version, c.dataRegistryContractAddress, c.appRegistryContractAddress, c.settlementRegistryContractAddress);
+        console.log(version, c.dataRegistryContractAddress, c.settlementRegistryContractAddress, c.keyServer ?? "unset");
     ') || { echo "  $w: cannot read the SDK — run pnpm install" >&2; exit 1; }
-    read -r version data apps settlement <<<"$info"
+    read -r version data settlement keyserver <<<"$info"
     versions+=("$version")
     case "$w" in
-        access) gate="settlement $settlement" ;;
-        *)      gate="apps $apps (data $data)" ;;
+        access)   gate="settlement $settlement" ;;
+        barliman) gate="data $data, settlement $settlement" ;;
+        *)        gate="data $data" ;;
     esac
     printf '  %-10s sdk %-16s %-18s %s\n' "$w" "$version" "$config" "$gate" >&2
+done
+
+echo "  the SDK deposits paid repos with key server: $keyserver" >&2
+
+# ── Preflight: each worker's own wiring ──────────────────────────────────────
+# A worker missing a secret deploys fine and then fails every request it exists for.
+has_secret() { (cd "$SCRIPT_DIR/$(dir_for "$1")" && pnpm exec wrangler secret list 2>/dev/null) | grep -q "\"$2\""; }
+for w in "${deploy_list[@]}"; do
+    case "$w" in
+        barliman)
+            treasury=$(grep -E '^\s*TREASURY\s*=' "$SCRIPT_DIR/barliman/wrangler.toml" | grep -oE '0x[0-9a-fA-F]{40}' || true)
+            if [[ -z "$treasury" || "$treasury" =~ ^0x0+$ ]]; then
+                echo "barliman: set TREASURY (the referrer on every register) under [vars] in barliman/wrangler.toml" >&2
+                exit 1
+            fi
+            echo "  barliman  referrer $treasury" >&2
+            $DRY_RUN || has_secret barliman TREASURY_KEY \
+                || echo "  ⚠ barliman has no TREASURY_KEY secret yet: wrangler secret put TREASURY_KEY (fund it with ETH)" >&2 ;;
+        access)
+            $DRY_RUN || has_secret access WORKER_X25519_SECRET \
+                || echo "  ⚠ the key server has no WORKER_X25519_SECRET yet: openssl rand -hex 32 | wrangler secret put WORKER_X25519_SECRET" >&2 ;;
+    esac
 done
 
 # One shared SDK is the whole point: different versions mean different contracts,

@@ -13,6 +13,9 @@ interface Env {
 	TREASURY: Address // the referrer on every register
 	RATE_KV: KVNamespace
 	RPC_URL?: string
+	// For a devnet or another deployment; unset, the SDK's.
+	DATA_REGISTRY?: Address
+	SETTLEMENT_REGISTRY?: Address
 }
 
 const CORS = {
@@ -44,8 +47,8 @@ function relayOf(env: Env): Relay {
 		chain: chainOf(env),
 		kv: env.RATE_KV,
 		treasury: env.TREASURY,
-		dataRegistry: FangornConfig.dataRegistryContractAddress as Address,
-		settlementRegistry: FangornConfig.settlementRegistryContractAddress as Address,
+		dataRegistry: env.DATA_REGISTRY || (FangornConfig.dataRegistryContractAddress as Address),
+		settlementRegistry: env.SETTLEMENT_REGISTRY || (FangornConfig.settlementRegistryContractAddress as Address),
 	}
 }
 
@@ -53,7 +56,7 @@ export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		if (request.method === 'OPTIONS') return new Response(null, { headers: CORS })
 		const path = new URL(request.url).pathname
-		if (request.method === 'GET' && path === '/supported') return json(x402.supported(NETWORK))
+		if (request.method === 'GET' && path === '/supported') return json(x402.supported(NETWORK, env.TREASURY))
 
 		const route = path.match(/^\/relay\/(commit|register|settle)$/)?.[1]
 		const facilitator = path === '/verify' || path === '/settle'

@@ -22,9 +22,7 @@ Paid registers and settles aren't limited.
 
 ## x402 facilitator
 
-Barliman is also the x402 (v2) facilitator for buying a record, in place of PayAI. The scheme
-is `fangorn`, and the payment is `register`: `POST /verify` simulates it and `POST /settle`
-sends it. `GET /supported` lists the scheme.
+Barliman is an x402 (v2) facilitator for buying a record. The scheme is `fangorn`, and the payment is `register`: `POST /verify` simulates it and `POST /settle` sends it. `GET /supported` lists the scheme.
 
 The seller's 402 (westmarch) names the record's signed terms:
 
@@ -34,17 +32,11 @@ The seller's 402 (westmarch) names the record's signed terms:
   "extra": { "terms": { … }, "signature": "0x…" } }
 ```
 
-The buyer's `PaymentPayload.payload` is `{ commitment, salt, payment }`, where `payment` is the
-ERC-3009 `receiveWithAuthorization` to the registry. A retry after `register` already landed
-succeeds (`AlreadyRegistered` counts as paid). Free records don't go through x402; they use
-`/relay/register`.
+The buyer's `PaymentPayload.payload` is `{ commitment, salt, payment }`, where `payment` is the ERC-3009 `receiveWithAuthorization` to the registry. A retry after `register` already landed succeeds (`AlreadyRegistered` counts as paid). Free records don't go through x402; they use `/relay/register`.
 
-After paying, the buyer sends its Semaphore proof to `/relay/settle`, then asks the key server
-for the key. Settle isn't part of x402, because the proof can only be made once `register`
-has landed.
+After paying, the buyer sends its Semaphore proof to `/relay/settle`, then asks the key server for the key. Settle isn't part of x402, because the proof can only be made once `register` has landed.
 
-Not yet: listing in a Bazaar (PayAI listed sellers in its own), and the `exact` scheme
-(passes and per-call MCP payments).
+Not yet: listing in a Bazaar (PayAI listed sellers in its own), and the `exact` scheme (passes and per-call MCP payments).
 
 ## Configure
 
@@ -52,8 +44,7 @@ Not yet: listing in a Bazaar (PayAI listed sellers in its own), and the `exact` 
 npx wrangler secret put TREASURY_KEY     # pays gas; fund it with Base Sepolia ETH
 ```
 
-Set `TREASURY` (the referrer address) under `[vars]` in `wrangler.toml`. The worker refuses
-requests without it. `RPC_URL` is optional.
+Set `TREASURY` (the referrer address) under `[vars]` in `wrangler.toml`. The worker refuses requests without it. `RPC_URL` is optional.
 
 ## Develop
 

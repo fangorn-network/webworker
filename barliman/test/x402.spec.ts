@@ -90,3 +90,10 @@ describe('x402 facilitator', () => {
 		expect(await settle(body(), relayWith(chain), NETWORK)).toMatchObject({ success: true })
 	})
 })
+
+describe('supported', () => {
+	it('names the treasury, which the buyer signs into its nonce', async () => {
+		const { supported } = await import('../src/x402')
+		expect(supported(NETWORK, TREASURY).kinds[0]).toMatchObject({ scheme: 'fangorn', network: NETWORK, extra: { referrer: TREASURY } })
+	})
+})

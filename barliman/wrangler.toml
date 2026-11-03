@@ -5,7 +5,7 @@ account_id = "0beaeb0776ca9e8404297afe0da73e5a"  # Fangorn@fangorn.network
 
 # Required var, set before deploying: TREASURY = "0x…", the referrer on every register (Fangorn's 5%).
 # Secret: npx wrangler secret put TREASURY_KEY   (fund it with Base Sepolia ETH)
-# Optional var: RPC_URL
+# Optional vars: RPC_URL, DATA_REGISTRY, SETTLEMENT_REGISTRY (a devnet or another deployment)
 
 # Rate-limit counters. No id: wrangler creates the namespace on first deploy.
 [[kv_namespaces]]

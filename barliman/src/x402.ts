@@ -63,4 +63,9 @@ export async function settle(body: any, r: Relay, network: Network): Promise<Set
 	}
 }
 
-export const supported = (network: Network): SupportedResponse => ({ kinds: [{ x402Version: 2, scheme: SCHEME, network }], extensions: [], signers: {} })
+// The buyer signs the treasury into its payment's nonce (registerNonce binds the referrer), so it needs it up front.
+export const supported = (network: Network, treasury: Address): SupportedResponse => ({
+	kinds: [{ x402Version: 2, scheme: SCHEME, network, extra: { referrer: treasury } }],
+	extensions: [],
+	signers: {},
+})

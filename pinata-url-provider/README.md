@@ -2,9 +2,7 @@
 
 A single-file Cloudflare Worker (`src/index.js`) that mints **Pinata presigned upload URLs** for wallets that prove address ownership. Callers pin to IPFS without ever seeing the Pinata JWT. Each publisher has a daily storage quota, and the worker a global one.
 
-It deploys as **`pinata-url-provider-base`**
-(`https://pinata-url-provider-base.fangorn-0be.workers.dev`). The older
-`pinata-url-provider` worker is the Arbitrum deployment's, and is never redeployed.
+It deploys as **`pinata-url-provider-base`** (`https://pinata-url-provider-base.fangorn-0be.workers.dev`). The older `pinata-url-provider` worker is the Arbitrum deployment's, and is never redeployed.
 
 Requests get validated on:
 
