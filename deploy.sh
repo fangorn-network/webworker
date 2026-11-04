@@ -5,29 +5,28 @@ set -euo pipefail
 # ==============================================================================
 # Deploys the Fangorn Cloudflare Workers — any one, any combination, or all.
 #
-#   storage    pinata-url-provider     presigned Pinata upload URLs, gated on
-#                                      access() at Base Sepolia's AppRegistry;
+#   storage    pinata-url-provider     presigned Pinata upload URLs under daily quotas;
 #                                      deploys as pinata-url-provider-base
-#   quickbeam  quickbeam-registry      Quickbeam view control plane, same gate
-#   access     fangorn-access-worker   R2 reads gated on the SettlementRegistry
+#   access     fangorn-access-worker   the key server: releases a paid field's key once
+#                                      the SettlementRegistry says the reader paid
+#   barliman   barliman                the relay and x402 facilitator: sends signed commits,
+#                                      register and settle, paying gas from the treasury
 #
 # Usage:
 #   ./deploy.sh                        # interactive: y/N per worker
 #   ./deploy.sh all                    # every worker
-#   ./deploy.sh storage quickbeam      # any subset, any order
+#   ./deploy.sh access barliman        # any subset, any order
 #   ./deploy.sh --dry-run all          # bundle + config check, deploy nothing
 #   TARGETS="storage access" ./deploy.sh   # non-interactive preset (CI)
 #
-# Deploying `quickbeam` asks whether to clear its KV store (every view, and the
-# per-view DNS rows) once the deploy lands. Default is no; CLEAR_KV=true|false
-# answers it non-interactively.
-#
 # Package directory names work as arguments too, so tab-completion is enough.
 #
-# All three workers read their contract addresses from @fangorn-network/sdk, so
-# the preflight prints what each package resolves and refuses to deploy a set
-# whose SDK versions disagree — that mismatch is invisible at runtime and would
-# gate each worker on a different deployment.
+# Every worker reads its contract addresses from @fangorn-network/sdk, so the
+# preflight prints what each package resolves and refuses to deploy a set whose SDK
+# versions disagree — that mismatch is invisible at runtime and would gate each
+# worker on a different deployment. It also checks each worker's own wiring:
+# Barliman's TREASURY var and TREASURY_KEY secret, the key server's
+# WORKER_X25519_SECRET.
 #
 # `wrangler login` once first. The storage worker also needs its Pinata secret
 # (`wrangler secret put PINATA_JWT`), set separately and unaffected by deploys.
@@ -35,14 +34,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-WORKERS=(storage quickbeam access)
+WORKERS=(storage access barliman)
 
 # Short name or package directory → short name. The only place names are spelled.
 canonical() {
     case "$1" in
         storage|pinata-url-provider)    echo storage ;;
-        quickbeam|quickbeam-registry)   echo quickbeam ;;
         access|fangorn-access-worker)   echo access ;;
+        barliman|relay)                 echo barliman ;;
         *) return 1 ;;
     esac
 }
@@ -50,52 +49,13 @@ canonical() {
 dir_for() {
     case "$1" in
         storage)   echo pinata-url-provider ;;
-        quickbeam) echo quickbeam-registry ;;
         access)    echo fangorn-access-worker ;;
+        barliman)  echo barliman ;;
     esac
 }
 
 DRY_RUN=false
 selected=()
-
-# Wipe every key in the Quickbeam worker's KV: the `view:` rows and their `dns:`
-# reverse-map entries, which is everything it stores. Asked, never assumed.
-#
-# ponytail: a raw KV wipe, so a view's hosted Cloud Run MCP outlives its row — the
-# worker's own /admin/remove deletes that service first, this cannot. Remove hosted
-# views with examples/manage-views.mjs --remove before clearing, or delete the
-# services by hand afterwards.
-clear_quickbeam_kv() {
-    local dir="$SCRIPT_DIR/$(dir_for quickbeam)"
-    local keys count file
-    keys=$(cd "$dir" && pnpm exec wrangler kv key list --binding QUICKBEAM_KV --remote 2>/dev/null) \
-        || { echo "  ✘ could not list the KV namespace — nothing cleared" >&2; return 1; }
-    count=$(grep -c '"name"' <<<"$keys" || true)
-
-    if [[ "$count" -eq 0 ]]; then
-        echo "  KV is already empty." >&2
-        return 0
-    fi
-
-    if [[ -n "${CLEAR_KV:-}" ]]; then
-        [[ "$CLEAR_KV" == true ]] || { echo "  KV left alone (CLEAR_KV=$CLEAR_KV): $count key(s)." >&2; return 0; }
-    elif [[ ! -t 0 ]]; then
-        echo "  KV left alone ($count key(s)) — no TTY to ask; set CLEAR_KV=true to wipe." >&2
-        return 0
-    else
-        echo >&2
-        echo "  The Quickbeam KV holds $count key(s) — every view and its DNS row." >&2
-        echo "  Hosted Cloud Run MCP services are NOT deleted by this wipe." >&2
-        read -rp "  Clear the KV store? [y/N] " reply
-        [[ "$reply" =~ ^[Yy] ]] || { echo "  Left alone." >&2; return 0; }
-    fi
-
-    # wrangler kv bulk delete wants a JSON array of key names.
-    file=$(mktemp); trap 'rm -f "$file"' RETURN
-    grep -oE '"name": "[^"]+"' <<<"$keys" | sed 's/"name": //' | paste -sd, - | sed 's/^/[/; s/$/]/' > "$file"
-    (cd "$dir" && pnpm exec wrangler kv bulk delete "$file" --binding QUICKBEAM_KV --remote --force)
-    echo "  🗑  cleared $count key(s)." >&2
-}
 
 for arg in "$@"; do
     case "$arg" in
@@ -170,15 +130,36 @@ for w in "${deploy_list[@]}"; do
         const require = createRequire(process.cwd() + "/");
         const { version } = require("@fangorn-network/sdk/package.json");
         const c = (await import("@fangorn-network/sdk/lib/config.js"))[process.env.CONFIG];
-        console.log(version, c.dataRegistryContractAddress, c.appRegistryContractAddress, c.settlementRegistryContractAddress);
+        console.log(version, c.dataRegistryContractAddress, c.settlementRegistryContractAddress);
     ') || { echo "  $w: cannot read the SDK — run pnpm install" >&2; exit 1; }
-    read -r version data apps settlement <<<"$info"
+    read -r version data settlement <<<"$info"
     versions+=("$version")
     case "$w" in
-        access) gate="settlement $settlement" ;;
-        *)      gate="apps $apps (data $data)" ;;
+        access)   gate="settlement $settlement" ;;
+        barliman) gate="data $data, settlement $settlement" ;;
+        *)        gate="data $data" ;;
     esac
     printf '  %-10s sdk %-16s %-18s %s\n' "$w" "$version" "$config" "$gate" >&2
+done
+
+# ── Preflight: each worker's own wiring ──────────────────────────────────────
+# A worker missing a secret deploys fine and then fails every request it exists for.
+has_secret() { (cd "$SCRIPT_DIR/$(dir_for "$1")" && pnpm exec wrangler secret list 2>/dev/null) | grep -q "\"$2\""; }
+for w in "${deploy_list[@]}"; do
+    case "$w" in
+        barliman)
+            treasury=$(grep -E '^\s*TREASURY\s*=' "$SCRIPT_DIR/barliman/wrangler.toml" | grep -oE '0x[0-9a-fA-F]{40}' || true)
+            if [[ -z "$treasury" || "$treasury" =~ ^0x0+$ ]]; then
+                echo "barliman: set TREASURY (the referrer on every register) under [vars] in barliman/wrangler.toml" >&2
+                exit 1
+            fi
+            echo "  barliman  referrer $treasury" >&2
+            $DRY_RUN || has_secret barliman TREASURY_KEY \
+                || echo "  ⚠ barliman has no TREASURY_KEY secret yet: wrangler secret put TREASURY_KEY (fund it with ETH)" >&2 ;;
+        access)
+            $DRY_RUN || has_secret access WORKER_X25519_SECRET \
+                || echo "  ⚠ the key server has no WORKER_X25519_SECRET yet: openssl rand -hex 32 | wrangler secret put WORKER_X25519_SECRET" >&2 ;;
+    esac
 done
 
 # One shared SDK is the whole point: different versions mean different contracts,
@@ -202,11 +183,8 @@ for w in "${deploy_list[@]}"; do
         # `--` through to wrangler, which ignores it and deploys for real.)
         (cd "$SCRIPT_DIR/$dir" \
             && pnpm exec $(node -p "require('./package.json').scripts.deploy") --dry-run)
-        [[ "$w" == quickbeam ]] && echo "  (would ask whether to clear the KV store)" >&2
     else
         (cd "$SCRIPT_DIR/$dir" && pnpm run deploy)
-        # After the deploy, not before: a failed deploy should not cost you the store.
-        [[ "$w" == quickbeam ]] && clear_quickbeam_kv
     fi
 done
 

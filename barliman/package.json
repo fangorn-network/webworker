@@ -1,0 +1,23 @@
+{
+  "name": "barliman",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fangorn-network/sdk": "2026.11.3-dev",
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.0",
+    "@cloudflare/workers-types": "^4.0.0",
+    "@x402/core": "2.29.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.82.2"
+  }
+}

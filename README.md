@@ -1,112 +1,90 @@
 # Fangorn Webworker
 
-A pnpm workspace containing the Cloudflare Workers behind Fangorn's content gating.
+The Cloudflare Workers Fangorn runs for its testnet on Base Sepolia. Each holds one secret,
+deploys on its own, and calls none of the others.
 
-## Packages
+| Worker | Package | Does | Secret |
+|---|---|---|---|
+| Storage | [`pinata-url-provider`](./pinata-url-provider) | Mints Pinata presigned upload URLs for wallets that prove ownership, under daily quotas | `PINATA_JWT` |
+| Key server | [`fangorn-access-worker`](./fangorn-access-worker) | Releases a paid field's key once the SettlementRegistry says the reader paid. Stores nothing | `WORKER_X25519_SECRET` |
+| Barliman | [`barliman`](./barliman) | The relay and x402 facilitator: sends signed commits, `register` and `settle`, paying gas from the treasury | `TREASURY_KEY` |
 
-| Package | Path | Description |
-|---------|------|-------------|
-| [`fangorn-access-worker`](./fangorn-access-worker) | `fangorn-access-worker/` | Gates R2 content behind on-chain settlement verification. One worker per R2 bucket. |
-| [`pinata-url-provider`](./pinata-url-provider) | `pinata-url-provider/` | Mints Pinata presigned upload URLs for callers who prove address ownership, are registered, and publish under an app with an active subscription (Base Sepolia's AppRegistry `access()` check). Every upload is billed to its app. Deploys as `pinata-url-provider-base`; never redeploy the Arbitrum worker `pinata-url-provider`. |
-| [`quickbeam-registry`](./quickbeam-registry) | `quickbeam-registry/` | Control plane for Quickbeam views: KV of watched sources, the instance's `/watchlist`, and the per-view search/CDN proxy. Gated on the same app subscription. |
+None of these is part of the protocol. The chain and IPFS are the source of truth, and each worker
+can be replaced: a publisher can run their own key server (and name it in their deposit), anyone
+with ETH can call `register` and `settle` themselves, and any IPFS pinning service stores records.
 
-See each package's own `README.md` for details.
+## How a sale uses them
 
-## Getting started
+1. The publisher seals a record's fields and signs its price (`fangorn commit --paid`). The repo's
+   key goes into a `@deposit` record, sealed to the key server. Uploads go through the storage worker.
+2. An app (a [westmarch](https://github.com/fangorn-network/westmarch) Worker) quotes the record over
+   x402 v2, scheme `fangorn`. Barliman's `/verify` and `/settle` send the buyer's `register`, which
+   pays the publisher and gives the treasury its referral share.
+3. The buyer proves with Semaphore that it paid, naming a reading address, and Barliman sends that
+   `settle`.
+4. The buyer asks the key server for the record's key, signing as the reading address.
 
-This repo uses [pnpm](https://pnpm.io) workspaces.
+## Develop
+
+This is a pnpm workspace.
 
 ```sh
 pnpm install
+pnpm --filter ./barliman test     # each package: test, typecheck, dev
+pnpm typecheck                     # every package
 ```
 
-## Common tasks
+Every package takes its contract addresses and RPC from `@fangorn-network/sdk`. The key server and
+Barliman also take `RPC_URL`, `SETTLEMENT_REGISTRY` (and Barliman `DATA_REGISTRY`) as overrides,
+which is how they run against a local chain.
 
-Run from the repo root:
+### Running them together
+
+westmarch drives these packages from a sibling checkout (`FANGORN_WEBWORKER_DIR`, default
+`../webworker`), each under `wrangler dev`:
 
 ```sh
-pnpm dev:r2        # wrangler dev for fangorn-access-worker
-pnpm dev:gate      # wrangler dev for pinata-url-provider
-pnpm typecheck     # typecheck every package that defines a typecheck script
+cd ../westmarch
+npm run e2e:paid                    # anvil + contracts, key server, Barliman, an app: one sale, mocked USDC and proof
+node scripts/sale-live.mjs          # one real sale on Base Sepolia (real USDC and proof); see the file for its keys
+npx westmarch-ship app.json --devnet   # a whole app locally; with "paid", the key server and Barliman too
 ```
 
-## Deploying
+## Deploy
 
 `./deploy.sh` deploys any one worker, any combination, or all of them:
 
 ```sh
-./deploy.sh                      # interactive: y/N per worker
-./deploy.sh all
-./deploy.sh storage quickbeam    # names: storage, quickbeam, access
-./deploy.sh --dry-run all        # bundle + config check, deploy nothing
-TARGETS="storage access" ./deploy.sh    # non-interactive (CI)
+./deploy.sh                        # interactive: y/N per worker
+./deploy.sh access barliman        # names: storage, access, barliman
+./deploy.sh --dry-run all          # bundle and check, deploy nothing
+TARGETS="access barliman" ./deploy.sh
 ```
 
-Deploying `quickbeam` asks, after the deploy lands, whether to clear its KV store —
-every view and its DNS row. Default is no; `CLEAR_KV=true|false` answers it
-non-interactively. It is a raw wipe, so a view's hosted Cloud Run MCP outlives its row:
-remove hosted views with `quickbeam-registry/examples/manage-views.mjs --remove` first,
-or delete those services by hand afterwards.
+Before deploying it prints the SDK version and the contracts each package resolves, and refuses a
+set whose SDK versions disagree. It also checks each worker's wiring: Barliman needs `TREASURY`
+under `[vars]` in its `wrangler.toml` (refused without it) and a `TREASURY_KEY` secret; the key
+server needs `WORKER_X25519_SECRET` (warned when missing). It prints the key server URL the SDK
+deposits paid repos with.
 
-Package directory names work as arguments too. Before deploying anything it prints
-the SDK version and contract addresses each package resolves, and **refuses a set
-whose SDK versions disagree** — that would gate each worker on a different deployment
-with nothing at runtime to say so. `wrangler login` once first; the storage worker's
-`PINATA_JWT` is a secret set separately and is unaffected by deploys.
-
-Or work inside a package directly, e.g.:
+Secrets are set once per worker, and deploys leave them alone:
 
 ```sh
-pnpm --filter ./pinata-url-provider dev
+cd fangorn-access-worker && openssl rand -hex 32 | npx wrangler secret put WORKER_X25519_SECRET
+cd barliman && npx wrangler secret put TREASURY_KEY      # fund its address with Base Sepolia ETH
+cd pinata-url-provider && npx wrangler secret put PINATA_JWT
 ```
 
-`quickbeam-registry` has no root shortcut; run it the same way
-(`pnpm --filter ./quickbeam-registry dev`).
+Keep a copy of `WORKER_X25519_SECRET`: every deposit is sealed to it, and losing or changing it
+makes every paid repo deposited with this key server unopenable. A deposit also names the key
+server's URL for good, so serve it from a domain you control before anyone publishes.
 
-## Contract addresses
-
-All three workers take their registry addresses and RPC endpoint from
-`@fangorn-network/sdk` (`FangornConfig`) — the storage and Quickbeam workers read the
-DataRegistry (network standing) and the AppRegistry's `access()` (app membership and
-the app's subscription), the access worker checks the SettlementRegistry. Nothing is
-pinned in a `wrangler.toml`: the SDK is the only thing that knows which contracts
-belong together, and a worker left on a retired one fails closed and silently — every
-wallet reads as unregistered, every buyer as unsettled.
-
-**Move deployments by bumping `@fangorn-network/sdk`, then redeploying the workers.**
-The storage and Quickbeam workers have no address override. The access worker keeps
-`SETTLEMENT_REGISTRY_ADDRESS` as an escape hatch for repointing ahead of an SDK publish;
-taking it logs a warning naming what it replaced.
-
-Only `@fangorn-network/sdk/lib/config.js` is imported — it pulls in nothing but viem,
-while the package root reaches node `fs`/`path` and the graph engine, which a workerd
+**Move deployments by bumping `@fangorn-network/sdk`, then redeploying.** Only
+`@fangorn-network/sdk/lib/…` modules are imported: they pull in viem and noble, nothing a workerd
 bundle can't carry.
+
 ## Security
 
-Cloudflare Webworkers are designed with a high-security isolation model. Instead of VMs or containers, they use V8 isolated, providing a lightweight and secure environment. However, they fundamentally require *trust in Cloudflare*. 
-
-- V8 Isolates: Unlike containers that share an OS kernel, [V8 Isolates](https://blog.cloudflare.com/introducing-cloudflare-workers/) separate code at the memory level. This allows thousands of Workers to run on a single thread while remaining isolated.
-- Spectre Mitigation: Cloudflare uses a unique approach to prevent [Spectre-style side-channel attacks](https://blog.cloudflare.com/mitigating-spectre-and-other-security-threats-the-cloudflare-workers-security-model/) by removing high-precision timers and implementing memory protection keys that trap unauthorized memory access attempts.
-- Automatic Patches: Since Cloudflare manages the runtime, security updates for the V8 engine and the Workers runtime are applied automatically without developer intervention. 
-
-### Application-Level Security (Developer’s Responsibility)
-While the infrastructure is hardened, developers must secure the logic and data flow within their scripts. 
-
-    Secret Management: Never hardcode sensitive data like API keys. Use Wrangler Secrets to encrypt and store credentials securely.
-    Authentication & Access: You can implement Cloudflare Access with a single click to protect Worker routes or use the Web Crypto API for custom JWT validation.
-    Data Protection: Data stored in Workers KV is encrypted at rest using AES-256 and encrypted in transit via TLS.
-    Security Headers: Workers are frequently used to inject security headers (e.g., CSP, HSTS, X-Frame-Options) into responses to protect against XSS and clickjacking. 
-
----
-
-### Gen keys
-
-openssl rand -hex 32 | npx wrangler secret put WORKER_X25519_SECRET
-
-
-# deploy work
-cd ~/fangorn/webworker && npx wrangler deploy      # ships the new /upload + DEK-from-R2 /access
-
-# run the example
-cd ~/fangorn/x402f && npm run client:node          # runs the loop (costs Sepolia gas for createResource)
-
+Workers run in V8 isolates on Cloudflare, which is trusted: the operator can see what an isolate
+sees. That matters most for the key server, which could unseal any deposit made to it. A publisher
+who won't accept that runs their own.

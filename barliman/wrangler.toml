@@ -1,0 +1,22 @@
+name = "barliman"
+main = "src/index.ts"
+compatibility_date = "2025-07-18"
+account_id = "0beaeb0776ca9e8404297afe0da73e5a"  # Fangorn@fangorn.network
+
+# Required var, set before deploying: TREASURY = "0x…", the referrer on every register (Fangorn's 5%).
+# Secret: npx wrangler secret put TREASURY_KEY   (fund it with Base Sepolia ETH)
+# Optional vars: RPC_URL, DATA_REGISTRY, SETTLEMENT_REGISTRY (a devnet or another deployment)
+
+[vars]
+# the public key corresponding the the TREASURY secret (wallet)
+TREASURY = "0x1903B0D771Ce7cDDC94a70d73537Ca2B5080400b"
+
+# Rate-limit counters.
+[[kv_namespaces]]
+binding = "RATE_KV"
+id = "ba8e021b025e40a5a57194a79b756fad"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
