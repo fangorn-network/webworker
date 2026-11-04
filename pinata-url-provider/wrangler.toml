@@ -30,10 +30,10 @@ PINATA_URL_EXPIRES = "300"       # seconds the upload URL stays valid
 # worker mints a URL scoped to it; this only caps how large any single request
 # may be, so nobody can mint a URL for an absurd file. Unset → 500 MiB default.
 MAX_UPLOAD_SIZE = "524288000"    # 500 MiB
-# Fangorn uploads opaque binary (CAR packfiles + raw commit blocks) as
-# octet-stream, and serialized payloads as text/plain — so allow exactly those.
-# Widen or unset to permit more MIME types.
-PINATA_ALLOW_MIME_TYPES = "application/octet-stream,text/plain"  # optional CSV
+# Pinata checks each upload's real (sniffed) type against this. Fangorn's own blocks are
+# octet-stream; publishers upload files of any kind. Wildcards work. Left out: text/html,
+# which the gateway would serve as a page. image/* still lets SVG through.
+PINATA_ALLOW_MIME_TYPES = "application/*,image/*,audio/*,video/*,font/*,model/*,text/plain,text/csv,text/markdown,text/tab-separated-values"  # optional CSV
 # Every presigned URL is scoped to a Pinata group named "<prefix>:<wallet>" — one
 # group per wallet, namespaced by deployment — so a deployment's (or one
 # publisher's) pins can be swept later. REQUIRED: a mint that can't resolve its
