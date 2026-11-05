@@ -30,7 +30,7 @@ Query parameters (`GET`) or a JSON body (`POST`).
 | `address` | **Required.** The wallet requesting the URL, and charged for it. |
 | `message` | The challenge, signed verbatim (see *Ownership handshake*). |
 | `signature` | 65-byte `personal_sign` signature of `message`. |
-| `size` | Declared upload size in bytes. The minted URL is scoped to `size + 4096` (multipart headroom). This is what the quotas are charged. Omitted → `DEFAULT_UPLOAD_SIZE`. |
+| `size` | Declared upload size in bytes. The minted URL is scoped to `size` plus Pinata's IPFS DAG overhead (64 B per 256 KiB chunk + 4 KiB). This is what the quotas are charged. Omitted → `DEFAULT_UPLOAD_SIZE`. |
 | `uploadId` | Idempotency key. A retry reusing it re-mints a fresh single-use URL but is charged once. |
 
 ### Minting: responses

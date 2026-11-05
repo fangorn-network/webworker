@@ -110,7 +110,7 @@ export default {
     }
 
     try {
-      const maxFileSize = size + UPLOAD_HEADROOM;
+      const maxFileSize = uploadCap(size);
       const uploadUrl = await createPinataUploadUrl(env, maxFileSize, address);
       if (charge) {
         await Promise.all([recordUsage(env, address, used, size), recordUsage(env, ALL, usedAll, size)]);
@@ -135,7 +135,11 @@ export default {
 // Upload sizing defaults (all overridable via env; bytes).
 const DEFAULT_UPLOAD_SIZE = 10 * 1024 * 1024;   // used when a caller omits `size` (older SDKs)
 const DEFAULT_MAX_UPLOAD = 500 * 1024 * 1024;   // per-request ceiling when MAX_UPLOAD_SIZE unset
-const UPLOAD_HEADROOM = 4096;                    // multipart/form-data overhead slack on max_file_size
+// Pinata checks max_file_size against the IPFS DAG it builds (256 KiB chunks, ~50 B
+// of link per chunk; measured 2026-10-27), not the raw bytes. So the cap allows 64 B
+// per chunk plus 4 KiB. Never billed (the debit is `size`).
+const PINATA_CHUNK = 262144;
+const uploadCap = (size) => size + Math.ceil(size / PINATA_CHUNK) * 64 + 4096;
 
 // Daily byte quotas, backed by Workers KV: DAILY_BYTE_LIMIT per publisher, and
 // GLOBAL_DAILY_BYTE_LIMIT for everyone together. Each is off at 0 or unset, or
