@@ -9,7 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@fangorn-network/sdk": "^0.1.2",
+    "@fangorn-network/sdk": "^0.1.4",
     "viem": "^2.0.0"
   },
   "devDependencies": {

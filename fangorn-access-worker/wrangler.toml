@@ -11,3 +11,15 @@ account_id = "0beaeb0776ca9e8404297afe0da73e5a"  # Fangorn@fangorn.network
 [observability]
 enabled = true
 head_sampling_rate = 1
+
+# ── Arbitrum Sepolia ─────────────────────────────────────────────────────────
+# `./deploy.sh --env=arbitrum access` deploys this as fangorn-access-worker-arbitrum, the key
+# server ArbitrumSepoliaConfig.keyServer names. Give it its own secret, once:
+#   openssl rand -hex 32 | npx wrangler secret put WORKER_X25519_SECRET --env arbitrum
+# Deposits sealed to it open only for purchases on Arbitrum's SettlementRegistry.
+[env.arbitrum]
+name = "fangorn-access-worker-arbitrum"
+routes = [{ pattern = "arbitrum-sepolia.keys-test.fangorn.network", custom_domain = true }]
+
+[env.arbitrum.vars]
+NETWORK = "arbitrumSepolia"

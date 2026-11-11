@@ -67,3 +67,31 @@ GLOBAL_DAILY_BYTE_LIMIT = "21474836480" # 20 GiB / day, everyone together
 binding = "RATE_KV"
 # Created 2026-10-22 for pinata-url-provider-base.
 id = "ba8e021b025e40a5a57194a79b756fad"
+
+# ── Arbitrum Sepolia ─────────────────────────────────────────────────────────
+# `./deploy.sh --env=arbitrum storage` (or `wrangler deploy --env arbitrum`) deploys this
+# as pinata-url-provider-arbitrum: NEVER "pinata-url-provider", the legacy Arbitrum worker.
+# The code is the same; nothing here is chain-specific (the ownership proof names no chain).
+# Its own group prefix keeps its pins sweepable apart from Base's. It shares Base's KV on
+# purpose: one Pinata account, so one global daily budget, one per-wallet quota and one
+# denylist. Group-id cache keys include the prefix, so they never collide.
+# [vars] and [[kv_namespaces]] are not inherited by an environment, hence the repetition.
+# Secret, once: wrangler secret put PINATA_JWT --env arbitrum   (the same Pinata key)
+[env.arbitrum]
+name = "pinata-url-provider-arbitrum"
+routes = [{ pattern = "arbitrum-sepolia.storage-worker.fangorn.network", custom_domain = true }]
+
+[env.arbitrum.vars]
+SIGNATURE_MAX_AGE = "300"
+PINATA_NETWORK = "public"
+PINATA_URL_EXPIRES = "300"
+MAX_UPLOAD_SIZE = "524288000"
+PINATA_ALLOW_MIME_TYPES = "application/*,image/*,audio/*,video/*,font/*,model/*,text/plain,text/csv,text/markdown,text/tab-separated-values"
+PINATA_GROUP_PREFIX = "testnet-arbitrum"
+ALLOWED_ORIGIN = "*"
+DAILY_BYTE_LIMIT = "1073741824"
+GLOBAL_DAILY_BYTE_LIMIT = "21474836480"
+
+[[env.arbitrum.kv_namespaces]]
+binding = "RATE_KV"
+id = "ba8e021b025e40a5a57194a79b756fad"

@@ -17,6 +17,8 @@ set -euo pipefail
 #   ./deploy.sh all                    # every worker
 #   ./deploy.sh access barliman        # any subset, any order
 #   ./deploy.sh --dry-run all          # bundle + config check, deploy nothing
+#   ./deploy.sh --env=arbitrum all     # the Arbitrum Sepolia instances ([env.arbitrum]
+#                                      # in each wrangler.toml); without it, Base Sepolia's
 #   TARGETS="storage access" ./deploy.sh   # non-interactive preset (CI)
 #
 # Package directory names work as arguments too, so tab-completion is enough.
@@ -55,11 +57,13 @@ dir_for() {
 }
 
 DRY_RUN=false
+ENV_NAME=""   # the wrangler environment: "" is the top level, Base Sepolia's workers
 selected=()
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true; continue ;;
+        --env=*)   ENV_NAME="${arg#--env=}"; continue ;;
         -h|--help) sed -n '/^# =\{10,\}/,/^# =\{10,\}/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//; /^=\{10,\}/d'; exit 0 ;;
         all)       selected=("${WORKERS[@]}"); continue ;;
     esac
@@ -83,6 +87,15 @@ if [[ ${#selected[@]} -eq 0 ]]; then
         [[ "$reply" =~ ^[Yy] ]] && selected+=("$w")
     done
 fi
+
+case "$ENV_NAME" in
+    "")       NETWORK_LABEL="Base Sepolia" ;;
+    arbitrum) NETWORK_LABEL="Arbitrum Sepolia" ;;
+    *) echo "Unknown --env: $ENV_NAME (want: arbitrum, or none for Base Sepolia)" >&2; exit 1 ;;
+esac
+# Always named, even when empty: with environments defined, wrangler otherwise warns and
+# a bare `wrangler deploy` is one typo from the wrong network.
+WRANGLER_ENV=(--env "$ENV_NAME")
 
 # Dedupe into a stable order, so `./deploy.sh all storage` deploys each once.
 deploy_list=()
@@ -116,14 +129,31 @@ done
 # ── Preflight: which deployment is each package about to ship? ────────────────
 # The addresses no longer live in wrangler.toml, so this is the only place an
 # operator sees them before the fact.
+# A [vars] value from the section this environment reads: [vars], or [env.<name>.vars].
+toml_var() {
+    local section="[vars]"; [[ -n "$ENV_NAME" ]] && section="[env.$ENV_NAME.vars]"
+    awk -v s="$section" -v k="$2" '
+        /^\[/ { inside = ($0 == s) }
+        inside && $0 ~ "^[ \t]*" k "[ \t]*=" { sub(/^[^=]*=[ \t]*/, ""); gsub(/"/, ""); sub(/[ \t]*#.*/, ""); print; exit }
+    ' "$1"
+}
+
 echo >&2
-echo "Deploying from @fangorn-network/sdk:" >&2
+echo "Deploying $NETWORK_LABEL's workers, from @fangorn-network/sdk:" >&2
 versions=()
 for w in "${deploy_list[@]}"; do
-    # The storage worker is gated on Base Sepolia; the others still on the SDK default.
-    case "$w" in
-        storage) config=BaseSepoliaConfig ;;
-        *)       config=FangornConfig ;;
+    # The storage worker has no SDK and reads no chain: what sets its deployment apart is
+    # the Pinata group its pins are filed under.
+    if [[ "$w" == storage ]]; then
+        printf '  %-10s %-37s group prefix %s\n' "$w" "(no SDK, no chain)" \
+            "$(toml_var "$SCRIPT_DIR/$(dir_for storage)/wrangler.toml" PINATA_GROUP_PREFIX)" >&2
+        continue
+    fi
+    # What each worker resolves with no RPC/registry overrides: NETWORK in its wrangler env,
+    # else the SDK default.
+    case "$ENV_NAME" in
+        arbitrum) config=ArbitrumSepoliaConfig ;;
+        *)        config=BaseSepoliaConfig ;;
     esac
     info=$(cd "$SCRIPT_DIR/$(dir_for "$w")" && CONFIG=$config node --input-type=module -e '
         import { createRequire } from "node:module";
@@ -137,28 +167,30 @@ for w in "${deploy_list[@]}"; do
     case "$w" in
         access)   gate="settlement $settlement" ;;
         barliman) gate="data $data, settlement $settlement" ;;
-        *)        gate="data $data" ;;
     esac
     printf '  %-10s sdk %-16s %-18s %s\n' "$w" "$version" "$config" "$gate" >&2
 done
 
 # ── Preflight: each worker's own wiring ──────────────────────────────────────
 # A worker missing a secret deploys fine and then fails every request it exists for.
-has_secret() { (cd "$SCRIPT_DIR/$(dir_for "$1")" && pnpm exec wrangler secret list 2>/dev/null) | grep -q "\"$2\""; }
+has_secret() { (cd "$SCRIPT_DIR/$(dir_for "$1")" && pnpm exec wrangler secret list "${WRANGLER_ENV[@]}" 2>/dev/null) | grep -q "\"$2\""; }
 for w in "${deploy_list[@]}"; do
     case "$w" in
         barliman)
-            treasury=$(grep -E '^\s*TREASURY\s*=' "$SCRIPT_DIR/barliman/wrangler.toml" | grep -oE '0x[0-9a-fA-F]{40}' || true)
+            treasury=$(toml_var "$SCRIPT_DIR/barliman/wrangler.toml" TREASURY | grep -oE '0x[0-9a-fA-F]{40}' || true)
             if [[ -z "$treasury" || "$treasury" =~ ^0x0+$ ]]; then
                 echo "barliman: set TREASURY (the referrer on every register) under [vars] in barliman/wrangler.toml" >&2
                 exit 1
             fi
             echo "  barliman  referrer $treasury" >&2
             $DRY_RUN || has_secret barliman TREASURY_KEY \
-                || echo "  ⚠ barliman has no TREASURY_KEY secret yet: wrangler secret put TREASURY_KEY (fund it with ETH)" >&2 ;;
+                || echo "  ⚠ barliman has no TREASURY_KEY secret yet: wrangler secret put TREASURY_KEY --env \"$ENV_NAME\" (fund it with $NETWORK_LABEL ETH)" >&2 ;;
         access)
             $DRY_RUN || has_secret access WORKER_X25519_SECRET \
-                || echo "  ⚠ the key server has no WORKER_X25519_SECRET yet: openssl rand -hex 32 | wrangler secret put WORKER_X25519_SECRET" >&2 ;;
+                || echo "  ⚠ the key server has no WORKER_X25519_SECRET yet: openssl rand -hex 32 | wrangler secret put WORKER_X25519_SECRET --env \"$ENV_NAME\"" >&2 ;;
+        storage)
+            $DRY_RUN || has_secret storage PINATA_JWT \
+                || echo "  ⚠ the storage worker has no PINATA_JWT secret yet: wrangler secret put PINATA_JWT --env \"$ENV_NAME\"" >&2 ;;
     esac
 done
 
@@ -182,9 +214,9 @@ for w in "${deploy_list[@]}"; do
         # different config checks nothing. (`pnpm run deploy -- --dry-run` passes the
         # `--` through to wrangler, which ignores it and deploys for real.)
         (cd "$SCRIPT_DIR/$dir" \
-            && pnpm exec $(node -p "require('./package.json').scripts.deploy") --dry-run)
+            && pnpm exec $(node -p "require('./package.json').scripts.deploy") "${WRANGLER_ENV[@]}" --dry-run)
     else
-        (cd "$SCRIPT_DIR/$dir" && pnpm run deploy)
+        (cd "$SCRIPT_DIR/$dir" && pnpm exec $(node -p "require('./package.json').scripts.deploy") "${WRANGLER_ENV[@]}")
     fi
 done
 

@@ -22,3 +22,20 @@ id = "ba8e021b025e40a5a57194a79b756fad"
 enabled = true
 head_sampling_rate = 1
 
+
+# ── Arbitrum Sepolia ─────────────────────────────────────────────────────────
+# `./deploy.sh --env=arbitrum barliman` deploys this as barliman-arbitrum. Same treasury
+# wallet (an EOA works on both chains), so the same secret, set once for this env:
+#   wrangler secret put TREASURY_KEY --env arbitrum
+# and fund TREASURY with Arbitrum Sepolia ETH. It shares Base's KV: the daily limits are per
+# address across both chains. [vars] and [[kv_namespaces]] are not inherited.
+[env.arbitrum]
+name = "barliman-arbitrum"
+
+[env.arbitrum.vars]
+NETWORK = "arbitrumSepolia"
+TREASURY = "0x1903B0D771Ce7cDDC94a70d73537Ca2B5080400b"
+
+[[env.arbitrum.kv_namespaces]]
+binding = "RATE_KV"
+id = "ba8e021b025e40a5a57194a79b756fad"
