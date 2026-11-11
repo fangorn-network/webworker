@@ -4,7 +4,9 @@ compatibility_date = "2025-07-18"
 account_id = "0beaeb0776ca9e8404297afe0da73e5a"  # Fangorn@fangorn.network
 
 # Secret: `openssl rand -hex 32 | npx wrangler secret put WORKER_X25519_SECRET`
-# Optional vars: RPC_URL, SETTLEMENT_REGISTRY (default: the SDK's Base Sepolia deployment)
+# Optional vars: NETWORK ("baseSepolia" | "arbitrumSepolia", default the SDK's Base Sepolia),
+# RPC_URL, SETTLEMENT_REGISTRY (default: that network's). One instance serves one network:
+# deploy a second, under its own name and secret, for the other.
 
 [observability]
 enabled = true

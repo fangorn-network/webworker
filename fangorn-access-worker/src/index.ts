@@ -1,6 +1,6 @@
 import { x25519 } from '@noble/curves/ed25519.js'
 import { bytesToHex, createPublicClient, hexToBytes, http, type Address } from 'viem'
-import { FangornConfig } from '@fangorn-network/sdk/lib/config.js'
+import getNetwork, { FangornConfig } from '@fangorn-network/sdk/lib/config.js'
 import type { AccessRequest } from '@fangorn-network/sdk/lib/crypto/paid.js'
 import { AccessError, serveAccess } from './access'
 import { SettlementRegistryClient } from '@fangorn-network/sdk/lib/contracts/settlement-registry/index.js'
@@ -12,6 +12,8 @@ import { SettlementRegistryClient } from '@fangorn-network/sdk/lib/contracts/set
 interface Env {
 	WORKER_X25519_SECRET: string // 32 bytes hex. Lose it and every deposit is unopenable.
 	RPC_URL?: string
+	// The SDK's network name ("baseSepolia", "arbitrumSepolia"); unset, its default.
+	NETWORK?: string
 	SETTLEMENT_REGISTRY?: string
 }
 
@@ -51,15 +53,16 @@ async function access(request: Request, env: Env): Promise<Response> {
 	const body = (await request.json().catch(() => null)) as AccessRequest | null
 	if (!wellFormed(body)) return json({ error: 'malformed request' }, 400)
 
+	const net = env.NETWORK ? getNetwork(env.NETWORK) : FangornConfig
 	const registry = new SettlementRegistryClient(
-		(env.SETTLEMENT_REGISTRY || FangornConfig.settlementRegistryContractAddress) as Address,
-		createPublicClient({ transport: http(env.RPC_URL || FangornConfig.rpcUrl) }) as never,
+		(env.SETTLEMENT_REGISTRY || net.settlementRegistryContractAddress) as Address,
+		createPublicClient({ transport: http(env.RPC_URL || net.rpcUrl) }) as never,
 	)
 	try {
 		return json(
 			await serveAccess(body, {
 				secret: secret(env),
-				chainId: FangornConfig.chain.id,
+				chainId: net.chain.id,
 				registry: registry.getAddress(),
 				canRead: (reader, publisher, repo, key) => registry.canRead(reader, publisher, repo, key),
 			}),

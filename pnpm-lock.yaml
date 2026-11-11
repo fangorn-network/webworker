@@ -34,8 +34,8 @@ importers:
   barliman:
     dependencies:
       '@fangorn-network/sdk':
-        specifier: ^0.1.1
-        version: 0.1.1(react@19.3.0)(typescript@5.9.3)(zod@4.6.7)
+        specifier: ^0.1.2
+        version: 0.1.2(react@19.3.0)(typescript@5.9.3)(zod@4.6.7)
       viem:
         specifier: ^2.0.0
         version: 2.54.6(typescript@5.9.3)(zod@4.6.7)
@@ -62,8 +62,8 @@ importers:
   fangorn-access-worker:
     dependencies:
       '@fangorn-network/sdk':
-        specifier: ^0.1.1
-        version: 0.1.1(react@19.3.0)(typescript@5.9.3)(zod@4.6.7)
+        specifier: ^0.1.2
+        version: 0.1.2(react@19.3.0)(typescript@5.9.3)(zod@4.6.7)
       viem:
         specifier: ^2.0.0
         version: 2.54.6(typescript@5.9.3)(zod@4.6.7)
@@ -354,8 +354,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@fangorn-network/sdk@0.1.1':
-    resolution: {integrity: sha512-ANjQU0QHp0RTQocaaCCFdAE3G7zGOLfKgwDix6A3Uh45hoJUZUZUBgJuRmUWsSNKPSBTO045emvI0RrxtTHpkA==}
+  '@fangorn-network/sdk@0.1.2':
+    resolution: {integrity: sha512-Anxv2UFtYe0u9j/MVzJIbxsKVIH1nhW7kdOlpUAUSr+LxF1w3xW8FgK1jbbdDBAQJY/F/AZ7cwyfjVIIuTIQQQ==}
     engines: {node: '>=20.19.0'}
     hasBin: true
 
@@ -1520,7 +1520,7 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@fangorn-network/sdk@0.1.1(react@19.3.0)(typescript@5.9.3)(zod@4.6.7)':
+  '@fangorn-network/sdk@0.1.2(react@19.3.0)(typescript@5.9.3)(zod@4.6.7)':
     dependencies:
       '@clack/prompts': 1.7.0
       '@ipld/car': 5.4.7
